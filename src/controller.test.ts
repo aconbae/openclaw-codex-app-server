@@ -300,4 +300,56 @@ describe("Discord controller flows", () => {
       expect.objectContaining({ accountId: "default" }),
     );
   });
+
+  it("normalizes raw Discord callback conversation ids for guild interactions", async () => {
+    const { controller, sendComponentMessage } = await createControllerHarness();
+    const callback = await (controller as any).store.putCallback({
+      kind: "picker-view",
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:chan-1",
+      },
+      view: {
+        mode: "projects",
+        includeAll: true,
+        page: 0,
+      },
+    });
+
+    await controller.handleDiscordInteractive({
+      channel: "discord",
+      accountId: "default",
+      interactionId: "interaction-1",
+      conversationId: "1481858418548412579",
+      guildId: "guild-1",
+      auth: { isAuthorizedSender: true },
+      interaction: {
+        kind: "button",
+        data: `codexapp:${callback.token}`,
+        namespace: "codexapp",
+        payload: callback.token,
+        messageId: "message-1",
+      },
+      senderId: "user-1",
+      senderUsername: "Ada",
+      respond: {
+        acknowledge: vi.fn(async () => {}),
+        reply: vi.fn(async () => {}),
+        followUp: vi.fn(async () => {}),
+        editMessage: vi.fn(async () => {}),
+        clearComponents: vi.fn(async () => {
+          throw new Error("Interaction has already been acknowledged.");
+        }),
+      },
+    } as any);
+
+    expect(sendComponentMessage).toHaveBeenCalledWith(
+      "channel:1481858418548412579",
+      expect.objectContaining({
+        text: expect.stringContaining("Choose a project to filter recent Codex sessions"),
+      }),
+      expect.objectContaining({ accountId: "default" }),
+    );
+  });
 });

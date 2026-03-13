@@ -156,6 +156,20 @@ function normalizeDiscordConversationId(raw: string | undefined): string | undef
   return trimmed;
 }
 
+function normalizeDiscordInteractiveConversationId(params: {
+  conversationId?: string;
+  guildId?: string;
+}): string | undefined {
+  const normalized = normalizeDiscordConversationId(params.conversationId);
+  if (!normalized) {
+    return undefined;
+  }
+  if (normalized.includes(":")) {
+    return normalized;
+  }
+  return params.guildId ? `channel:${normalized}` : `user:${normalized}`;
+}
+
 function toConversationTargetFromCommand(ctx: PluginCommandContext): ConversationTarget | null {
   if (isTelegramChannel(ctx.channel)) {
     const chatId = normalizeTelegramChatId(ctx.to ?? ctx.from ?? ctx.senderId);
@@ -461,11 +475,22 @@ export class CodexPluginController {
       await ctx.respond.reply({ text: "That Codex action expired. Please retry the command.", ephemeral: true });
       return;
     }
+    const conversationId = normalizeDiscordInteractiveConversationId({
+      conversationId: ctx.conversationId,
+      guildId: ctx.guildId,
+    });
+    if (!conversationId) {
+      await ctx.respond.reply({
+        text: "I couldn’t determine the Discord conversation for that action. Please retry the command.",
+        ephemeral: true,
+      });
+      return;
+    }
     await this.dispatchCallbackAction(callback, {
       conversation: {
         channel: "discord",
         accountId: ctx.accountId,
-        conversationId: ctx.conversationId,
+        conversationId,
         parentConversationId: ctx.parentConversationId,
       },
       clear: async () => {
@@ -476,18 +501,25 @@ export class CodexPluginController {
       },
       editPicker: async (picker) => {
         this.api.logger.debug(
-          `codex discord picker refresh conversation=${ctx.conversationId} rows=${picker.buttons?.length ?? 0}`,
+          `codex discord picker refresh conversation=${conversationId} rows=${picker.buttons?.length ?? 0}`,
         );
         await ctx.respond.clearComponents({ text: picker.text }).catch((error) => {
+          const detail = String(error);
+          if (detail.includes("already been acknowledged")) {
+            this.api.logger.debug?.(
+              `codex discord picker clear skipped conversation=${conversationId}: ${detail}`,
+            );
+            return;
+          }
           this.api.logger.warn(
-            `codex discord picker clear failed conversation=${ctx.conversationId}: ${String(error)}`,
+            `codex discord picker clear failed conversation=${conversationId}: ${detail}`,
           );
         });
         await this.sendDiscordPicker(
           {
             channel: "discord",
             accountId: ctx.accountId,
-            conversationId: ctx.conversationId,
+            conversationId,
             parentConversationId: ctx.parentConversationId,
           },
           picker,
