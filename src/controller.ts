@@ -79,6 +79,11 @@ type PickerResponders = {
   editPicker: (picker: PickerRender) => Promise<void>;
 };
 
+type FollowUpSummary = {
+  initialReply: ReplyPayload;
+  followUps: string[];
+};
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -91,6 +96,10 @@ function isTelegramChannel(channel: string): boolean {
 
 function isDiscordChannel(channel: string): boolean {
   return channel.trim().toLowerCase() === "discord";
+}
+
+function buildPlainReply(text: string): ReplyPayload {
+  return { text };
 }
 
 function normalizeTelegramChatId(raw: string | undefined): string | undefined {
@@ -237,7 +246,7 @@ function isTransportClosedMessage(error: unknown): boolean {
   );
 }
 
-function formatFailureText(kind: "plan" | "review", error: unknown): string {
+function formatFailureText(kind: "plan" | "review" | "compact", error: unknown): string {
   if (isTransportClosedMessage(error)) {
     return `Codex ${kind} failed because the App Server connection closed. Please retry the command or rejoin the thread.`;
   }
@@ -578,8 +587,9 @@ export class CodexPluginController {
         await this.renameConversationIfSupported(conversation, syncedName);
       }
     }
-    await this.sendBoundConversationSummary(conversation);
-    return { text: "" };
+    const summary = await this.buildBoundConversationSummaryReply(conversation);
+    this.queueFollowUpTexts(conversation, summary.followUps);
+    return summary.initialReply;
   }
 
   private async handleStatusCommand(binding: StoredBinding | null): Promise<ReplyPayload> {
@@ -641,8 +651,11 @@ export class CodexPluginController {
       binding,
       workspaceDir,
       prompt,
+      announceStart: false,
     });
-    return { text: "" };
+    return buildPlainReply(
+      "Starting Codex plan mode. I’ll relay the questions and final plan as they arrive.",
+    );
   }
 
   private async handleReviewCommand(
@@ -661,8 +674,13 @@ export class CodexPluginController {
       target: args.trim()
         ? { type: "custom", instructions: args.trim() }
         : { type: "uncommittedChanges" },
+      announceStart: false,
     });
-    return { text: "" };
+    return buildPlainReply(
+      args.trim()
+        ? "Starting Codex review with your custom focus. I’ll send the findings when the review finishes."
+        : "Starting Codex review of the current changes. I’ll send the findings when the review finishes.",
+    );
   }
 
   private async handleCompactCommand(
@@ -672,18 +690,23 @@ export class CodexPluginController {
     if (!conversation || !binding) {
       return { text: "Bind this conversation to a Codex thread before compacting it." };
     }
+    void this.startCompact({
+      conversation,
+      binding,
+    });
+    return buildPlainReply(this.buildCompactStartText(binding.contextUsage));
+  }
+
+  private async startCompact(params: {
+    conversation: ConversationTarget;
+    binding: StoredBinding;
+  }): Promise<void> {
+    const { conversation, binding } = params;
     const typing = await this.startTypingLease(conversation);
     let startingUsage = binding.contextUsage;
     let latestUsage = startingUsage;
     let lastEmittedUsageText = binding.contextUsage ? formatContextUsageText(binding.contextUsage) : undefined;
     try {
-      const startLines = ["Starting Codex thread compaction."];
-      const initialUsageText = startingUsage ? formatContextUsageText(startingUsage) : undefined;
-      if (initialUsageText) {
-        startLines.push(`Starting context usage: ${initialUsageText}`);
-      }
-      startLines.push("I’ll report progress here as compaction events arrive.");
-      await this.sendText(conversation, startLines.join("\n"));
       let keepaliveInterval: NodeJS.Timeout | undefined;
       const progressTimer = setTimeout(() => {
         void (async () => {
@@ -740,7 +763,9 @@ export class CodexPluginController {
           updatedAt: Date.now(),
         });
       }
-      return { text: "" };
+      return;
+    } catch (error) {
+      await this.sendText(conversation, formatFailureText("compact", error));
     } finally {
       typing?.stop();
     }
@@ -1044,16 +1069,19 @@ export class CodexPluginController {
     binding: StoredBinding | null;
     workspaceDir: string;
     prompt: string;
+    announceStart?: boolean;
   }): Promise<void> {
     const key = buildConversationKey(params.conversation);
     const existing = this.activeRuns.get(key);
     if (existing) {
       await existing.handle.interrupt();
     }
-    await this.sendText(
-      params.conversation,
-      "Starting Codex plan mode. I’ll relay the questions and final plan as they arrive.",
-    );
+    if (params.announceStart !== false) {
+      await this.sendText(
+        params.conversation,
+        "Starting Codex plan mode. I’ll relay the questions and final plan as they arrive.",
+      );
+    }
     const typing = await this.startTypingLease(params.conversation);
     let keepaliveSent = false;
     const progressTimer = setTimeout(() => {
@@ -1185,18 +1213,21 @@ export class CodexPluginController {
     binding: StoredBinding;
     workspaceDir: string;
     target: { type: "uncommittedChanges" } | { type: "custom"; instructions: string };
+    announceStart?: boolean;
   }): Promise<void> {
     const key = buildConversationKey(params.conversation);
     const existing = this.activeRuns.get(key);
     if (existing) {
       await existing.handle.interrupt();
     }
-    await this.sendText(
-      params.conversation,
-      params.target.type === "custom"
-        ? "Starting Codex review with your custom focus. I’ll send the findings when the review finishes."
-        : "Starting Codex review of the current changes. I’ll send the findings when the review finishes.",
-    );
+    if (params.announceStart !== false) {
+      await this.sendText(
+        params.conversation,
+        params.target.type === "custom"
+          ? "Starting Codex review with your custom focus. I’ll send the findings when the review finishes."
+          : "Starting Codex review of the current changes. I’ll send the findings when the review finishes.",
+      );
+    }
     const typing = await this.startTypingLease(params.conversation);
     let keepaliveSent = false;
     const progressTimer = setTimeout(() => {
@@ -2003,6 +2034,32 @@ export class CodexPluginController {
     }
   }
 
+  private async buildBoundConversationSummaryReply(
+    conversation: ConversationTarget | ConversationRef,
+  ): Promise<FollowUpSummary> {
+    const messages = await this.buildBoundConversationMessages(conversation);
+    const [firstMessage, ...followUps] = messages;
+    return {
+      initialReply: buildPlainReply(firstMessage ?? "Codex thread bound."),
+      followUps,
+    };
+  }
+
+  private queueFollowUpTexts(conversation: ConversationTarget, texts: string[]): void {
+    if (texts.length === 0) {
+      return;
+    }
+    setTimeout(() => {
+      void (async () => {
+        for (const text of texts) {
+          await this.sendText(conversation, text);
+        }
+      })().catch((error) => {
+        this.api.logger.warn(`codex follow-up send failed: ${String(error)}`);
+      });
+    }, 0);
+  }
+
   private async buildStatusText(binding: StoredBinding | null): Promise<string> {
     const workspaceDir = resolveWorkspaceDir({
       bindingWorkspaceDir: binding?.workspaceDir,
@@ -2034,6 +2091,16 @@ export class CodexPluginController {
       worktreeFolder: threadState?.cwd?.trim() || binding?.workspaceDir || workspaceDir,
       contextUsage: binding?.contextUsage,
     });
+  }
+
+  private buildCompactStartText(usage?: StoredBinding["contextUsage"]): string {
+    const lines = ["Starting Codex thread compaction."];
+    const initialUsageText = usage ? formatContextUsageText(usage) : undefined;
+    if (initialUsageText) {
+      lines.push(`Starting context usage: ${initialUsageText}`);
+    }
+    lines.push("I’ll report progress here as compaction events arrive.");
+    return lines.join("\n");
   }
 
   private async resolveProjectFolder(worktreeFolder?: string): Promise<string | undefined> {

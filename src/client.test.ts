@@ -1,6 +1,117 @@
 import { describe, expect, it } from "vitest";
 import { __testing } from "./client.js";
 
+describe("buildTurnStartPayloads", () => {
+  it("keeps legacy text and message input fallbacks for normal turns", () => {
+    expect(
+      __testing.buildTurnStartPayloads({
+        threadId: "thread-123",
+        prompt: "ship it",
+        model: "gpt-5.4",
+      }),
+    ).toEqual([
+      {
+        threadId: "thread-123",
+        input: [{ type: "text", text: "ship it" }],
+        model: "gpt-5.4",
+      },
+      {
+        thread_id: "thread-123",
+        input: [{ type: "text", text: "ship it" }],
+        model: "gpt-5.4",
+      },
+      {
+        threadId: "thread-123",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "ship it" }],
+          },
+        ],
+        model: "gpt-5.4",
+      },
+      {
+        thread_id: "thread-123",
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "ship it" }],
+          },
+        ],
+        model: "gpt-5.4",
+      },
+    ]);
+  });
+
+  it("prefers text-only collaboration payloads and omits null developer instructions", () => {
+    expect(
+      __testing.buildTurnStartPayloads({
+        threadId: "thread-123",
+        prompt: "plan it",
+        model: "gpt-5.4",
+        collaborationMode: {
+          mode: "plan",
+          settings: {
+            model: "gpt-5.4",
+            developerInstructions: null,
+          },
+        },
+      }),
+    ).toEqual([
+      {
+        threadId: "thread-123",
+        input: [{ type: "text", text: "plan it" }],
+        model: "gpt-5.4",
+        collaborationMode: {
+          mode: "plan",
+          settings: {
+            model: "gpt-5.4",
+          },
+        },
+      },
+      {
+        thread_id: "thread-123",
+        input: [{ type: "text", text: "plan it" }],
+        model: "gpt-5.4",
+        collaboration_mode: {
+          mode: "plan",
+          settings: {
+            model: "gpt-5.4",
+          },
+        },
+      },
+      {
+        threadId: "thread-123",
+        input: [{ type: "text", text: "plan it" }],
+        model: "gpt-5.4",
+        collaborationMode: {
+          mode: "plan",
+        },
+      },
+      {
+        thread_id: "thread-123",
+        input: [{ type: "text", text: "plan it" }],
+        model: "gpt-5.4",
+        collaboration_mode: {
+          mode: "plan",
+        },
+      },
+      {
+        threadId: "thread-123",
+        input: [{ type: "text", text: "plan it" }],
+        model: "gpt-5.4",
+      },
+      {
+        thread_id: "thread-123",
+        input: [{ type: "text", text: "plan it" }],
+        model: "gpt-5.4",
+      },
+    ]);
+  });
+});
+
 describe("extractThreadTokenUsageSnapshot", () => {
   it("prefers current-context usage over cumulative totals when both are present", () => {
     expect(

@@ -807,17 +807,71 @@ function buildThreadResumePayloads(params: {
   });
 }
 
-function buildTurnInput(prompt: string): unknown[] {
-  return [
-    [{ type: "text", text: prompt }],
-    [
+function buildTurnInput(
+  prompt: string,
+  options?: { includeLegacyMessageVariant?: boolean },
+): unknown[] {
+  const variants: unknown[] = [[{ type: "text", text: prompt }]];
+  if (options?.includeLegacyMessageVariant !== false) {
+    variants.push([
       {
         type: "message",
         role: "user",
         content: [{ type: "input_text", text: prompt }],
       },
-    ],
-  ];
+    ]);
+  }
+  return variants;
+}
+
+function buildCollaborationModeVariants(
+  collaborationMode: CollaborationMode,
+): Array<{ camel?: Record<string, unknown>; snake?: Record<string, unknown> }> {
+  const normalizedSettings: Record<string, unknown> = {
+    ...(collaborationMode.settings?.model
+      ? { model: collaborationMode.settings.model }
+      : {}),
+    ...(collaborationMode.settings?.reasoningEffort
+      ? { reasoningEffort: collaborationMode.settings.reasoningEffort }
+      : {}),
+    ...(typeof collaborationMode.settings?.developerInstructions === "string" &&
+    collaborationMode.settings.developerInstructions.trim()
+      ? { developerInstructions: collaborationMode.settings.developerInstructions.trim() }
+      : {}),
+  };
+  const variants: Array<{ camel?: Record<string, unknown>; snake?: Record<string, unknown> }> =
+    [];
+  if (Object.keys(normalizedSettings).length > 0) {
+    variants.push({
+      camel: {
+        mode: collaborationMode.mode,
+        settings: normalizedSettings,
+      },
+      snake: {
+        mode: collaborationMode.mode,
+        settings: {
+          ...(typeof normalizedSettings.model === "string"
+            ? { model: normalizedSettings.model }
+            : {}),
+          ...(typeof normalizedSettings.reasoningEffort === "string"
+            ? { reasoning_effort: normalizedSettings.reasoningEffort }
+            : {}),
+          ...(typeof normalizedSettings.developerInstructions === "string"
+            ? { developer_instructions: normalizedSettings.developerInstructions }
+            : {}),
+        },
+      },
+    });
+  }
+  variants.push({
+    camel: {
+      mode: collaborationMode.mode,
+    },
+    snake: {
+      mode: collaborationMode.mode,
+    },
+  });
+  return variants;
 }
 
 function buildTurnStartPayloads(params: {
@@ -826,7 +880,9 @@ function buildTurnStartPayloads(params: {
   model?: string;
   collaborationMode?: CollaborationMode;
 }): unknown[] {
-  return buildTurnInput(params.prompt).flatMap((input) => {
+  const payloads = buildTurnInput(params.prompt, {
+    includeLegacyMessageVariant: !params.collaborationMode,
+  }).flatMap((input) => {
     const camel: Record<string, unknown> = {
       threadId: params.threadId,
       input,
@@ -839,44 +895,26 @@ function buildTurnStartPayloads(params: {
       camel.model = params.model.trim();
       snake.model = params.model.trim();
     }
-    if (params.collaborationMode) {
-      const collaborationMode = {
-        mode: params.collaborationMode.mode,
-        settings: {
-          ...(params.collaborationMode.settings?.model
-            ? { model: params.collaborationMode.settings.model }
-            : {}),
-          ...(params.collaborationMode.settings?.reasoningEffort
-            ? { reasoningEffort: params.collaborationMode.settings.reasoningEffort }
-            : {}),
-          ...(Object.hasOwn(params.collaborationMode.settings ?? {}, "developerInstructions")
-            ? {
-                developerInstructions:
-                  params.collaborationMode.settings?.developerInstructions ?? null,
-              }
-            : {}),
-        },
-      };
-      camel.collaborationMode = collaborationMode;
-      snake.collaboration_mode = {
-        mode: collaborationMode.mode,
-        settings: {
-          ...(typeof collaborationMode.settings.model === "string"
-            ? { model: collaborationMode.settings.model }
-            : {}),
-          ...(typeof collaborationMode.settings.reasoningEffort === "string"
-            ? { reasoning_effort: collaborationMode.settings.reasoningEffort }
-            : {}),
-          ...(Object.hasOwn(collaborationMode.settings, "developerInstructions")
-            ? {
-                developer_instructions: collaborationMode.settings.developerInstructions ?? null,
-              }
-            : {}),
-        },
-      };
+    if (!params.collaborationMode) {
+      return [camel, snake];
     }
-    return [camel, snake];
+    const collaborationVariants = buildCollaborationModeVariants(params.collaborationMode);
+    return [
+      ...collaborationVariants.flatMap((variant) => [
+        {
+          ...camel,
+          ...(variant.camel ? { collaborationMode: variant.camel } : {}),
+        },
+        {
+          ...snake,
+          ...(variant.snake ? { collaboration_mode: variant.snake } : {}),
+        },
+      ]),
+      camel,
+      snake,
+    ];
   });
+  return payloads;
 }
 
 function normalizeEpochTimestamp(value: number | undefined): number | undefined {
@@ -2645,6 +2683,7 @@ export class CodexAppServerClient {
 }
 
 export const __testing = {
+  buildTurnStartPayloads,
   extractThreadTokenUsageSnapshot,
   extractRateLimitSummaries,
 };
