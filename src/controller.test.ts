@@ -423,4 +423,41 @@ describe("Discord controller flows", () => {
     expect(result).toEqual({ handled: true });
     expect(startTurn).toHaveBeenCalled();
   });
+
+  it("matches a Discord binding even when the inbound event includes a parent conversation id", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:1481858418548412579",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        text: "hello",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => true),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    const result = await controller.handleInboundClaim({
+      content: "What is the CWD?",
+      channel: "discord",
+      accountId: "default",
+      conversationId: "1481858418548412579",
+      parentConversationId: "987654321",
+      isGroup: true,
+      metadata: { guildId: "guild-1" },
+    });
+
+    expect(result).toEqual({ handled: true });
+    expect(startTurn).toHaveBeenCalled();
+  });
 });

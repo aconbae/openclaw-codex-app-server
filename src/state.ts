@@ -69,11 +69,12 @@ type PutCallbackInput =
     };
 
 function toConversationKey(target: ConversationTarget): string {
+  const channel = target.channel.trim().toLowerCase();
   return [
-    target.channel.trim().toLowerCase(),
+    channel,
     target.accountId.trim(),
     target.conversationId.trim(),
-    target.parentConversationId?.trim() ?? "",
+    channel === "telegram" ? (target.parentConversationId?.trim() ?? "") : "",
   ].join("::");
 }
 
