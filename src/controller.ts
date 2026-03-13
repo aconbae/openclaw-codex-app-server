@@ -38,6 +38,7 @@ import {
 import {
   buildPendingQuestionnaireResponse,
   formatPendingQuestionnairePrompt,
+  questionnaireCurrentQuestionHasAnswer,
   questionnaireIsComplete,
   requestToken,
 } from "./pending-input.js";
@@ -1491,7 +1492,10 @@ export class CodexPluginController {
         callback_data: `${INTERACTIVE_NAMESPACE}:${prev.token}`,
       });
     }
-    if (questionnaire.currentIndex < questionnaire.questions.length - 1) {
+    if (
+      questionnaire.currentIndex < questionnaire.questions.length - 1 &&
+      questionnaireCurrentQuestionHasAnswer(questionnaire)
+    ) {
       const next = await this.store.putCallback({
         kind: "pending-questionnaire",
         conversation,

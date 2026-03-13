@@ -7,6 +7,7 @@ import {
   formatPendingQuestionnairePrompt,
   parseCodexUserInput,
   parsePendingQuestionnaire,
+  questionnaireCurrentQuestionHasAnswer,
   questionnaireIsComplete,
   requestToken,
 } from "./pending-input.js";
@@ -119,6 +120,28 @@ Guidance:
     expect(buildPendingQuestionnaireResponse(questionnaire)).toBe(
       "1A 2: Balanced, but only if we keep the migration simple.",
     );
+  });
+
+  it("requires an answer before advancing to the next questionnaire question", () => {
+    const questionnaire = parsePendingQuestionnaire(`
+1. What do you want the final artifact to be?
+• A Single static binary
+• B Normal runtime-managed CLI
+
+2. What do you care about more?
+• A Fastest rewrite
+• B Balanced
+    `)!;
+
+    expect(questionnaireCurrentQuestionHasAnswer(questionnaire)).toBe(false);
+
+    questionnaire.answers[0] = {
+      kind: "option",
+      optionKey: "A",
+      optionLabel: "Single static binary",
+    };
+
+    expect(questionnaireCurrentQuestionHasAnswer(questionnaire)).toBe(true);
   });
 
   it("parses structured request_user_input questions into questionnaire state", () => {

@@ -497,6 +497,16 @@ export function questionnaireIsComplete(questionnaire: PendingQuestionnaireState
   );
 }
 
+export function questionnaireCurrentQuestionHasAnswer(
+  questionnaire: PendingQuestionnaireState,
+): boolean {
+  const answer = questionnaire.answers[questionnaire.currentIndex];
+  return (
+    answer != null &&
+    (answer.kind === "option" || (answer.kind === "text" && answer.text.trim().length > 0))
+  );
+}
+
 function collectText(value: unknown): string[] {
   if (typeof value === "string") {
     const trimmed = value.trim();
