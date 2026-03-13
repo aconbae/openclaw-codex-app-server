@@ -227,6 +227,7 @@ export type CallbackAction =
       conversation: ConversationRef;
       threadId: string;
       workspaceDir: string;
+      syncTopic?: boolean;
       createdAt: number;
       expiresAt: number;
     }
@@ -248,6 +249,7 @@ export type CallbackAction =
             mode: "threads";
             includeAll: boolean;
             page: number;
+            syncTopic?: boolean;
             query?: string;
             workspaceDir?: string;
             projectName?: string;
@@ -256,9 +258,10 @@ export type CallbackAction =
             mode: "projects";
             includeAll: boolean;
             page: number;
+            syncTopic?: boolean;
             query?: string;
             workspaceDir?: string;
-      };
+          };
       createdAt: number;
       expiresAt: number;
     }

@@ -5,6 +5,7 @@ import type { ThreadSummary } from "./types.js";
 export type ParsedThreadSelectionArgs = {
   includeAll: boolean;
   listProjects: boolean;
+  syncTopic: boolean;
   cwd?: string;
   query: string;
 };
@@ -27,6 +28,7 @@ export function parseThreadSelectionArgs(args: string): ParsedThreadSelectionArg
     .filter(Boolean);
   let includeAll = false;
   let listProjects = false;
+  let syncTopic = false;
   let cwd: string | undefined;
   const queryTokens: string[] = [];
 
@@ -38,6 +40,10 @@ export function parseThreadSelectionArgs(args: string): ParsedThreadSelectionArg
     }
     if (token === "--projects" || token === "--project" || token === "-p") {
       listProjects = true;
+      continue;
+    }
+    if (token === "--sync") {
+      syncTopic = true;
       continue;
     }
     if (token === "--cwd") {
@@ -54,6 +60,7 @@ export function parseThreadSelectionArgs(args: string): ParsedThreadSelectionArg
   return {
     includeAll,
     listProjects,
+    syncTopic,
     cwd,
     query: queryTokens.join(" ").trim(),
   };

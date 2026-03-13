@@ -267,6 +267,46 @@ function formatContextUsageText(usage: { totalTokens?: number; contextWindow?: n
   return `${total} / ${context} tokens used${typeof percent === "number" ? ` (${percent}% full)` : ""}`;
 }
 
+function parseRenameArgs(args: string): { syncTopic: boolean; name: string } | null {
+  const tokens = args
+    .replace(/(^|\s)[\u2010-\u2015\u2212](?=\S)/g, "$1--")
+    .replace(/[\u2010-\u2015\u2212]/g, "-")
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  let syncTopic = false;
+  const nameParts: string[] = [];
+  for (const token of tokens) {
+    if (token === "--sync") {
+      syncTopic = true;
+      continue;
+    }
+    nameParts.push(token);
+  }
+  const name = nameParts.join(" ").trim();
+  if (!syncTopic && !name) {
+    return null;
+  }
+  return { syncTopic, name };
+}
+
+function buildResumeTopicName(params: { title?: string; projectKey?: string; threadId: string }): string | undefined {
+  const threadName = params.title?.trim() || params.threadId.trim();
+  if (!threadName) {
+    return undefined;
+  }
+  const projectName = path.basename(params.projectKey?.replace(/[\\/]+$/, "").trim() || "");
+  return projectName ? `${threadName} (${projectName})` : threadName;
+}
+
+function truncateDiscordLabel(text: string, maxChars = 80): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxChars) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
+}
+
 export class CodexPluginController {
   private readonly settings;
   private readonly client;
@@ -460,8 +500,13 @@ export class CodexPluginController {
       ? await this.renderProjectPicker(conversation, binding, parsed, 0)
       : await this.renderThreadPicker(conversation, binding, parsed, 0);
     if (isDiscordChannel(channel) && picker.buttons) {
-      await this.sendDiscordPicker(conversation, picker);
-      return { text: "Sent a Codex thread picker to this Discord conversation." };
+      try {
+        await this.sendDiscordPicker(conversation, picker);
+        return { text: "Sent a Codex thread picker to this Discord conversation." };
+      } catch (error) {
+        this.api.logger.warn(`codex discord picker send failed: ${String(error)}`);
+        return { text: picker.text };
+      }
     }
     return buildReplyWithButtons(picker.text, picker.buttons);
   }
@@ -480,6 +525,7 @@ export class CodexPluginController {
       const passthroughArgs = [
         parsed.includeAll ? "--all" : "",
         parsed.listProjects ? "--projects" : "",
+        parsed.syncTopic ? "--sync" : "",
         parsed.cwd ? `--cwd ${parsed.cwd}` : "",
       ]
         .filter(Boolean)
@@ -498,10 +544,15 @@ export class CodexPluginController {
     if (selection.kind === "ambiguous") {
       const picker = await this.renderThreadPicker(conversation, binding, parsed, 0);
       if (isDiscordChannel(channel) && picker.buttons) {
-        await this.sendDiscordPicker(conversation, picker);
-        return {
-          text: `Multiple Codex threads matched "${parsed.query}". Sent a picker to this Discord conversation.`,
-        };
+        try {
+          await this.sendDiscordPicker(conversation, picker);
+          return {
+            text: `Multiple Codex threads matched "${parsed.query}". Sent a picker to this Discord conversation.`,
+          };
+        } catch (error) {
+          this.api.logger.warn(`codex discord picker send failed: ${String(error)}`);
+          return { text: picker.text };
+        }
       }
       return buildReplyWithButtons(picker.text, picker.buttons);
     }
@@ -517,6 +568,16 @@ export class CodexPluginController {
       }),
       threadTitle: selection.thread.title,
     });
+    if (parsed.syncTopic) {
+      const syncedName = buildResumeTopicName({
+        title: selection.thread.title,
+        projectKey: selection.thread.projectKey,
+        threadId: selection.thread.threadId,
+      });
+      if (syncedName) {
+        await this.renameConversationIfSupported(conversation, syncedName);
+      }
+    }
     await this.sendBoundConversationSummary(conversation);
     return { text: "" };
   }
@@ -879,22 +940,24 @@ export class CodexPluginController {
     if (!conversation || !binding) {
       return { text: "Bind this conversation to a Codex thread before renaming it." };
     }
-    const name = args.trim();
-    if (!name) {
-      return { text: "Usage: /codex_rename <new name>" };
+    const parsed = parseRenameArgs(args);
+    if (!parsed?.name) {
+      return { text: "Usage: /codex_rename [--sync] <new name>" };
     }
     await this.client.setThreadName({
       sessionKey: binding.sessionKey,
       threadId: binding.threadId,
-      name,
+      name: parsed.name,
     });
-    await this.renameConversationIfSupported(conversation, name);
+    if (parsed.syncTopic) {
+      await this.renameConversationIfSupported(conversation, parsed.name);
+    }
     await this.store.upsertBinding({
       ...binding,
-      threadTitle: name,
+      threadTitle: parsed.name,
       updatedAt: Date.now(),
     });
-    return { text: `Renamed the Codex thread to "${name}".` };
+    return { text: `Renamed the Codex thread to "${parsed.name}".` };
   }
 
   private async startTurn(params: {
@@ -1345,6 +1408,7 @@ export class CodexPluginController {
 
   private async buildThreadPickerButtons(params: {
     conversation: ConversationTarget;
+    syncTopic?: boolean;
     threads: Array<{ threadId: string; title?: string; projectKey?: string }>;
     showProjectName: boolean;
   }): Promise<PluginInteractiveButtons | undefined> {
@@ -1360,6 +1424,7 @@ export class CodexPluginController {
         conversation: params.conversation,
         threadId: thread.threadId,
         workspaceDir: thread.projectKey?.trim() || this.settings.defaultWorkspaceDir || process.cwd(),
+        syncTopic: params.syncTopic,
       });
       rows.push([
         {
@@ -1393,6 +1458,7 @@ export class CodexPluginController {
           view: {
             mode: "threads",
             includeAll: params.parsed.includeAll,
+            syncTopic: params.parsed.syncTopic,
             workspaceDir: params.parsed.cwd,
             query: params.parsed.query || undefined,
             projectName: params.projectName,
@@ -1411,6 +1477,7 @@ export class CodexPluginController {
           view: {
             mode: "threads",
             includeAll: params.parsed.includeAll,
+            syncTopic: params.parsed.syncTopic,
             workspaceDir: params.parsed.cwd,
             query: params.parsed.query || undefined,
             projectName: params.projectName,
@@ -1433,6 +1500,7 @@ export class CodexPluginController {
       view: {
         mode: "projects",
         includeAll: true,
+        syncTopic: params.parsed.syncTopic,
         workspaceDir: params.parsed.cwd,
         page: 0,
       },
@@ -1464,6 +1532,7 @@ export class CodexPluginController {
     const threadButtons =
       (await this.buildThreadPickerButtons({
       conversation,
+      syncTopic: parsed.syncTopic,
       threads: pageResult.items,
       showProjectName: !projectName && distinctProjects.size > 1,
       })) ?? [];
@@ -1473,6 +1542,7 @@ export class CodexPluginController {
         totalPages: pageResult.totalPages,
         totalItems: pageResult.totalItems,
         includeAll: workspaceDir == null,
+        syncTopic: parsed.syncTopic,
         workspaceDir,
         projectName,
       }),
@@ -1506,6 +1576,7 @@ export class CodexPluginController {
         view: {
           mode: "threads",
           includeAll: true,
+          syncTopic: parsed.syncTopic,
           workspaceDir: parsed.cwd,
           projectName: project.name,
           page: 0,
@@ -1528,6 +1599,7 @@ export class CodexPluginController {
           view: {
             mode: "projects",
             includeAll: true,
+            syncTopic: parsed.syncTopic,
             workspaceDir: parsed.cwd,
             query: parsed.query || undefined,
             page: projects.page - 1,
@@ -1545,6 +1617,7 @@ export class CodexPluginController {
           view: {
             mode: "projects",
             includeAll: true,
+            syncTopic: parsed.syncTopic,
             workspaceDir: parsed.cwd,
             query: parsed.query || undefined,
             page: projects.page + 1,
@@ -1566,6 +1639,7 @@ export class CodexPluginController {
       view: {
         mode: "threads",
         includeAll: true,
+        syncTopic: parsed.syncTopic,
         workspaceDir: parsed.cwd,
         page: 0,
       },
@@ -1597,7 +1671,7 @@ export class CodexPluginController {
       components: row.map((button) => ({
         type: 2,
         style: 1,
-        label: button.text,
+        label: truncateDiscordLabel(button.text),
         custom_id: button.callback_data,
       })),
     }));
@@ -1614,7 +1688,7 @@ export class CodexPluginController {
         blocks: (picker.buttons ?? []).map((row) => ({
           type: "actions" as const,
           buttons: row.map((button) => ({
-            label: button.text,
+            label: truncateDiscordLabel(button.text),
             style: "primary" as const,
             callbackData: button.callback_data,
           })),
@@ -1632,11 +1706,28 @@ export class CodexPluginController {
   ): Promise<void> {
     if (callback.kind === "resume-thread") {
       await responders.clear().catch(() => undefined);
+      const threadState = await this.client
+        .readThreadState({
+          sessionKey: buildPluginSessionKey(callback.threadId),
+          threadId: callback.threadId,
+        })
+        .catch(() => undefined);
       await this.bindConversation(callback.conversation, {
         threadId: callback.threadId,
-        workspaceDir: callback.workspaceDir,
+        workspaceDir: threadState?.cwd?.trim() || callback.workspaceDir,
+        threadTitle: threadState?.threadName,
       });
       await this.store.removeCallback(callback.token);
+      if (callback.syncTopic) {
+        const syncedName = buildResumeTopicName({
+          title: threadState?.threadName,
+          projectKey: threadState?.cwd?.trim() || callback.workspaceDir,
+          threadId: callback.threadId,
+        });
+        if (syncedName) {
+          await this.renameConversationIfSupported(responders.conversation, syncedName);
+        }
+      }
       await this.sendBoundConversationSummary(callback.conversation);
       return;
     }
@@ -1721,6 +1812,7 @@ export class CodexPluginController {
     const parsed = {
       includeAll: callback.view.includeAll,
       listProjects: callback.view.mode === "projects",
+      syncTopic: callback.view.syncTopic ?? false,
       cwd: callback.view.workspaceDir,
       query: callback.view.query ?? "",
     };
@@ -2061,7 +2153,7 @@ export class CodexPluginController {
             blocks: opts.buttons.map((row) => ({
               type: "actions" as const,
               buttons: row.map((button) => ({
-                label: button.text,
+                label: truncateDiscordLabel(button.text),
                 style: "primary" as const,
                 callbackData: button.callback_data,
               })),

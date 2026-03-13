@@ -16,6 +16,7 @@ type PutCallbackInput =
       conversation: ConversationTarget;
       threadId: string;
       workspaceDir: string;
+      syncTopic?: boolean;
       token?: string;
       ttlMs?: number;
     }
@@ -195,6 +196,7 @@ export class PluginStateStore {
             conversation: callback.conversation,
             threadId: callback.threadId,
             workspaceDir: callback.workspaceDir,
+            syncTopic: callback.syncTopic,
             token: callback.token ?? this.createCallbackToken(),
             createdAt: now,
             expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),

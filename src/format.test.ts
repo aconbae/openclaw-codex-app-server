@@ -319,6 +319,18 @@ describe("formatThreadPickerIntro", () => {
 
     expect(text).toContain("Legend: 🌿 worktree, ✏️ uncommitted changes, U updated, C created.");
   });
+
+  it("mentions topic sync when the resume picker is in sync mode", () => {
+    const text = formatThreadPickerIntro({
+      page: 0,
+      totalPages: 1,
+      totalItems: 3,
+      includeAll: true,
+      syncTopic: true,
+    });
+
+    expect(text).toContain("sync the current channel/topic name");
+  });
 });
 
 describe("formatSkills", () => {

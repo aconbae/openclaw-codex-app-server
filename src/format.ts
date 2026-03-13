@@ -148,6 +148,7 @@ export function formatThreadPickerIntro(params: {
   totalPages: number;
   totalItems: number;
   includeAll: boolean;
+  syncTopic?: boolean;
   projectName?: string;
   workspaceDir?: string;
 }): string {
@@ -162,6 +163,9 @@ export function formatThreadPickerIntro(params: {
   return [
     `${scopeLabel} ${pageLabel}.`,
     "Legend: 🌿 worktree, ✏️ uncommitted changes, U updated, C created.",
+    params.syncTopic
+      ? "Choosing a session will also try to sync the current channel/topic name."
+      : "",
     `Tap a session to resume it. Use Projects to browse by project or \`--cwd /path/to/project\` to narrow to one workspace.`,
     params.totalItems === 0 ? "No matching Codex threads found." : "",
   ]

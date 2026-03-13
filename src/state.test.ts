@@ -44,6 +44,7 @@ describe("state store", () => {
       },
       threadId: "thread-1",
       workspaceDir: "/tmp/work",
+      syncTopic: true,
     });
     const promptCallback = await store.putCallback({
       kind: "run-prompt",
@@ -78,6 +79,9 @@ describe("state store", () => {
     expect(reloaded.listBindings()).toHaveLength(1);
     expect(reloaded.listBindings()[0]?.contextUsage?.totalTokens).toBe(9_800);
     expect(reloaded.getCallback(callback.token)?.kind).toBe("resume-thread");
+    const resumeCallback = reloaded.getCallback(callback.token);
+    expect(resumeCallback?.kind).toBe("resume-thread");
+    expect(resumeCallback && resumeCallback.kind === "resume-thread" ? resumeCallback.syncTopic : undefined).toBe(true);
     expect(reloaded.getCallback(promptCallback.token)?.kind).toBe("run-prompt");
     expect(reloaded.getCallback(modelCallback.token)?.kind).toBe("set-model");
     expect(reloaded.getCallback(replyCallback.token)?.kind).toBe("reply-text");
