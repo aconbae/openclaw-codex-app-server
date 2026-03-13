@@ -503,8 +503,21 @@ export class CodexPluginController {
             return { handled: true };
           }
         }
-        const handled = await active.handle.queueMessage(event.content);
-        return { handled };
+        try {
+          const handled = await active.handle.queueMessage(event.content);
+          if (handled) {
+            return { handled: true };
+          }
+          this.api.logger.warn(
+            `codex inbound claim could not enqueue message for active run; restarting thread conversation=${conversation.conversationId}`,
+          );
+        } catch (error) {
+          this.api.logger.warn(
+            `codex inbound claim active run enqueue failed; restarting thread conversation=${conversation.conversationId}: ${String(error)}`,
+          );
+        }
+        this.activeRuns.delete(activeKey);
+        await active.handle.interrupt().catch(() => undefined);
       }
       const binding = this.store.getBinding(conversation);
       const resolvedBinding = binding ?? (await this.resolveRuntimeBackedBinding(conversation));
