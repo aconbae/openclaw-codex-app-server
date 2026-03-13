@@ -185,6 +185,35 @@ function buildReplyWithButtons(text: string, buttons?: PluginInteractiveButtons)
     : { text };
 }
 
+function parseFastAction(
+  argsText: string,
+): "toggle" | "on" | "off" | "status" | { error: string } {
+  const normalized = argsText.trim().toLowerCase();
+  if (!normalized) {
+    return "toggle";
+  }
+  if (normalized === "on" || normalized === "off" || normalized === "status") {
+    return normalized;
+  }
+  return { error: "Usage: /codex_fast [on|off|status]" };
+}
+
+function normalizeServiceTier(value: string | undefined | null): string | undefined {
+  const normalized = value?.trim().toLowerCase();
+  return normalized ? normalized : undefined;
+}
+
+function formatFastModeValue(value: string | undefined): string {
+  const normalized = normalizeServiceTier(value);
+  if (!normalized || normalized === "default" || normalized === "auto") {
+    return "off";
+  }
+  if (normalized === "fast" || normalized === "priority") {
+    return "on";
+  }
+  return normalized;
+}
+
 export class CodexPluginController {
   private readonly settings;
   private readonly client;
@@ -340,15 +369,15 @@ export class CodexPluginController {
       case "codex_compact":
         return await this.handleCompactCommand(conversation, binding);
       case "codex_skills":
-        return await this.handleSkillsCommand(binding);
+        return await this.handleSkillsCommand(conversation, binding, args);
       case "codex_experimental":
         return await this.handleExperimentalCommand(binding);
       case "codex_mcp":
-        return await this.handleMcpCommand(binding);
+        return await this.handleMcpCommand(binding, args);
       case "codex_fast":
-        return await this.handleFastCommand(binding);
+        return await this.handleFastCommand(binding, args);
       case "codex_model":
-        return await this.handleModelCommand(binding, args);
+        return await this.handleModelCommand(conversation, binding, args);
       case "codex_permissions":
         return await this.handlePermissionsCommand(binding);
       case "codex_init":
@@ -535,12 +564,50 @@ export class CodexPluginController {
     }
   }
 
-  private async handleSkillsCommand(binding: StoredBinding | null): Promise<ReplyPayload> {
+  private async handleSkillsCommand(
+    conversation: ConversationTarget | null,
+    binding: StoredBinding | null,
+    args: string,
+  ): Promise<ReplyPayload> {
+    const workspaceDir = resolveWorkspaceDir({
+      bindingWorkspaceDir: binding?.workspaceDir,
+      configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
+      serviceWorkspaceDir: this.serviceWorkspaceDir,
+    });
     const skills = await this.client.listSkills({
       sessionKey: binding?.sessionKey,
-      workspaceDir: binding?.workspaceDir,
+      workspaceDir,
     });
-    return { text: formatSkills(skills) };
+    const text = formatSkills({
+      workspaceDir,
+      skills,
+      filter: args,
+    });
+    if (!conversation) {
+      return { text };
+    }
+    const filtered = args.trim()
+      ? skills.filter((skill) => {
+          const haystack = [skill.name, skill.description, skill.cwd].filter(Boolean).join("\n");
+          return haystack.toLowerCase().includes(args.trim().toLowerCase());
+        })
+      : skills;
+    const buttons: PluginInteractiveButtons = [];
+    for (const skill of filtered.slice(0, 8)) {
+      const callback = await this.store.putCallback({
+        kind: "run-prompt",
+        conversation,
+        prompt: `$${skill.name}`,
+        workspaceDir: binding?.workspaceDir || workspaceDir,
+      });
+      buttons.push([
+        {
+          text: `$${skill.name}`,
+          callback_data: `${INTERACTIVE_NAMESPACE}:${callback.token}`,
+        },
+      ]);
+    }
+    return buildReplyWithButtons(text, buttons.length > 0 ? buttons : undefined);
   }
 
   private async handleExperimentalCommand(binding: StoredBinding | null): Promise<ReplyPayload> {
@@ -550,36 +617,50 @@ export class CodexPluginController {
     return { text: formatExperimentalFeatures(features) };
   }
 
-  private async handleMcpCommand(binding: StoredBinding | null): Promise<ReplyPayload> {
+  private async handleMcpCommand(binding: StoredBinding | null, args: string): Promise<ReplyPayload> {
     const servers = await this.client.listMcpServers({
       sessionKey: binding?.sessionKey,
     });
-    return { text: formatMcpServers(servers) };
+    return {
+      text: formatMcpServers({
+        servers,
+        filter: args,
+      }),
+    };
   }
 
-  private async handleFastCommand(binding: StoredBinding | null): Promise<ReplyPayload> {
+  private async handleFastCommand(binding: StoredBinding | null, args: string): Promise<ReplyPayload> {
     if (!binding) {
       return { text: "Bind this conversation to a Codex thread before toggling fast mode." };
+    }
+    const action = parseFastAction(args);
+    if (typeof action === "object") {
+      return { text: action.error };
     }
     const state = await this.client.readThreadState({
       sessionKey: binding.sessionKey,
       threadId: binding.threadId,
     });
-    const nextTier = state.serviceTier === "priority" ? null : "priority";
+    const currentTier = normalizeServiceTier(state.serviceTier);
+    if (action === "status") {
+      return { text: `Fast mode is ${formatFastModeValue(currentTier)}.` };
+    }
+    const nextTier =
+      action === "toggle" ? (currentTier === "fast" || currentTier === "priority" ? null : "fast")
+      : action === "on" ? "fast"
+      : null;
     const updated = await this.client.setThreadServiceTier({
       sessionKey: binding.sessionKey,
       threadId: binding.threadId,
       serviceTier: nextTier,
     });
     return {
-      text:
-        updated.serviceTier === "priority"
-          ? "Codex Fast mode enabled."
-          : "Codex Fast mode disabled.",
+      text: `Fast mode set to ${formatFastModeValue(updated.serviceTier)}.`,
     };
   }
 
   private async handleModelCommand(
+    conversation: ConversationTarget | null,
     binding: StoredBinding | null,
     args: string,
   ): Promise<ReplyPayload> {
@@ -595,7 +676,24 @@ export class CodexPluginController {
           threadId: binding.threadId,
         }),
       ]);
-      return { text: formatModels(models, state) };
+      if (!conversation) {
+        return { text: formatModels(models, state) };
+      }
+      const buttons: PluginInteractiveButtons = [];
+      for (const model of models.slice(0, 8)) {
+        const callback = await this.store.putCallback({
+          kind: "set-model",
+          conversation,
+          model: model.id,
+        });
+        buttons.push([
+          {
+            text: `${model.id}${model.current || model.id === state.model ? " (current)" : ""}`,
+            callback_data: `${INTERACTIVE_NAMESPACE}:${callback.token}`,
+          },
+        ]);
+      }
+      return buildReplyWithButtons(formatModels(models, state), buttons);
     }
     const state = await this.client.setThreadModel({
       sessionKey: binding.sessionKey,
@@ -1220,6 +1318,54 @@ export class CodexPluginController {
       }
       await this.store.removeCallback(callback.token);
       await responders.reply("Sent to Codex.");
+      return;
+    }
+    if (callback.kind === "run-prompt") {
+      await responders.clear().catch(() => undefined);
+      const binding = this.store.getBinding(callback.conversation);
+      const conversation = {
+        ...callback.conversation,
+        threadId: responders.conversation.threadId,
+      };
+      const workspaceDir = callback.workspaceDir?.trim() || binding?.workspaceDir || resolveWorkspaceDir({
+        bindingWorkspaceDir: binding?.workspaceDir,
+        configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
+        serviceWorkspaceDir: this.serviceWorkspaceDir,
+      });
+      await this.store.removeCallback(callback.token);
+      const active = this.activeRuns.get(buildConversationKey(conversation));
+      if (active) {
+        const handled = await active.handle.queueMessage(callback.prompt);
+        if (handled) {
+          await responders.reply(`Sent ${callback.prompt} to Codex.`);
+          return;
+        }
+      }
+      await this.startTurn({
+        conversation,
+        binding,
+        workspaceDir,
+        prompt: callback.prompt,
+        reason: "command",
+      });
+      await responders.reply(`Sent ${callback.prompt} to Codex.`);
+      return;
+    }
+    if (callback.kind === "set-model") {
+      await responders.clear().catch(() => undefined);
+      const binding = this.store.getBinding(callback.conversation);
+      await this.store.removeCallback(callback.token);
+      if (!binding) {
+        await responders.reply("No Codex binding for this conversation.");
+        return;
+      }
+      const state = await this.client.setThreadModel({
+        sessionKey: binding.sessionKey,
+        threadId: binding.threadId,
+        model: callback.model,
+        workspaceDir: binding.workspaceDir,
+      });
+      await responders.reply(`Codex model set to ${state.model || callback.model}.`);
       return;
     }
     const binding = this.store.getBinding(callback.conversation);

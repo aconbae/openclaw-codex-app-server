@@ -33,6 +33,21 @@ type PutCallbackInput =
       view: Extract<CallbackAction, { kind: "picker-view" }>["view"];
       token?: string;
       ttlMs?: number;
+    }
+  | {
+      kind: "run-prompt";
+      conversation: ConversationTarget;
+      prompt: string;
+      workspaceDir?: string;
+      token?: string;
+      ttlMs?: number;
+    }
+  | {
+      kind: "set-model";
+      conversation: ConversationTarget;
+      model: string;
+      token?: string;
+      ttlMs?: number;
     };
 
 function toConversationKey(target: ConversationTarget): string {
@@ -187,14 +202,33 @@ export class PluginStateStore {
               createdAt: now,
               expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
             }
-          : {
+          : callback.kind === "picker-view"
+            ? {
               kind: "picker-view",
               conversation: callback.conversation,
               view: callback.view,
               token: callback.token ?? this.createCallbackToken(),
               createdAt: now,
               expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
-            };
+              }
+            : callback.kind === "run-prompt"
+              ? {
+                  kind: "run-prompt",
+                  conversation: callback.conversation,
+                  prompt: callback.prompt,
+                  workspaceDir: callback.workspaceDir,
+                  token: callback.token ?? this.createCallbackToken(),
+                  createdAt: now,
+                  expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
+                }
+              : {
+                  kind: "set-model",
+                  conversation: callback.conversation,
+                  model: callback.model,
+                  token: callback.token ?? this.createCallbackToken(),
+                  createdAt: now,
+                  expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
+                };
     this.snapshot.callbacks = this.snapshot.callbacks.filter(
       (current) => current.token !== entry.token,
     );

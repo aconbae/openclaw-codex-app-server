@@ -249,7 +249,24 @@ export type CallbackAction =
             page: number;
             query?: string;
             workspaceDir?: string;
-          };
+      };
+      createdAt: number;
+      expiresAt: number;
+    }
+  | {
+      token: string;
+      kind: "run-prompt";
+      conversation: ConversationRef;
+      prompt: string;
+      workspaceDir?: string;
+      createdAt: number;
+      expiresAt: number;
+    }
+  | {
+      token: string;
+      kind: "set-model";
+      conversation: ConversationRef;
+      model: string;
       createdAt: number;
       expiresAt: number;
     };

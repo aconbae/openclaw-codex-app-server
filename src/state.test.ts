@@ -45,11 +45,32 @@ describe("state store", () => {
       threadId: "thread-1",
       workspaceDir: "/tmp/work",
     });
+    const promptCallback = await store.putCallback({
+      kind: "run-prompt",
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      prompt: "$skill-creator",
+      workspaceDir: "/tmp/work",
+    });
+    const modelCallback = await store.putCallback({
+      kind: "set-model",
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      model: "gpt-5.2-codex",
+    });
     const reloaded = await makeStore(dir);
 
     expect(reloaded.listBindings()).toHaveLength(1);
     expect(reloaded.listBindings()[0]?.contextUsage?.totalTokens).toBe(9_800);
     expect(reloaded.getCallback(callback.token)?.kind).toBe("resume-thread");
+    expect(reloaded.getCallback(promptCallback.token)?.kind).toBe("run-prompt");
+    expect(reloaded.getCallback(modelCallback.token)?.kind).toBe("set-model");
   });
 
   it("removes pending requests and related callbacks", async () => {

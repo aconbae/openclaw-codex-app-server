@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   formatBoundThreadSummary,
   formatCodexStatusText,
+  formatMcpServers,
+  formatModels,
+  formatSkills,
   formatThreadPickerIntro,
   formatThreadButtonLabel,
 } from "./format.js";
@@ -311,5 +314,67 @@ describe("formatThreadPickerIntro", () => {
     });
 
     expect(text).toContain("Legend: 🌿 worktree, ✏️ uncommitted changes, U updated, C created.");
+  });
+});
+
+describe("formatSkills", () => {
+  it("matches the old skill summary shape and filtering", () => {
+    expect(
+      formatSkills({
+        workspaceDir: "/repo/openclaw",
+        filter: "creator",
+        skills: [
+          {
+            cwd: "/repo/openclaw",
+            name: "skill-creator",
+            description: "Create or update a Codex skill",
+            enabled: true,
+          },
+          {
+            cwd: "/repo/openclaw",
+            name: "legacy-helper",
+            description: "Old helper",
+            enabled: false,
+          },
+        ],
+      }),
+    ).toContain("skill-creator - Create or update a Codex skill");
+  });
+});
+
+describe("formatMcpServers", () => {
+  it("matches the old MCP summary shape", () => {
+    expect(
+      formatMcpServers({
+        servers: [
+          {
+            name: "github",
+            authStatus: "authenticated",
+            toolCount: 12,
+            resourceCount: 3,
+            resourceTemplateCount: 1,
+          },
+        ],
+      }),
+    ).toContain("github · auth=authenticated · tools=12 · resources=3 · templates=1");
+  });
+});
+
+describe("formatModels", () => {
+  it("shows the current model followed by the available list", () => {
+    const text = formatModels(
+      [
+        { id: "gpt-5.3-codex", current: true },
+        { id: "gpt-5.2-codex" },
+      ],
+      {
+        threadId: "thread-1",
+        model: "gpt-5.3-codex",
+      },
+    );
+
+    expect(text).toContain("Current model: gpt-5.3-codex");
+    expect(text).toContain("Available models:");
+    expect(text).toContain("- gpt-5.2-codex");
   });
 });

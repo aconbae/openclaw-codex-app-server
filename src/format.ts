@@ -587,25 +587,48 @@ export function formatModels(models: ModelSummary[], state?: ThreadState): strin
   if (models.length === 0) {
     return state?.model ? `Current model: ${state.model}` : "No Codex models reported.";
   }
-  return [
-    "Codex models:",
+  const currentModel = models.find((model) => model.current)?.id || state?.model;
+  const lines = [];
+  if (currentModel) {
+    lines.push(`Current model: ${currentModel}`);
+  }
+  lines.push(
+    "Available models:",
     ...models.slice(0, 20).map((model) => {
       const current = model.current || model.id === state?.model ? " (current)" : "";
       return `- ${model.id}${current}`;
     }),
-  ].join("\n");
+  );
+  return lines.join("\n");
 }
 
-export function formatSkills(skills: SkillSummary[]): string {
+export function formatSkills(params: {
+  workspaceDir: string;
+  skills: SkillSummary[];
+  filter?: string;
+}): string {
+  const filter = params.filter?.trim().toLowerCase();
+  const skills = filter
+    ? params.skills.filter((skill) => {
+        const haystack = [skill.name, skill.description, skill.cwd].filter(Boolean).join("\n");
+        return haystack.toLowerCase().includes(filter);
+      })
+    : params.skills;
+  const lines = [`Codex skills for ${params.workspaceDir}:`];
   if (skills.length === 0) {
-    return "No Codex skills reported.";
+    lines.push(filter ? `No Codex skills matched "${params.filter?.trim()}".` : "No Codex skills found.");
+    return lines.join("\n");
   }
-  return [
-    "Codex skills:",
-    ...skills.slice(0, 30).map((skill) =>
-      `- ${skill.name}${skill.enabled === false ? " (disabled)" : ""}${skill.cwd ? ` - ${skill.cwd}` : ""}`,
-    ),
-  ].join("\n");
+  for (const skill of skills.slice(0, 20)) {
+    const suffix = skill.description?.trim() ? ` - ${skill.description.trim()}` : "";
+    const state =
+      skill.enabled === false ? " (disabled)" : skill.enabled === true ? "" : " (status unknown)";
+    lines.push(`- ${skill.name}${state}${suffix}`);
+  }
+  if (skills.length > 20) {
+    lines.push(`- …and ${skills.length - 20} more`);
+  }
+  return lines.join("\n");
 }
 
 export function formatExperimentalFeatures(features: ExperimentalFeatureSummary[]): string {
@@ -620,16 +643,35 @@ export function formatExperimentalFeatures(features: ExperimentalFeatureSummary[
   ].join("\n");
 }
 
-export function formatMcpServers(servers: McpServerSummary[]): string {
+export function formatMcpServers(params: {
+  servers: McpServerSummary[];
+  filter?: string;
+}): string {
+  const filter = params.filter?.trim().toLowerCase();
+  const servers = filter
+    ? params.servers.filter((server) => {
+        const haystack = [server.name, server.authStatus].filter(Boolean).join("\n");
+        return haystack.toLowerCase().includes(filter);
+      })
+    : params.servers;
+  const lines = ["Codex MCP servers:"];
   if (servers.length === 0) {
-    return "No Codex MCP servers reported.";
+    lines.push(filter ? `No MCP servers matched "${params.filter?.trim()}".` : "No MCP servers reported.");
+    return lines.join("\n");
   }
-  return [
-    "Codex MCP servers:",
-    ...servers.slice(0, 20).map((server) =>
-      `- ${server.name} - tools ${server.toolCount}, resources ${server.resourceCount}, templates ${server.resourceTemplateCount}`,
-    ),
-  ].join("\n");
+  for (const server of servers.slice(0, 20)) {
+    const details = [
+      server.authStatus ? `auth=${server.authStatus}` : undefined,
+      `tools=${server.toolCount}`,
+      `resources=${server.resourceCount}`,
+      `templates=${server.resourceTemplateCount}`,
+    ].filter(Boolean);
+    lines.push(`- ${server.name} · ${details.join(" · ")}`);
+  }
+  if (servers.length > 20) {
+    lines.push(`- …and ${servers.length - 20} more`);
+  }
+  return lines.join("\n");
 }
 
 export function formatThreadReplay(replay: ThreadReplay): string {
