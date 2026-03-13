@@ -3,10 +3,8 @@ import { CodexPluginController } from "./src/controller.js";
 import { INTERACTIVE_NAMESPACE } from "./src/types.js";
 
 const COMMANDS = [
-  ["codex", "Start or continue a Codex App Server turn."],
-  ["codex_list", "List Codex threads for this workspace."],
-  ["codex_join", "Bind this conversation to an existing Codex thread."],
   ["codex_resume", "Resume or bind an existing Codex thread."],
+  ["codex_detach", "Detach this conversation from the current Codex thread."],
   ["codex_status", "Show the current Codex binding and thread state."],
   ["codex_stop", "Stop the active Codex turn."],
   ["codex_plan", "Ask Codex to produce a plan instead of executing work."],

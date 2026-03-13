@@ -321,13 +321,14 @@ export class CodexPluginController {
     const args = ctx.args?.trim() ?? "";
 
     switch (commandName) {
-      case "codex":
-        return await this.handleMainCodexCommand(ctx, conversation, binding, args);
-      case "codex_list":
-        return await this.handleListCommand(conversation, binding, args, ctx.channel);
-      case "codex_join":
       case "codex_resume":
         return await this.handleJoinCommand(conversation, binding, args, ctx.channel);
+      case "codex_detach":
+        if (!conversation) {
+          return { text: "This command needs a Telegram or Discord conversation." };
+        }
+        await this.unbindConversation(conversation);
+        return { text: "Detached this conversation from Codex." };
       case "codex_status":
         return await this.handleStatusCommand(binding);
       case "codex_stop":
@@ -359,73 +360,6 @@ export class CodexPluginController {
       default:
         return { text: "Unknown Codex command." };
     }
-  }
-
-  private async handleMainCodexCommand(
-    ctx: PluginCommandContext,
-    conversation: ConversationTarget | null,
-    binding: StoredBinding | null,
-    args: string,
-  ): Promise<ReplyPayload> {
-    if (!args) {
-      return binding
-        ? await this.handleStatusCommand(binding)
-        : {
-            text:
-              "/codex <prompt>\n/codex list\n/codex resume [thread]\n/codex join <thread>\n/codex status\n/codex stop\n/codex detach",
-          };
-    }
-    const [first, ...rest] = args.split(/\s+/);
-    const subcommand = first.toLowerCase();
-    const remainder = rest.join(" ").trim();
-    if (subcommand === "list") {
-      return await this.handleListCommand(conversation, binding, remainder, ctx.channel);
-    }
-    if (subcommand === "resume" || subcommand === "join") {
-      return await this.handleJoinCommand(conversation, binding, remainder, ctx.channel);
-    }
-    if (subcommand === "status") {
-      return await this.handleStatusCommand(binding);
-    }
-    if (subcommand === "stop") {
-      return await this.handleStopCommand(conversation);
-    }
-    if (subcommand === "detach") {
-      if (!conversation) {
-        return { text: "This command needs a Telegram or Discord conversation." };
-      }
-      await this.unbindConversation(conversation);
-      return { text: "Detached this conversation from Codex." };
-    }
-    if (subcommand === "plan") {
-      return await this.handlePlanCommand(conversation, binding, remainder);
-    }
-    if (subcommand === "review") {
-      return await this.handleReviewCommand(conversation, binding, remainder);
-    }
-    if (subcommand === "compact") {
-      return await this.handleCompactCommand(conversation, binding);
-    }
-    if (subcommand === "rename") {
-      return await this.handleRenameCommand(conversation, binding, remainder);
-    }
-    const prompt = subcommand === "new" ? remainder : args;
-    if (!conversation) {
-      return { text: "This command needs a Telegram or Discord conversation." };
-    }
-    const workspaceDir = resolveWorkspaceDir({
-      bindingWorkspaceDir: binding?.workspaceDir,
-      configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
-      serviceWorkspaceDir: this.serviceWorkspaceDir,
-    });
-    await this.startTurn({
-      conversation,
-      binding,
-      workspaceDir,
-      prompt,
-      reason: "command",
-    });
-    return { text: "Codex is working. Plain text in this bound conversation now routes to Codex." };
   }
 
   private async handleListCommand(
