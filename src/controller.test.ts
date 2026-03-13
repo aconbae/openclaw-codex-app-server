@@ -195,8 +195,8 @@ describe("Discord controller flows", () => {
     );
   });
 
-  it("edits Discord pickers in place for plugin-owned callbacks", async () => {
-    const { controller } = await createControllerHarness();
+  it("refreshes Discord pickers by clearing the old components and sending a new picker", async () => {
+    const { controller, sendComponentMessage } = await createControllerHarness();
     const callback = await (controller as any).store.putCallback({
       kind: "picker-view",
       conversation: {
@@ -206,6 +206,61 @@ describe("Discord controller flows", () => {
       },
       view: {
         mode: "threads",
+        includeAll: true,
+        page: 0,
+      },
+    });
+    const clearComponents = vi.fn(async () => {});
+
+    await controller.handleDiscordInteractive({
+      channel: "discord",
+      accountId: "default",
+      interactionId: "interaction-1",
+      conversationId: "channel:chan-1",
+      auth: { isAuthorizedSender: true },
+      interaction: {
+        kind: "button",
+        data: `codexapp:${callback.token}`,
+        namespace: "codexapp",
+        payload: callback.token,
+        messageId: "message-1",
+      },
+      senderId: "user-1",
+      senderUsername: "Ada",
+      respond: {
+        acknowledge: vi.fn(async () => {}),
+        reply: vi.fn(async () => {}),
+        followUp: vi.fn(async () => {}),
+        editMessage: vi.fn(async () => {}),
+        clearComponents,
+      },
+    } as any);
+
+    expect(clearComponents).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Showing recent Codex sessions"),
+      }),
+    );
+    expect(sendComponentMessage).toHaveBeenCalledWith(
+      "channel:chan-1",
+      expect.objectContaining({
+        text: expect.stringContaining("Showing recent Codex sessions"),
+      }),
+      expect.objectContaining({ accountId: "default" }),
+    );
+  });
+
+  it("refreshes the Discord project picker without using interactive editMessage components", async () => {
+    const { controller, sendComponentMessage } = await createControllerHarness();
+    const callback = await (controller as any).store.putCallback({
+      kind: "picker-view",
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:chan-1",
+      },
+      view: {
+        mode: "projects",
         includeAll: true,
         page: 0,
       },
@@ -236,11 +291,13 @@ describe("Discord controller flows", () => {
       },
     } as any);
 
-    expect(editMessage).toHaveBeenCalledWith(
+    expect(editMessage).not.toHaveBeenCalled();
+    expect(sendComponentMessage).toHaveBeenCalledWith(
+      "channel:chan-1",
       expect.objectContaining({
-        text: expect.stringContaining("Showing recent Codex sessions"),
-        components: expect.any(Array),
+        text: expect.stringContaining("Choose a project to filter recent Codex sessions"),
       }),
+      expect.objectContaining({ accountId: "default" }),
     );
   });
 });

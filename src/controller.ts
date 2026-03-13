@@ -475,10 +475,23 @@ export class CodexPluginController {
         await ctx.respond.reply({ text, ephemeral: true });
       },
       editPicker: async (picker) => {
-        await ctx.respond.editMessage({
-          text: picker.text,
-          components: this.toDiscordComponents(picker.buttons),
+        this.api.logger.debug(
+          `codex discord picker refresh conversation=${ctx.conversationId} rows=${picker.buttons?.length ?? 0}`,
+        );
+        await ctx.respond.clearComponents({ text: picker.text }).catch((error) => {
+          this.api.logger.warn(
+            `codex discord picker clear failed conversation=${ctx.conversationId}: ${String(error)}`,
+          );
         });
+        await this.sendDiscordPicker(
+          {
+            channel: "discord",
+            accountId: ctx.accountId,
+            conversationId: ctx.conversationId,
+            parentConversationId: ctx.parentConversationId,
+          },
+          picker,
+        );
       },
     });
   }
@@ -1925,21 +1938,6 @@ export class CodexPluginController {
       }),
       buttons,
     };
-  }
-
-  private toDiscordComponents(buttons: PluginInteractiveButtons | undefined): unknown[] | undefined {
-    if (!buttons || buttons.length === 0) {
-      return undefined;
-    }
-    return buttons.map((row) => ({
-      type: 1,
-      components: row.map((button) => ({
-        type: 2,
-        style: 1,
-        label: truncateDiscordLabel(button.text),
-        custom_id: button.callback_data,
-      })),
-    }));
   }
 
   private async sendDiscordPicker(
