@@ -138,8 +138,20 @@ function normalizeDiscordConversationId(raw: string | undefined): string | undef
   if (!trimmed) {
     return undefined;
   }
+  if (trimmed.startsWith("discord:channel:")) {
+    return `channel:${trimmed.slice("discord:channel:".length)}`;
+  }
+  if (trimmed.startsWith("discord:group:")) {
+    return `channel:${trimmed.slice("discord:group:".length)}`;
+  }
+  if (trimmed.startsWith("discord:user:")) {
+    return `user:${trimmed.slice("discord:user:".length)}`;
+  }
   if (trimmed.startsWith("discord:")) {
-    return trimmed.slice("discord:".length);
+    return `user:${trimmed.slice("discord:".length)}`;
+  }
+  if (trimmed.startsWith("slash:")) {
+    return undefined;
   }
   return trimmed;
 }
@@ -160,7 +172,7 @@ function toConversationTargetFromCommand(ctx: PluginCommandContext): Conversatio
     };
   }
   if (isDiscordChannel(ctx.channel)) {
-    const conversationId = normalizeDiscordConversationId(ctx.to ?? ctx.from);
+    const conversationId = normalizeDiscordConversationId(ctx.from ?? ctx.to);
     if (!conversationId) {
       return null;
     }
@@ -476,6 +488,11 @@ export class CodexPluginController {
     const conversation = toConversationTargetFromCommand(ctx);
     const binding = conversation ? this.store.getBinding(conversation) : null;
     const args = ctx.args?.trim() ?? "";
+    if (isDiscordChannel(ctx.channel)) {
+      this.api.logger.debug(
+        `codex discord command /${commandName} from=${ctx.from ?? "<none>"} to=${ctx.to ?? "<none>"} conversation=${conversation?.conversationId ?? "<none>"}`,
+      );
+    }
 
     switch (commandName) {
       case "codex_resume":
@@ -840,6 +857,18 @@ export class CodexPluginController {
         },
       ]);
     }
+    if (conversation && isDiscordChannel(conversation.channel) && buttons.length > 0) {
+      try {
+        await this.sendReply(conversation, {
+          text,
+          buttons,
+        });
+        return { text: "Sent Codex skills to this Discord conversation." };
+      } catch (error) {
+        this.api.logger.warn(`codex discord skills send failed: ${String(error)}`);
+        return { text };
+      }
+    }
     return buildReplyWithButtons(text, buttons.length > 0 ? buttons : undefined);
   }
 
@@ -925,6 +954,18 @@ export class CodexPluginController {
             callback_data: `${INTERACTIVE_NAMESPACE}:${callback.token}`,
           },
         ]);
+      }
+      if (isDiscordChannel(conversation.channel) && buttons.length > 0) {
+        try {
+          await this.sendReply(conversation, {
+            text: formatModels(models, state),
+            buttons,
+          });
+          return { text: "Sent Codex model choices to this Discord conversation." };
+        } catch (error) {
+          this.api.logger.warn(`codex discord model picker send failed: ${String(error)}`);
+          return { text: formatModels(models, state) };
+        }
       }
       return buildReplyWithButtons(formatModels(models, state), buttons);
     }
@@ -1905,6 +1946,9 @@ export class CodexPluginController {
     conversation: ConversationTarget,
     picker: PickerRender,
   ): Promise<void> {
+    this.api.logger.debug(
+      `codex discord picker send conversation=${conversation.conversationId} rows=${picker.buttons?.length ?? 0}`,
+    );
     await this.api.runtime.channel.discord.sendComponentMessage(
       conversation.conversationId,
       {
@@ -2500,6 +2544,9 @@ export class CodexPluginController {
         ? this.api.runtime.channel.text.chunkText(text, limit).filter(Boolean)
         : [];
       if (payload.buttons && payload.buttons.length > 0) {
+        this.api.logger.debug(
+          `codex discord reply send conversation=${conversation.conversationId} rows=${payload.buttons.length}`,
+        );
         const finalChunk = chunks.pop() ?? text;
         for (const chunk of chunks) {
           await this.api.runtime.channel.discord.sendMessageDiscord(conversation.conversationId, chunk, {
