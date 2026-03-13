@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   formatBoundThreadSummary,
   formatCodexStatusText,
@@ -123,6 +123,181 @@ describe("formatCodexStatusText", () => {
     expect(text).toContain("Rate limits timezone:");
     expect(text).toContain("5h limit: 85% left");
     expect(text).toContain("Weekly limit: 85% left");
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("formats context usage once a fresh token snapshot exists", () => {
+    const text = formatCodexStatusText({
+      bindingActive: true,
+      threadState: {
+        threadId: "thread-123",
+        threadName: "Plan TASKS doc refresh",
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        reasoningEffort: "high",
+        cwd: "/repo/openclaw",
+      },
+      account: {
+        type: "chatgpt",
+        email: "user@example.com",
+        planType: "pro",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw",
+      contextUsage: {
+        totalTokens: 139_000,
+        contextWindow: 258_000,
+      },
+      rateLimits: [
+        {
+          name: "5h limit",
+          usedPercent: 4,
+        },
+      ],
+    });
+
+    expect(text).toContain("Context usage: 139k / 258k tokens used (54% full)");
+  });
+
+  it("does not render a partial context usage line when only the window size is known", () => {
+    const text = formatCodexStatusText({
+      bindingActive: true,
+      threadState: {
+        threadId: "thread-123",
+        threadName: "Plan TASKS doc refresh",
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        cwd: "/repo/openclaw",
+      },
+      account: {
+        type: "chatgpt",
+        email: "user@example.com",
+        planType: "pro",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw",
+      contextUsage: {
+        contextWindow: 272_000,
+      },
+      rateLimits: [],
+    });
+
+    expect(text).not.toContain("Context usage: ? / 272k");
+    expect(text).toContain("Context usage: unavailable until Codex emits a token-usage update");
+  });
+
+  it("hides non-matching model-specific rate-limit rows", () => {
+    const text = formatCodexStatusText({
+      bindingActive: true,
+      threadState: {
+        threadId: "thread-123",
+        threadName: "Plan TASKS doc refresh",
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        cwd: "/repo/openclaw",
+      },
+      account: {
+        type: "chatgpt",
+        email: "user@example.com",
+        planType: "pro",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw",
+      rateLimits: [
+        { name: "5h limit", usedPercent: 4 },
+        { name: "Weekly limit", usedPercent: 17 },
+        { name: "GPT-5.3-Codex-Spark 5h limit", usedPercent: 0 },
+        { name: "GPT-5.3-Codex-Spark Weekly limit", usedPercent: 0 },
+      ],
+    });
+
+    expect(text).toContain("5h limit: 96% left");
+    expect(text).toContain("Weekly limit: 83% left");
+    expect(text).not.toContain("GPT-5.3-Codex-Spark 5h limit");
+    expect(text).not.toContain("GPT-5.3-Codex-Spark Weekly limit");
+  });
+
+  it("groups model-specific rate-limit rows after generic rows", () => {
+    const text = formatCodexStatusText({
+      bindingActive: true,
+      threadState: {
+        threadId: "thread-123",
+        threadName: "Plan TASKS doc refresh",
+        model: "gpt-5.3-codex-spark",
+        modelProvider: "openai",
+        cwd: "/repo/openclaw",
+      },
+      account: {
+        type: "chatgpt",
+        email: "user@example.com",
+        planType: "pro",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw",
+      rateLimits: [
+        { name: "GPT-5.3-Codex-Spark Weekly limit", usedPercent: 0 },
+        { name: "Weekly limit", usedPercent: 17 },
+        { name: "GPT-5.3-Codex-Spark 5h limit", usedPercent: 0 },
+        { name: "5h limit", usedPercent: 4 },
+      ],
+    });
+
+    const genericFiveHourIndex = text.indexOf("5h limit: 96% left");
+    const genericWeeklyIndex = text.indexOf("Weekly limit: 83% left");
+    const sparkFiveHourIndex = text.indexOf("GPT-5.3-Codex-Spark 5h limit: 100% left");
+    const sparkWeeklyIndex = text.indexOf("GPT-5.3-Codex-Spark Weekly limit: 100% left");
+
+    expect(genericFiveHourIndex).toBeGreaterThan(-1);
+    expect(genericWeeklyIndex).toBeGreaterThan(genericFiveHourIndex);
+    expect(sparkFiveHourIndex).toBeGreaterThan(genericWeeklyIndex);
+    expect(sparkWeeklyIndex).toBeGreaterThan(sparkFiveHourIndex);
+  });
+
+  it("formats reset windows in local time and rolls stale anchors forward", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-07T12:00:00-05:00"));
+
+    const text = formatCodexStatusText({
+      bindingActive: true,
+      threadState: {
+        threadId: "thread-123",
+        threadName: "Plan TASKS doc refresh",
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        cwd: "/repo/openclaw",
+      },
+      account: {
+        type: "chatgpt",
+        email: "user@example.com",
+        planType: "pro",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw",
+      rateLimits: [
+        {
+          name: "5h limit",
+          usedPercent: 11,
+          resetAt: new Date("2026-01-21T07:28:00-05:00").getTime(),
+          windowSeconds: 18_000,
+        },
+        {
+          name: "Weekly limit",
+          usedPercent: 20,
+          resetAt: new Date("2026-01-21T07:34:00-05:00").getTime(),
+          windowSeconds: 604_800,
+        },
+      ],
+    });
+
+    expect(text).toContain(
+      `Rate limits timezone: ${new Intl.DateTimeFormat().resolvedOptions().timeZone}`,
+    );
+    expect(text).toContain("5h limit: 89% left (resets 12:28 PM)");
+    expect(text).toContain("Weekly limit: 80% left (resets Mar 11)");
+    expect(text).not.toContain("Jan 21");
   });
 });
 

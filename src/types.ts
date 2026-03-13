@@ -198,6 +198,7 @@ export type StoredBinding = {
   threadId: string;
   workspaceDir: string;
   threadTitle?: string;
+  contextUsage?: ContextUsageSnapshot;
   updatedAt: number;
 };
 

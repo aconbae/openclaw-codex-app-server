@@ -221,6 +221,25 @@ function shortenHomePath(value?: string): string | undefined {
   return trimmed;
 }
 
+function formatTokenCount(value?: number): string {
+  if (value === undefined || !Number.isFinite(value)) {
+    return "0";
+  }
+  const safe = Math.max(0, value);
+  if (safe >= 1_000_000) {
+    return `${(safe / 1_000_000).toFixed(1)}m`;
+  }
+  if (safe >= 1_000) {
+    const precision = safe >= 10_000 ? 0 : 1;
+    const formattedThousands = (safe / 1_000).toFixed(precision);
+    if (Number(formattedThousands) >= 1_000) {
+      return `${(safe / 1_000_000).toFixed(1)}m`;
+    }
+    return `${formattedThousands}k`;
+  }
+  return String(Math.round(safe));
+}
+
 export function formatCodexPermissions(params: {
   approvalPolicy?: string;
   sandbox?: string;
@@ -278,7 +297,16 @@ export function formatCodexModelText(threadState: ThreadState | undefined): stri
 
 function formatCodexFastModeValue(value: string | undefined): string {
   const normalized = value?.trim().toLowerCase();
-  return normalized === "fast" ? "on" : "off";
+  if (!normalized) {
+    return "off";
+  }
+  if (normalized === "default" || normalized === "auto") {
+    return "off";
+  }
+  if (normalized === "fast" || normalized === "priority") {
+    return "on";
+  }
+  return normalized;
 }
 
 function advanceCodexResetAtToNextWindow(params: {
@@ -432,8 +460,8 @@ export function formatCodexContextUsageSnapshot(
   if (typeof totalTokens !== "number") {
     return undefined;
   }
-  const totalLabel = `${Math.round(totalTokens / 1000)}k`;
-  const contextLabel = typeof contextWindow === "number" ? `${Math.round(contextWindow / 1000)}k` : "?";
+  const totalLabel = formatTokenCount(totalTokens);
+  const contextLabel = typeof contextWindow === "number" ? formatTokenCount(contextWindow) : "?";
   const percentFull =
     typeof totalTokens === "number" && typeof contextWindow === "number" && contextWindow > 0
       ? Math.max(0, Math.min(100, Math.round((totalTokens / contextWindow) * 100)))

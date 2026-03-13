@@ -4,16 +4,21 @@ import fs from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { PluginStateStore, buildPluginSessionKey } from "./state.js";
 
-async function makeStore(): Promise<PluginStateStore> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oc-codex-plugin-"));
-  const store = new PluginStateStore(dir);
+async function makeStoreDir(): Promise<string> {
+  return await fs.mkdtemp(path.join(os.tmpdir(), "oc-codex-plugin-"));
+}
+
+async function makeStore(dir?: string): Promise<PluginStateStore> {
+  const resolvedDir = dir ?? (await makeStoreDir());
+  const store = new PluginStateStore(resolvedDir);
   await store.load();
   return store;
 }
 
 describe("state store", () => {
   it("persists bindings and callbacks", async () => {
-    const store = await makeStore();
+    const dir = await makeStoreDir();
+    const store = await makeStore(dir);
     await store.upsertBinding({
       conversation: {
         channel: "telegram",
@@ -23,6 +28,11 @@ describe("state store", () => {
       sessionKey: buildPluginSessionKey("thread-1"),
       threadId: "thread-1",
       workspaceDir: "/tmp/work",
+      contextUsage: {
+        totalTokens: 9_800,
+        contextWindow: 258_000,
+        remainingPercent: 96,
+      },
       updatedAt: Date.now(),
     });
     const callback = await store.putCallback({
@@ -35,8 +45,11 @@ describe("state store", () => {
       threadId: "thread-1",
       workspaceDir: "/tmp/work",
     });
-    expect(store.listBindings()).toHaveLength(1);
-    expect(store.getCallback(callback.token)?.kind).toBe("resume-thread");
+    const reloaded = await makeStore(dir);
+
+    expect(reloaded.listBindings()).toHaveLength(1);
+    expect(reloaded.listBindings()[0]?.contextUsage?.totalTokens).toBe(9_800);
+    expect(reloaded.getCallback(callback.token)?.kind).toBe("resume-thread");
   });
 
   it("removes pending requests and related callbacks", async () => {

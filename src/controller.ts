@@ -588,6 +588,13 @@ export class CodexPluginController {
           ? `Codex compacted the thread. Context remaining: ${result.usage.remainingPercent}%.`
           : "Codex compacted the thread.",
       );
+      if (result.usage) {
+        await this.store.upsertBinding({
+          ...binding,
+          contextUsage: result.usage,
+          updatedAt: Date.now(),
+        });
+      }
       return { text: "Codex compaction started and the follow-up message was sent." };
     } finally {
       typing?.stop();
@@ -789,6 +796,13 @@ export class CodexPluginController {
             await this.store.upsertBinding({
               ...nextBinding,
               threadTitle: state.threadName,
+              contextUsage: result.usage ?? nextBinding.contextUsage,
+              updatedAt: Date.now(),
+            });
+          } else if (result.usage) {
+            await this.store.upsertBinding({
+              ...nextBinding,
+              contextUsage: result.usage,
               updatedAt: Date.now(),
             });
           }
@@ -1333,6 +1347,7 @@ export class CodexPluginController {
       threadId: params.threadId,
       workspaceDir: params.workspaceDir,
       threadTitle: params.threadTitle,
+      contextUsage: this.store.getBinding(conversation)?.contextUsage,
       updatedAt: Date.now(),
     };
     const existing = this.api.runtime.channel.bindings.resolveByConversation(record.conversation);
@@ -1421,6 +1436,7 @@ export class CodexPluginController {
             ...binding,
             threadTitle: state.threadName?.trim() || binding.threadTitle,
             workspaceDir: state.cwd?.trim() || binding.workspaceDir,
+            contextUsage: binding.contextUsage,
             updatedAt: Date.now(),
           }
         : binding;
@@ -1496,6 +1512,7 @@ export class CodexPluginController {
       bindingActive: Boolean(binding),
       projectFolder,
       worktreeFolder: threadState?.cwd?.trim() || binding?.workspaceDir || workspaceDir,
+      contextUsage: binding?.contextUsage,
     });
   }
 

@@ -2515,3 +2515,7 @@ export class CodexAppServerClient {
     };
   }
 }
+
+export const __testing = {
+  extractThreadTokenUsageSnapshot,
+};
