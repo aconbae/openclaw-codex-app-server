@@ -156,6 +156,53 @@ function normalizeDiscordConversationId(raw: string | undefined): string | undef
   return trimmed;
 }
 
+function denormalizeDiscordConversationId(raw: string | undefined): string | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (trimmed.startsWith("channel:")) {
+    return trimmed.slice("channel:".length);
+  }
+  if (trimmed.startsWith("user:")) {
+    return trimmed.slice("user:".length);
+  }
+  if (trimmed.startsWith("discord:channel:")) {
+    return trimmed.slice("discord:channel:".length);
+  }
+  if (trimmed.startsWith("discord:user:")) {
+    return trimmed.slice("discord:user:".length);
+  }
+  if (trimmed.startsWith("discord:")) {
+    return trimmed.slice("discord:".length);
+  }
+  return trimmed;
+}
+
+function toRuntimeBindingConversationRef(
+  conversation: ConversationTarget | ConversationRef,
+): ConversationRef {
+  if (conversation.channel !== "discord") {
+    return {
+      channel: conversation.channel,
+      accountId: conversation.accountId,
+      conversationId: conversation.conversationId,
+      parentConversationId: conversation.parentConversationId,
+    };
+  }
+  return {
+    channel: conversation.channel,
+    accountId: conversation.accountId,
+    conversationId: denormalizeDiscordConversationId(conversation.conversationId) ?? conversation.conversationId,
+    parentConversationId:
+      denormalizeDiscordConversationId(conversation.parentConversationId) ??
+      conversation.parentConversationId,
+  };
+}
+
 function normalizeDiscordInteractiveConversationId(params: {
   conversationId?: string;
   guildId?: string;
@@ -205,15 +252,42 @@ function toConversationTargetFromInbound(event: {
   conversationId?: string;
   parentConversationId?: string;
   threadId?: string | number;
+  isGroup?: boolean;
+  metadata?: Record<string, unknown>;
 }): ConversationTarget | null {
   if (!event.accountId || !event.conversationId) {
     return null;
   }
+  const channel = event.channel.trim().toLowerCase();
+  const conversationIdRaw = event.conversationId?.trim();
+  const conversationId =
+    channel === "discord"
+      ? (() => {
+          const normalized = normalizeDiscordConversationId(conversationIdRaw);
+          if (!normalized) {
+            return undefined;
+          }
+          if (normalized.includes(":")) {
+            return normalized;
+          }
+          const guildId =
+            typeof event.metadata?.guildId === "string" ? event.metadata.guildId.trim() : "";
+          const isChannel = Boolean(event.parentConversationId?.trim() || event.isGroup || guildId);
+          return `${isChannel ? "channel" : "user"}:${normalized}`;
+        })()
+      : event.conversationId;
+  const parentConversationId =
+    channel === "discord"
+      ? normalizeDiscordConversationId(event.parentConversationId)
+      : event.parentConversationId;
+  if (!conversationId) {
+    return null;
+  }
   return {
-    channel: event.channel.trim().toLowerCase(),
+    channel,
     accountId: event.accountId,
-    conversationId: event.conversationId,
-    parentConversationId: event.parentConversationId,
+    conversationId,
+    parentConversationId,
     threadId:
       typeof event.threadId === "number"
         ? event.threadId
@@ -397,6 +471,8 @@ export class CodexPluginController {
     conversationId?: string;
     parentConversationId?: string;
     threadId?: string | number;
+    isGroup?: boolean;
+    metadata?: Record<string, unknown>;
   }): Promise<{ handled: boolean }> {
     if (!this.settings.enabled) {
       return { handled: false };
@@ -494,7 +570,11 @@ export class CodexPluginController {
         parentConversationId: ctx.parentConversationId,
       },
       clear: async () => {
-        await ctx.respond.clearComponents().catch(() => undefined);
+        try {
+          await ctx.respond.clearComponents();
+        } catch {
+          await ctx.respond.acknowledge().catch(() => undefined);
+        }
       },
       reply: async (text) => {
         await ctx.respond.reply({ text, ephemeral: true });
@@ -2269,13 +2349,14 @@ export class CodexPluginController {
       contextUsage: this.store.getBinding(conversation)?.contextUsage,
       updatedAt: Date.now(),
     };
-    const existing = this.api.runtime.channel.bindings.resolveByConversation(record.conversation);
+    const runtimeConversation = toRuntimeBindingConversationRef(record.conversation);
+    const existing = this.api.runtime.channel.bindings.resolveByConversation(runtimeConversation);
     if (!existing) {
       try {
         await this.api.runtime.channel.bindings.bind({
           targetSessionKey: sessionKey,
           targetKind: "session",
-          conversation: record.conversation,
+          conversation: runtimeConversation,
           placement: "current",
           metadata: {
             pluginId: PLUGIN_ID,
@@ -2663,7 +2744,8 @@ export class CodexPluginController {
           continue;
         }
       }
-      const existing = this.api.runtime.channel.bindings.resolveByConversation(binding.conversation);
+      const runtimeConversation = toRuntimeBindingConversationRef(binding.conversation);
+      const existing = this.api.runtime.channel.bindings.resolveByConversation(runtimeConversation);
       if (existing?.targetSessionKey === binding.sessionKey) {
         continue;
       }
@@ -2671,7 +2753,7 @@ export class CodexPluginController {
         await this.api.runtime.channel.bindings.bind({
           targetSessionKey: binding.sessionKey,
           targetKind: "session",
-          conversation: binding.conversation,
+          conversation: runtimeConversation,
           placement: "current",
           metadata: {
             pluginId: PLUGIN_ID,

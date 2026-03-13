@@ -13,6 +13,8 @@ function createApiMock() {
   const stateDir = makeStateDir();
   const sendComponentMessage = vi.fn(async () => ({}));
   const sendMessageDiscord = vi.fn(async () => ({}));
+  const bindingBind = vi.fn(async () => ({}));
+  const bindingResolveByConversation = vi.fn(() => null);
   const api = {
     id: "test-plugin",
     pluginConfig: {
@@ -31,9 +33,9 @@ function createApiMock() {
       },
       channel: {
         bindings: {
-          bind: vi.fn(async () => ({})),
+          bind: bindingBind,
           unbind: vi.fn(async () => ({})),
-          resolveByConversation: vi.fn(() => null),
+          resolveByConversation: bindingResolveByConversation,
         },
         text: {
           chunkText: (text: string) => [text],
@@ -66,11 +68,11 @@ function createApiMock() {
     registerCommand: vi.fn(),
     on: vi.fn(),
   } satisfies OpenClawPluginApi;
-  return { api, sendComponentMessage, sendMessageDiscord, stateDir };
+  return { api, sendComponentMessage, sendMessageDiscord, bindingBind, bindingResolveByConversation, stateDir };
 }
 
 async function createControllerHarness() {
-  const { api, sendComponentMessage, sendMessageDiscord, stateDir } = createApiMock();
+  const { api, sendComponentMessage, sendMessageDiscord, bindingBind, bindingResolveByConversation, stateDir } = createApiMock();
   const controller = new CodexPluginController(api);
   await controller.start();
   const clientMock = {
@@ -98,10 +100,23 @@ async function createControllerHarness() {
       cwd: "/repo/openclaw",
       serviceTier: "default",
     })),
+    readThreadContext: vi.fn(async () => ({
+      lastUserMessage: undefined,
+      lastAssistantMessage: undefined,
+    })),
   };
   (controller as any).client = clientMock;
   (controller as any).readThreadHasChanges = vi.fn(async () => false);
-  return { controller, api, clientMock, sendComponentMessage, sendMessageDiscord, stateDir };
+  return {
+    controller,
+    api,
+    clientMock,
+    sendComponentMessage,
+    sendMessageDiscord,
+    bindingBind,
+    bindingResolveByConversation,
+    stateDir,
+  };
 }
 
 function buildDiscordCommandContext(
@@ -351,5 +366,61 @@ describe("Discord controller flows", () => {
       }),
       expect.objectContaining({ accountId: "default" }),
     );
+  });
+
+  it("normalizes Discord runtime binding refs to raw ids when binding a thread", async () => {
+    const { controller, bindingBind, bindingResolveByConversation } = await createControllerHarness();
+    bindingResolveByConversation.mockReturnValue(null);
+
+    await controller.handleCommand("codex_resume", buildDiscordCommandContext({
+      args: "thread-1",
+      commandBody: "/codex_resume thread-1",
+    }));
+
+    expect(bindingBind).toHaveBeenCalledWith(
+      expect.objectContaining({
+        conversation: expect.objectContaining({
+          channel: "discord",
+          accountId: "default",
+          conversationId: "chan-1",
+        }),
+      }),
+    );
+  });
+
+  it("claims inbound Discord messages for raw thread ids after a typed bind", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:1481858418548412579",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        text: "hello",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => true),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    const result = await controller.handleInboundClaim({
+      content: "who are you?",
+      channel: "discord",
+      accountId: "default",
+      conversationId: "1481858418548412579",
+      isGroup: true,
+      metadata: { guildId: "guild-1" },
+    });
+
+    expect(result).toEqual({ handled: true });
+    expect(startTurn).toHaveBeenCalled();
   });
 });
