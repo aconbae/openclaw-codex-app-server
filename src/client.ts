@@ -1200,8 +1200,75 @@ function normalizeEpochMilliseconds(value: number | undefined): number | undefin
   return Math.round(value);
 }
 
+function formatRateLimitWindowName(params: {
+  limitId?: string;
+  limitName?: string;
+  windowKey: "primary" | "secondary";
+  windowMinutes?: number;
+}): string {
+  const rawId = params.limitId?.trim();
+  const rawName = params.limitName?.trim();
+  const minutes = params.windowMinutes;
+  let windowLabel: string;
+  if (minutes === 300) {
+    windowLabel = "5h limit";
+  } else if (minutes === 10080) {
+    windowLabel = "Weekly limit";
+  } else if (minutes === 43200) {
+    windowLabel = "Monthly limit";
+  } else if (typeof minutes === "number" && minutes > 0) {
+    if (minutes % 1440 === 0) {
+      windowLabel = `${Math.round(minutes / 1440)}d limit`;
+    } else if (minutes % 60 === 0) {
+      windowLabel = `${Math.round(minutes / 60)}h limit`;
+    } else {
+      windowLabel = `${minutes}m limit`;
+    }
+  } else {
+    windowLabel = params.windowKey === "primary" ? "Primary limit" : "Secondary limit";
+  }
+  if (!rawId || rawId.toLowerCase() === "codex") {
+    return windowLabel;
+  }
+  return `${rawName ?? rawId} ${windowLabel}`.trim();
+}
+
 function extractRateLimitSummaries(value: unknown): RateLimitSummary[] {
   const out = new Map<string, RateLimitSummary>();
+  const addWindow = (
+    windowValue: unknown,
+    params: { limitId?: string; limitName?: string; windowKey: "primary" | "secondary" },
+  ) => {
+    const window = asRecord(windowValue);
+    if (!window) {
+      return;
+    }
+    const usedPercent = pickFiniteNumber(window, ["usedPercent", "used_percent"]);
+    const windowMinutes = pickFiniteNumber(window, [
+      "windowDurationMins",
+      "window_duration_mins",
+      "windowMinutes",
+      "window_minutes",
+    ]);
+    const name = formatRateLimitWindowName({
+      limitId: params.limitId,
+      limitName: params.limitName,
+      windowKey: params.windowKey,
+      windowMinutes,
+    });
+    out.set(name, {
+      name,
+      limitId: params.limitId,
+      usedPercent,
+      remaining:
+        typeof usedPercent === "number" ? Math.max(0, Math.round(100 - usedPercent)) : undefined,
+      resetAt: normalizeEpochMilliseconds(
+        pickNumber(window, ["resetsAt", "resets_at", "resetAt", "reset_at"]),
+      ),
+      windowSeconds: typeof windowMinutes === "number" ? Math.round(windowMinutes * 60) : undefined,
+      windowMinutes,
+    });
+  };
   const visit = (node: unknown) => {
     if (Array.isArray(node)) {
       node.forEach((entry) => visit(entry));
@@ -1211,6 +1278,23 @@ function extractRateLimitSummaries(value: unknown): RateLimitSummary[] {
     if (!record) {
       return;
     }
+    if ("primary" in record || "secondary" in record) {
+      const limitId = pickString(record, ["limitId", "limit_id", "id"]);
+      const limitName = pickString(record, ["limitName", "limit_name", "name", "label"]);
+      addWindow(record.primary, { limitId, limitName, windowKey: "primary" });
+      addWindow(record.secondary, { limitId, limitName, windowKey: "secondary" });
+    }
+    if (record.rateLimitsByLimitId && typeof record.rateLimitsByLimitId === "object") {
+      for (const [limitId, snapshot] of Object.entries(record.rateLimitsByLimitId)) {
+        const snapshotRecord = asRecord(snapshot);
+        if (!snapshotRecord) {
+          continue;
+        }
+        const limitName = pickString(snapshotRecord, ["limitName", "limit_name", "name", "label"]);
+        addWindow(snapshotRecord.primary, { limitId, limitName, windowKey: "primary" });
+        addWindow(snapshotRecord.secondary, { limitId, limitName, windowKey: "secondary" });
+      }
+    }
     const remaining = pickFiniteNumber(record, [
       "remaining",
       "remainingCount",
@@ -1219,7 +1303,6 @@ function extractRateLimitSummaries(value: unknown): RateLimitSummary[] {
     ]);
     const limit = pickFiniteNumber(record, ["limit", "max", "quota", "capacity"]);
     const used = pickFiniteNumber(record, ["used", "consumed", "count"]);
-    const usedPercent = pickFiniteNumber(record, ["usedPercent", "used_percent"]);
     const resetAt = pickNumber(record, [
       "resetAt",
       "reset_at",
@@ -1242,14 +1325,17 @@ function extractRateLimitSummaries(value: unknown): RateLimitSummary[] {
         ? `limit-${out.size + 1}`
         : undefined);
     if (name) {
+      const existing = out.get(name);
       out.set(name, {
         name,
-        remaining,
-        limit,
-        used,
-        usedPercent,
-        resetAt: normalizeEpochMilliseconds(resetAt),
-        windowSeconds,
+        limitId: existing?.limitId,
+        remaining: remaining ?? existing?.remaining,
+        limit: limit ?? existing?.limit,
+        used: used ?? existing?.used,
+        usedPercent: existing?.usedPercent,
+        resetAt: normalizeEpochMilliseconds(resetAt) ?? existing?.resetAt,
+        windowSeconds: windowSeconds ?? existing?.windowSeconds,
+        windowMinutes: existing?.windowMinutes,
       });
     }
     for (const key of [
@@ -1261,6 +1347,8 @@ function extractRateLimitSummaries(value: unknown): RateLimitSummary[] {
       "buckets",
       "rateLimits",
       "rate_limits",
+      "rateLimitsByLimitId",
+      "rate_limits_by_limit_id",
     ]) {
       visit(record[key]);
     }
@@ -2518,4 +2606,5 @@ export class CodexAppServerClient {
 
 export const __testing = {
   extractThreadTokenUsageSnapshot,
+  extractRateLimitSummaries,
 };

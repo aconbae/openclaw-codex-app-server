@@ -62,3 +62,78 @@ describe("extractThreadTokenUsageSnapshot", () => {
     });
   });
 });
+
+describe("extractRateLimitSummaries", () => {
+  it("extracts primary and secondary window snapshots from rateLimitsByLimitId", () => {
+    expect(
+      __testing.extractRateLimitSummaries({
+        rateLimitsByLimitId: {
+          codex: {
+            limitName: "Codex",
+            primary: {
+              usedPercent: 15,
+              windowDurationMins: 300,
+              resetsAt: "2026-03-13T10:03:00-04:00",
+            },
+            secondary: {
+              usedPercent: 9,
+              windowDurationMins: 10_080,
+              resetsAt: "2026-03-14T10:03:00-04:00",
+            },
+          },
+        },
+      }),
+    ).toEqual([
+      {
+        name: "5h limit",
+        limitId: "codex",
+        usedPercent: 15,
+        remaining: 85,
+        resetAt: new Date("2026-03-13T10:03:00-04:00").getTime(),
+        windowSeconds: 18_000,
+        windowMinutes: 300,
+      },
+      {
+        name: "Weekly limit",
+        limitId: "codex",
+        usedPercent: 9,
+        remaining: 91,
+        resetAt: new Date("2026-03-14T10:03:00-04:00").getTime(),
+        windowSeconds: 604_800,
+        windowMinutes: 10_080,
+      },
+    ]);
+  });
+
+  it("merges generic rows into existing named windows without losing used percentages", () => {
+    expect(
+      __testing.extractRateLimitSummaries({
+        rateLimits: [
+          {
+            name: "5h limit",
+            resetAt: "2026-03-13T10:03:00-04:00",
+            windowSeconds: 18_000,
+          },
+        ],
+        rateLimitsByLimitId: {
+          codex: {
+            primary: {
+              usedPercent: 15,
+              windowDurationMins: 300,
+            },
+          },
+        },
+      }),
+    ).toEqual([
+      {
+        name: "5h limit",
+        limitId: "codex",
+        remaining: 85,
+        usedPercent: 15,
+        resetAt: new Date("2026-03-13T10:03:00-04:00").getTime(),
+        windowSeconds: 18_000,
+        windowMinutes: 300,
+      },
+    ]);
+  });
+});
