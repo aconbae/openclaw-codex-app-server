@@ -702,9 +702,13 @@ export class CodexPluginController {
         if (!conversation) {
           return { text: "This command needs a Telegram or Discord conversation." };
         }
-        await bindingApi.detachConversationBinding?.();
+        const detachResult = await bindingApi.detachConversationBinding?.();
         await this.unbindConversation(conversation);
-        return { text: "Detached this conversation from Codex." };
+        return {
+          text: detachResult?.removed
+            ? "Detached this conversation from Codex."
+            : "This conversation is not currently bound to Codex.",
+        };
       case "codex_status":
         return await this.handleStatusCommand(binding, Boolean(currentBinding));
       case "codex_stop":
