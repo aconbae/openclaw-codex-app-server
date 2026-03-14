@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type {
   OpenClawPluginApi,
@@ -2358,10 +2359,11 @@ export class CodexPluginController {
       });
       await this.store.removeCallback(callback.token);
       const active = this.activeRuns.get(buildConversationKey(conversation));
+      const ackText = this.buildRunPromptAckText(callback.prompt);
       if (active) {
         const handled = await active.handle.queueMessage(callback.prompt);
         if (handled) {
-          await responders.reply(`Sent ${callback.prompt} to Codex.`);
+          await responders.reply(ackText);
           return;
         }
       }
@@ -2372,7 +2374,7 @@ export class CodexPluginController {
         prompt: callback.prompt,
         reason: "command",
       });
-      await responders.reply(`Sent ${callback.prompt} to Codex.`);
+      await responders.reply(ackText);
       return;
     }
     if (callback.kind === "set-model") {
@@ -2754,6 +2756,7 @@ export class CodexPluginController {
       return false;
     }
     if (isTelegramChannel(conversation.channel)) {
+      const mediaLocalRoots = this.resolveReplyMediaLocalRoots(payload.mediaUrl);
       const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
         undefined,
         "telegram",
@@ -2771,6 +2774,7 @@ export class CodexPluginController {
             accountId: conversation.accountId,
             messageThreadId: conversation.threadId,
             mediaUrl: payload.mediaUrl,
+            mediaLocalRoots,
             buttons: chunks.length <= 1 ? payload.buttons : undefined,
           },
         );
@@ -2860,6 +2864,27 @@ export class CodexPluginController {
       return true;
     }
     return false;
+  }
+
+  private resolveReplyMediaLocalRoots(mediaUrl?: string): readonly string[] | undefined {
+    const rawValue = mediaUrl?.trim();
+    if (!rawValue) {
+      return undefined;
+    }
+    const localPath = rawValue.startsWith("file://") ? fileURLToPath(rawValue) : rawValue;
+    if (!path.isAbsolute(localPath)) {
+      return undefined;
+    }
+    const roots = new Set<string>([this.api.runtime.state.resolveStateDir(), path.dirname(localPath)]);
+    return [...roots];
+  }
+
+  private buildRunPromptAckText(prompt: string): string {
+    const trimmed = prompt.trim();
+    if (trimmed.startsWith("Please implement this plan:")) {
+      return "Sent the plan to Codex.";
+    }
+    return trimmed.length > 160 ? "Sent the prompt to Codex." : `Sent ${trimmed} to Codex.`;
   }
 
   private async resolveProjectFolder(worktreeFolder?: string): Promise<string | undefined> {

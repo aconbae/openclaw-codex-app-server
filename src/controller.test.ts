@@ -13,6 +13,7 @@ function createApiMock() {
   const stateDir = makeStateDir();
   const sendComponentMessage = vi.fn(async () => ({}));
   const sendMessageDiscord = vi.fn(async () => ({}));
+  const sendMessageTelegram = vi.fn(async () => ({}));
   const discordTypingStart = vi.fn(async () => ({ refresh: vi.fn(async () => {}), stop: vi.fn() }));
   const api = {
     id: "test-plugin",
@@ -42,7 +43,7 @@ function createApiMock() {
             opts?.fallbackLimit ?? 2000,
         },
         telegram: {
-          sendMessageTelegram: vi.fn(async () => ({})),
+          sendMessageTelegram,
           typing: {
             start: vi.fn(async () => ({ refresh: vi.fn(async () => {}), stop: vi.fn() })),
           },
@@ -71,6 +72,7 @@ function createApiMock() {
     api,
     sendComponentMessage,
     sendMessageDiscord,
+    sendMessageTelegram,
     discordTypingStart,
     stateDir,
   };
@@ -81,6 +83,7 @@ async function createControllerHarness() {
     api,
     sendComponentMessage,
     sendMessageDiscord,
+    sendMessageTelegram,
     discordTypingStart,
     stateDir,
   } = createApiMock();
@@ -130,6 +133,7 @@ async function createControllerHarness() {
     clientMock,
     sendComponentMessage,
     sendMessageDiscord,
+    sendMessageTelegram,
     discordTypingStart,
     stateDir,
   };
@@ -578,6 +582,99 @@ describe("Discord controller flows", () => {
       expect.objectContaining({
         channelId: "1481858418548412579",
         accountId: "default",
+      }),
+    );
+  });
+
+  it("acknowledges long run-prompt callbacks without echoing the full plan", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:chan-1",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    const callback = await (controller as any).store.putCallback({
+      kind: "run-prompt",
+      token: "run-prompt-token",
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:chan-1",
+      },
+      workspaceDir: "/repo/openclaw",
+      prompt: `Please implement this plan:\n\n${"Step\n".repeat(2000)}`,
+    });
+    (controller as any).client.startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        text: "implemented",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => true),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    const reply = vi.fn(async () => {});
+
+    await controller.handleDiscordInteractive({
+      channel: "discord",
+      accountId: "default",
+      interactionId: "interaction-1",
+      conversationId: "channel:chan-1",
+      auth: { isAuthorizedSender: true },
+      interaction: {
+        kind: "button",
+        data: `codexapp:${callback.token}`,
+        namespace: "codexapp",
+        payload: callback.token,
+        messageId: "message-1",
+      },
+      senderId: "user-1",
+      senderUsername: "Ada",
+      respond: {
+        acknowledge: vi.fn(async () => {}),
+        reply,
+        followUp: vi.fn(async () => {}),
+        editMessage: vi.fn(async () => {}),
+        clearComponents: vi.fn(async () => {}),
+      },
+    } as any);
+
+    expect(reply).toHaveBeenCalledWith({ text: "Sent the plan to Codex.", ephemeral: true });
+  });
+
+  it("passes trusted local media roots when sending a Telegram plan attachment", async () => {
+    const { controller, sendMessageTelegram, stateDir } = await createControllerHarness();
+    const attachmentPath = path.join(stateDir, "tmp", "plan.md");
+    fs.mkdirSync(path.dirname(attachmentPath), { recursive: true });
+    fs.writeFileSync(attachmentPath, "# Plan\n");
+
+    const sent = await (controller as any).sendReply(
+      {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "8460800771",
+      },
+      {
+        mediaUrl: attachmentPath,
+      },
+    );
+
+    expect(sent).toBe(true);
+    expect(sendMessageTelegram).toHaveBeenCalledWith(
+      "8460800771",
+      "",
+      expect.objectContaining({
+        mediaUrl: attachmentPath,
+        mediaLocalRoots: expect.arrayContaining([stateDir, path.dirname(attachmentPath)]),
       }),
     );
   });

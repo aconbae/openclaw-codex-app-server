@@ -324,8 +324,10 @@ describe("Codex plan delivery formatting", () => {
       steps: [{ step: "Write the rollout", status: "inProgress" as const }],
       markdown: `# Plan\n\n${"Long section.\n".repeat(10)}`,
     };
-    expect(formatCodexPlanAttachmentSummary(plan)).toContain("The full plan is attached as Markdown.");
     expect(formatCodexPlanAttachmentSummary(plan)).toContain("Plan preview:");
+    expect(formatCodexPlanAttachmentSummary(plan)).not.toContain(
+      "The full plan is attached as Markdown.",
+    );
     expect(formatCodexPlanAttachmentFallback(plan)).toContain(
       "I couldn't attach the full Markdown plan here, so here's a condensed inline summary instead.",
     );

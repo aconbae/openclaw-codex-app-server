@@ -836,7 +836,6 @@ export function formatCodexPlanAttachmentSummary(
   if (summaryPreview) {
     lines.push("", "Plan preview:", "", summaryPreview);
   }
-  lines.push("", "The full plan is attached as Markdown.");
   return lines.join("\n").trim();
 }
 
