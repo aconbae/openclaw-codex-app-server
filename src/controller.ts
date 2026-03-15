@@ -3036,6 +3036,7 @@ export class CodexPluginController {
       return true;
     }
     if (isDiscordChannel(conversation.channel)) {
+      const mediaLocalRoots = this.resolveReplyMediaLocalRoots(payload.mediaUrl);
       const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
         undefined,
         "discord",
@@ -3049,7 +3050,19 @@ export class CodexPluginController {
         this.api.logger.debug(
           `codex discord reply send conversation=${conversation.conversationId} rows=${payload.buttons.length}`,
         );
-        const finalChunk = chunks.pop() ?? text;
+        const attachmentChunk = hasMedia ? (chunks.shift() ?? text) : undefined;
+        if (hasMedia) {
+          await this.api.runtime.channel.discord.sendMessageDiscord(
+            conversation.conversationId,
+            attachmentChunk ?? "",
+            {
+              accountId: conversation.accountId,
+              mediaUrl: payload.mediaUrl,
+              mediaLocalRoots,
+            },
+          );
+        }
+        const finalChunk = chunks.pop() ?? (hasMedia ? "" : text);
         for (const chunk of chunks) {
           await this.api.runtime.channel.discord.sendMessageDiscord(conversation.conversationId, chunk, {
             accountId: conversation.accountId,
@@ -3075,6 +3088,18 @@ export class CodexPluginController {
         return true;
       }
       const textChunks = chunks.length > 0 ? chunks : [text];
+      if (hasMedia) {
+        const firstChunk = textChunks.shift() ?? "";
+        await this.api.runtime.channel.discord.sendMessageDiscord(
+          conversation.conversationId,
+          firstChunk,
+          {
+            accountId: conversation.accountId,
+            mediaUrl: payload.mediaUrl,
+            mediaLocalRoots,
+          },
+        );
+      }
       for (const chunk of textChunks) {
         if (!chunk) {
           continue;
@@ -3083,7 +3108,7 @@ export class CodexPluginController {
           accountId: conversation.accountId,
         });
       }
-      return true;
+      return hasMedia || textChunks.length > 0;
     }
     return false;
   }

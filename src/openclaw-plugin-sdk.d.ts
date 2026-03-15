@@ -178,7 +178,11 @@ declare module "openclaw/plugin-sdk" {
           sendMessageDiscord: (
             to: string,
             text: string,
-            opts?: { accountId?: string },
+            opts?: {
+              accountId?: string;
+              mediaUrl?: string;
+              mediaLocalRoots?: readonly string[];
+            },
           ) => Promise<unknown>;
           sendComponentMessage: (
             to: string,

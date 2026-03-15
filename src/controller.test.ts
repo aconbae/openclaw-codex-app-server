@@ -1019,6 +1019,34 @@ describe("Discord controller flows", () => {
     );
   });
 
+  it("passes trusted local media roots when sending a Discord plan attachment", async () => {
+    const { controller, sendMessageDiscord, stateDir } = await createControllerHarness();
+    const attachmentPath = path.join(stateDir, "tmp", "plan.md");
+    fs.mkdirSync(path.dirname(attachmentPath), { recursive: true });
+    fs.writeFileSync(attachmentPath, "# Plan\n");
+
+    const sent = await (controller as any).sendReply(
+      {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "user:1177378744822943744",
+      },
+      {
+        mediaUrl: attachmentPath,
+      },
+    );
+
+    expect(sent).toBe(true);
+    expect(sendMessageDiscord).toHaveBeenCalledWith(
+      "user:1177378744822943744",
+      "",
+      expect.objectContaining({
+        mediaUrl: attachmentPath,
+        mediaLocalRoots: expect.arrayContaining([stateDir, path.dirname(attachmentPath)]),
+      }),
+    );
+  });
+
   it("restarts a Discord bound run when the active queue path fails", async () => {
     const { controller } = await createControllerHarness();
     await (controller as any).store.upsertBinding({
