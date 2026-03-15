@@ -42,10 +42,6 @@ function findFirstStringByKeys(
   if (depth > 5) {
     return undefined;
   }
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    return trimmed || undefined;
-  }
   if (Array.isArray(value)) {
     for (const item of value) {
       const match = findFirstStringByKeys(item, keys, depth + 1);
@@ -70,6 +66,14 @@ function findFirstStringByKeys(
     }
   }
   return undefined;
+}
+
+function isFileChangeApprovalMethod(methodLower: string): boolean {
+  return methodLower.includes("filechange/requestapproval");
+}
+
+function isCommandApprovalMethod(methodLower: string): boolean {
+  return methodLower.includes("commandexecution/requestapproval") || methodLower === "turn/requestapproval";
 }
 
 function normalizeApprovalDecision(value: string): PendingApprovalDecision | null {
@@ -229,6 +233,64 @@ function buildApprovalActionsFromOptions(options: string[]): PendingInputAction[
   return actions;
 }
 
+function buildApprovalActionsFromMethod(
+  methodLower: string,
+  requestParams: unknown,
+): PendingInputAction[] {
+  if (isFileChangeApprovalMethod(methodLower)) {
+    return [
+      {
+        kind: "approval",
+        decision: "accept",
+        responseDecision: "accept",
+        label: "Approve File Changes",
+      },
+      {
+        kind: "approval",
+        decision: "decline",
+        responseDecision: "decline",
+        label: "Decline",
+      },
+    ];
+  }
+  if (!isCommandApprovalMethod(methodLower)) {
+    return [];
+  }
+  const sessionPrefix = extractSessionPrefix(requestParams);
+  const actions: PendingInputAction[] = [
+    {
+      kind: "approval",
+      decision: "accept",
+      responseDecision: "accept",
+      label: "Approve Once",
+    },
+  ];
+  if (sessionPrefix) {
+    actions.push({
+      kind: "approval",
+      decision: "acceptForSession",
+      responseDecision: "acceptForSession",
+      sessionPrefix,
+      label: humanizeApprovalDecision("acceptForSession", sessionPrefix),
+    });
+  }
+  actions.push(
+    {
+      kind: "approval",
+      decision: "decline",
+      responseDecision: "decline",
+      label: "Decline",
+    },
+    {
+      kind: "approval",
+      decision: "cancel",
+      responseDecision: "cancel",
+      label: "Cancel",
+    },
+  );
+  return actions;
+}
+
 export function buildPendingUserInputActions(params: {
   method?: string;
   requestParams?: unknown;
@@ -239,7 +301,11 @@ export function buildPendingUserInputActions(params: {
   if (methodLower.includes("requestapproval")) {
     const approvalActions = buildApprovalActionsFromDecisions(params.requestParams);
     const resolvedApprovalActions =
-      approvalActions.length > 0 ? approvalActions : buildApprovalActionsFromOptions(options);
+      approvalActions.length > 0
+        ? approvalActions
+        : buildApprovalActionsFromOptions(options).length > 0
+          ? buildApprovalActionsFromOptions(options)
+          : buildApprovalActionsFromMethod(methodLower, params.requestParams);
     return [...resolvedApprovalActions, { kind: "steer", label: "Tell Codex What To Do" }];
   }
   return options.map((option) => ({
@@ -558,9 +624,14 @@ export function buildPendingPromptText(params: {
   expiresAt: number;
   requestParams: unknown;
 }): string {
+  const methodLower = params.method.trim().toLowerCase();
   const lines = [
     /requestapproval/i.test(params.method)
-      ? `Codex approval requested (${params.requestId})`
+      ? isFileChangeApprovalMethod(methodLower)
+        ? `Codex file change approval requested (${params.requestId})`
+        : isCommandApprovalMethod(methodLower)
+          ? `Codex command approval requested (${params.requestId})`
+          : `Codex approval requested (${params.requestId})`
       : `Codex input requested (${params.requestId})`,
   ];
   const requestText = dedupeJoinedText(collectText(params.requestParams));
@@ -583,6 +654,10 @@ export function buildPendingPromptText(params: {
     ]) ?? "";
   if (command) {
     lines.push("", "Command:", "", buildMarkdownCodeBlock(command, "sh"));
+  }
+  const grantRoot = findFirstStringByKeys(params.requestParams, ["grantRoot", "grant_root"]);
+  if (grantRoot) {
+    lines.push("", `Requested writable root: \`${grantRoot}\``);
   }
   if (params.actions.length > 0) {
     lines.push("", "Choices:");

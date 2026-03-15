@@ -15,6 +15,7 @@ function createApiMock() {
   const sendMessageDiscord = vi.fn(async () => ({}));
   const sendMessageTelegram = vi.fn(async () => ({}));
   const discordTypingStart = vi.fn(async () => ({ refresh: vi.fn(async () => {}), stop: vi.fn() }));
+  const renameTopic = vi.fn(async () => ({}));
   const api = {
     id: "test-plugin",
     pluginConfig: {
@@ -48,7 +49,7 @@ function createApiMock() {
             start: vi.fn(async () => ({ refresh: vi.fn(async () => {}), stop: vi.fn() })),
           },
           conversationActions: {
-            renameTopic: vi.fn(async () => ({})),
+            renameTopic,
           },
         },
         discord: {
@@ -74,6 +75,7 @@ function createApiMock() {
     sendMessageDiscord,
     sendMessageTelegram,
     discordTypingStart,
+    renameTopic,
     stateDir,
   };
 }
@@ -85,6 +87,7 @@ async function createControllerHarness() {
     sendMessageDiscord,
     sendMessageTelegram,
     discordTypingStart,
+    renameTopic,
     stateDir,
   } = createApiMock();
   const controller = new CodexPluginController(api);
@@ -118,6 +121,10 @@ async function createControllerHarness() {
       lastUserMessage: undefined,
       lastAssistantMessage: undefined,
     })),
+    setThreadName: vi.fn(async () => ({
+      threadId: "thread-1",
+      threadName: "Discord Thread",
+    })),
     readAccount: vi.fn(async () => ({
       email: "test@example.com",
       planType: "pro",
@@ -135,6 +142,7 @@ async function createControllerHarness() {
     sendMessageDiscord,
     sendMessageTelegram,
     discordTypingStart,
+    renameTopic,
     stateDir,
   };
 }
@@ -163,6 +171,27 @@ function buildDiscordCommandContext(
     config: {},
     from: "discord:channel:chan-1",
     to: "slash:user-1",
+    accountId: "default",
+    requestConversationBinding: vi.fn(async () => ({ status: "bound" as const })),
+    detachConversationBinding: vi.fn(async () => ({ removed: true })),
+    getCurrentConversationBinding: vi.fn(async () => null),
+    ...overrides,
+  } as unknown as PluginCommandContext;
+}
+
+function buildTelegramCommandContext(
+  overrides: Partial<PluginCommandContext> & Record<string, unknown> = {},
+): PluginCommandContext {
+  return {
+    senderId: "user-1",
+    channel: "telegram",
+    channelId: "telegram",
+    isAuthorizedSender: true,
+    args: "",
+    commandBody: "/codex_status",
+    config: {},
+    from: "telegram:123",
+    to: "telegram:123",
     accountId: "default",
     requestConversationBinding: vi.fn(async () => ({ status: "bound" as const })),
     detachConversationBinding: vi.fn(async () => ({ removed: true })),
@@ -439,6 +468,50 @@ describe("Discord controller flows", () => {
         workspaceDir: "/repo/openclaw",
       }),
     );
+  });
+
+  it("parses unicode em dash --sync for codex_rename and renames the Telegram topic", async () => {
+    const { controller, clientMock, renameTopic } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      threadTitle: "Old Name",
+      updatedAt: Date.now(),
+    });
+    clientMock.setThreadName = vi.fn(async () => ({
+      threadId: "thread-1",
+      threadName: "New Topic Name",
+    }));
+
+    const reply = await controller.handleCommand(
+      "codex_rename",
+      buildTelegramCommandContext({
+        args: "—sync New Topic Name",
+        commandBody: "/codex_rename —sync New Topic Name",
+        messageThreadId: 456,
+        getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+      }),
+    );
+
+    expect(clientMock.setThreadName).toHaveBeenCalledWith({
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      name: "New Topic Name",
+    });
+    expect(renameTopic).toHaveBeenCalledWith(
+      "123",
+      456,
+      "New Topic Name",
+      expect.objectContaining({ accountId: "default" }),
+    );
+    expect(reply).toEqual({ text: 'Renamed the Codex thread to "New Topic Name".' });
   });
 
   it("requests approved conversation binding when binding a Discord thread", async () => {

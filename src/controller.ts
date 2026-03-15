@@ -394,10 +394,14 @@ function formatContextUsageText(usage: { totalTokens?: number; contextWindow?: n
   return `${total} / ${context} tokens used${typeof percent === "number" ? ` (${percent}% full)` : ""}`;
 }
 
-function parseRenameArgs(args: string): { syncTopic: boolean; name: string } | null {
-  const tokens = args
+function normalizeOptionDashes(text: string): string {
+  return text
     .replace(/(^|\s)[\u2010-\u2015\u2212](?=\S)/g, "$1--")
-    .replace(/[\u2010-\u2015\u2212]/g, "-")
+    .replace(/[\u2010-\u2015\u2212]/g, "-");
+}
+
+function parseRenameArgs(args: string): { syncTopic: boolean; name: string } | null {
+  const tokens = normalizeOptionDashes(args)
     .split(/\s+/)
     .map((token) => token.trim())
     .filter(Boolean);

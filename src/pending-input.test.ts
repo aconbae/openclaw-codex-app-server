@@ -35,6 +35,51 @@ describe("pending-input helpers", () => {
     ]);
   });
 
+  it("defaults file change approvals to approve and decline actions", () => {
+    const actions = buildPendingUserInputActions({
+      method: "item/fileChange/requestApproval",
+      requestParams: {
+        threadId: "019cd368-7eda-7863-86ba-6586598bc5a3",
+        turnId: "turn-1",
+        itemId: "item-1",
+      },
+    });
+    expect(actions.map((action) => action.label)).toEqual([
+      "Approve File Changes",
+      "Decline",
+      "Tell Codex What To Do",
+    ]);
+  });
+
+  it("does not treat ids as shell commands for file change approvals", () => {
+    const text = buildPendingPromptText({
+      method: "item/fileChange/requestApproval",
+      requestId: "req-file-1",
+      requestParams: {
+        threadId: "019cd368-7eda-7863-86ba-6586598bc5a3",
+        turnId: "turn-1",
+        itemId: "item-1",
+        reason: "Codex wants to apply the proposed patch.",
+      },
+      options: [],
+      actions: buildPendingUserInputActions({
+        method: "item/fileChange/requestApproval",
+        requestParams: {
+          threadId: "019cd368-7eda-7863-86ba-6586598bc5a3",
+          turnId: "turn-1",
+          itemId: "item-1",
+          reason: "Codex wants to apply the proposed patch.",
+        },
+      }),
+      expiresAt: Date.now() + 60_000,
+    });
+
+    expect(text).toContain("Codex file change approval requested");
+    expect(text).toContain("Codex wants to apply the proposed patch.");
+    expect(text).not.toContain("Command:");
+    expect(text).not.toContain("019cd368-7eda-7863-86ba-6586598bc5a3");
+  });
+
   it("creates a stable request token", () => {
     expect(requestToken("abc")).toBe(requestToken("abc"));
     expect(requestToken("abc")).not.toBe(requestToken("def"));
@@ -59,14 +104,14 @@ describe("pending-input helpers", () => {
       method: "item/tool/requestUserInput",
       requestId: "req-2",
       requestParams: {
-        details: "A".repeat(5000),
+        prompt: "A".repeat(5000),
       },
       options: ["A", "B"],
       actions: [],
       expiresAt: Date.now() + 60_000,
     });
     expect(text.length).toBeLessThan(2400);
-    expect(text).toContain("[Prompt truncated for chat delivery.");
+    expect(text).toContain("[Request details truncated.");
   });
 
   it("parses multi-question plan prompts into a questionnaire state", () => {
