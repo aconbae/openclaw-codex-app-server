@@ -773,6 +773,41 @@ describe("Discord controller flows", () => {
     );
   });
 
+  it("skips the Discord typing lease for bound DM inbound claims", async () => {
+    const { controller, discordTypingStart } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "user:1177378744822943744",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    (controller as any).client.startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        text: "hello",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => true),
+    }));
+
+    const result = await controller.handleInboundClaim({
+      content: "hello",
+      channel: "discord",
+      accountId: "default",
+      conversationId: "user:1177378744822943744",
+      isGroup: false,
+      metadata: {},
+    });
+
+    expect(result).toEqual({ handled: true });
+    expect(discordTypingStart).not.toHaveBeenCalled();
+  });
+
   it("implements a plan by switching back to default mode with a short prompt", async () => {
     const { controller } = await createControllerHarness();
     await (controller as any).store.upsertBinding({

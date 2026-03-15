@@ -3149,6 +3149,9 @@ export class CodexPluginController {
       });
     }
     if (isDiscordChannel(conversation.channel)) {
+      if (conversation.conversationId.startsWith("user:")) {
+        return null;
+      }
       const channelId =
         denormalizeDiscordConversationId(conversation.conversationId) ?? conversation.conversationId;
       return await this.api.runtime.channel.discord.typing.start({
