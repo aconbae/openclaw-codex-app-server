@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { __testing } from "./client.js";
 
 describe("buildTurnStartPayloads", () => {
-  it("keeps legacy text and message input fallbacks for normal turns", () => {
+  it("uses only text input variants for normal turns", () => {
     expect(
       __testing.buildTurnStartPayloads({
         threadId: "thread-123",
@@ -18,28 +18,6 @@ describe("buildTurnStartPayloads", () => {
       {
         thread_id: "thread-123",
         input: [{ type: "text", text: "ship it" }],
-        model: "gpt-5.4",
-      },
-      {
-        threadId: "thread-123",
-        input: [
-          {
-            type: "message",
-            role: "user",
-            content: [{ type: "input_text", text: "ship it" }],
-          },
-        ],
-        model: "gpt-5.4",
-      },
-      {
-        thread_id: "thread-123",
-        input: [
-          {
-            type: "message",
-            role: "user",
-            content: [{ type: "input_text", text: "ship it" }],
-          },
-        ],
         model: "gpt-5.4",
       },
     ]);
@@ -111,6 +89,36 @@ describe("buildTurnStartPayloads", () => {
         model: "gpt-5.4",
       },
     ]);
+  });
+});
+
+describe("extractStartupProbeInfo", () => {
+  it("extracts server info from initialize responses without losing CLI probe details", () => {
+    expect(
+      __testing.extractStartupProbeInfo(
+        {
+          serverInfo: {
+            name: "Codex App Server",
+            version: "2026.3.15",
+          },
+        },
+        {
+          transport: "stdio",
+          command: "codex",
+          args: ["--foo"],
+          resolvedCommandPath: "/opt/homebrew/bin/codex",
+          cliVersion: "2026.3.15",
+        },
+      ),
+    ).toEqual({
+      transport: "stdio",
+      command: "codex",
+      args: ["--foo"],
+      resolvedCommandPath: "/opt/homebrew/bin/codex",
+      cliVersion: "2026.3.15",
+      serverName: "Codex App Server",
+      serverVersion: "2026.3.15",
+    });
   });
 });
 

@@ -1,6 +1,7 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as path from "node:path";
 import readline from "node:readline";
+import { promisify } from "node:util";
 import WebSocket from "ws";
 import type { PluginLogger } from "openclaw/plugin-sdk";
 import { createPendingInputState, parseCodexUserInput } from "./pending-input.js";
@@ -72,6 +73,17 @@ const DEFAULT_PROTOCOL_VERSION = "1.0";
 const TRAILING_NOTIFICATION_SETTLE_MS = 250;
 const TURN_STEER_METHODS = ["turn/steer"] as const;
 const TURN_INTERRUPT_METHODS = ["turn/interrupt"] as const;
+const execFileAsync = promisify(execFile);
+
+type StartupProbeInfo = {
+  transport: PluginSettings["transport"];
+  command?: string;
+  args?: string[];
+  resolvedCommandPath?: string;
+  cliVersion?: string;
+  serverName?: string;
+  serverVersion?: string;
+};
 
 function isTransportClosedError(error: unknown): boolean {
   const text = error instanceof Error ? error.message : String(error);
@@ -741,8 +753,8 @@ async function initializeClient(params: {
   client: JsonRpcClient;
   settings: PluginSettings;
   sessionKey?: string;
-}): Promise<void> {
-  await params.client.request("initialize", {
+}): Promise<unknown> {
+  const initializeResult = await params.client.request("initialize", {
     protocolVersion: DEFAULT_PROTOCOL_VERSION,
     clientInfo: { name: "openclaw-codex-app-server", version: "0.0.0" },
     capabilities: { experimentalApi: true },
@@ -760,6 +772,82 @@ async function initializeClient(params: {
         }
       });
   }
+  return initializeResult;
+}
+
+function extractStartupProbeInfo(
+  initializeResult: unknown,
+  base: StartupProbeInfo,
+): StartupProbeInfo {
+  const record = asRecord(initializeResult) ?? {};
+  const serverInfo = asRecord(record.serverInfo) ?? asRecord(record.server_info) ?? record;
+  return {
+    ...base,
+    serverName:
+      pickString(serverInfo, ["name", "serverName", "server_name"]) ?? base.serverName,
+    serverVersion:
+      pickString(serverInfo, ["version", "serverVersion", "server_version"]) ?? base.serverVersion,
+  };
+}
+
+async function resolveCommandPath(command: string): Promise<string | undefined> {
+  const trimmed = command.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (trimmed.includes(path.sep)) {
+    return path.resolve(trimmed);
+  }
+  const locator = process.platform === "win32" ? "where" : "which";
+  try {
+    const { stdout } = await execFileAsync(locator, [trimmed], { timeout: 5_000 });
+    const first = stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean);
+    return first || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function probeStdioVersion(settings: PluginSettings): Promise<{
+  resolvedCommandPath?: string;
+  cliVersion?: string;
+}> {
+  const resolvedCommandPath = await resolveCommandPath(settings.command);
+  const commandPath = resolvedCommandPath ?? settings.command;
+  try {
+    const { stdout, stderr } = await execFileAsync(
+      commandPath,
+      [...settings.args, "--version"],
+      { timeout: Math.min(settings.requestTimeoutMs, 10_000) },
+    );
+    const combined = `${stdout}\n${stderr}`
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean);
+    return {
+      resolvedCommandPath,
+      cliVersion: combined || undefined,
+    };
+  } catch {
+    return { resolvedCommandPath };
+  }
+}
+
+function formatStartupProbeLog(info: StartupProbeInfo): string {
+  return [
+    `transport=${info.transport}`,
+    info.command ? `command=${info.command}` : undefined,
+    info.args ? `args=${JSON.stringify(info.args)}` : undefined,
+    info.resolvedCommandPath ? `resolved=${info.resolvedCommandPath}` : undefined,
+    info.cliVersion ? `cliVersion=${info.cliVersion}` : undefined,
+    info.serverName ? `serverName=${info.serverName}` : undefined,
+    info.serverVersion ? `serverVersion=${info.serverVersion}` : undefined,
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 async function requestWithFallbacks(params: {
@@ -828,21 +916,8 @@ function buildThreadResumePayloads(params: {
   });
 }
 
-function buildTurnInput(
-  prompt: string,
-  options?: { includeLegacyMessageVariant?: boolean },
-): unknown[] {
-  const variants: unknown[] = [[{ type: "text", text: prompt }]];
-  if (options?.includeLegacyMessageVariant !== false) {
-    variants.push([
-      {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: prompt }],
-      },
-    ]);
-  }
-  return variants;
+function buildTurnInput(prompt: string): unknown[] {
+  return [[{ type: "text", text: prompt }]];
 }
 
 function buildCollaborationModeVariants(
@@ -912,9 +987,7 @@ function buildTurnStartPayloads(params: {
   model?: string;
   collaborationMode?: CollaborationMode;
 }): unknown[] {
-  const payloads = buildTurnInput(params.prompt, {
-    includeLegacyMessageVariant: !params.collaborationMode,
-  }).flatMap((input) => {
+  const payloads = buildTurnInput(params.prompt).flatMap((input) => {
     const camel: Record<string, unknown> = {
       threadId: params.threadId,
       input,
@@ -1908,17 +1981,21 @@ async function withInitializedClient<T>(
     settings: PluginSettings;
     sessionKey?: string;
   },
-  callback: (args: { client: JsonRpcClient; settings: PluginSettings }) => Promise<T>,
+  callback: (args: {
+    client: JsonRpcClient;
+    settings: PluginSettings;
+    initializeResult: unknown;
+  }) => Promise<T>,
 ): Promise<T> {
   const client = createJsonRpcClient(params.settings);
   try {
     await client.connect();
-    await initializeClient({
+    const initializeResult = await initializeClient({
       client,
       settings: params.settings,
       sessionKey: params.sessionKey,
     });
-    return await callback({ client, settings: params.settings });
+    return await callback({ client, settings: params.settings, initializeResult });
   } finally {
     await client.close().catch(() => undefined);
   }
@@ -1940,6 +2017,31 @@ export class CodexAppServerClient {
     private readonly settings: PluginSettings,
     private readonly logger: PluginLogger,
   ) {}
+
+  async logStartupProbe(params: { sessionKey?: string } = {}): Promise<void> {
+    const base: StartupProbeInfo = {
+      transport: this.settings.transport,
+      command: this.settings.transport === "stdio" ? this.settings.command : undefined,
+      args: this.settings.transport === "stdio" ? this.settings.args : undefined,
+    };
+    const stdioProbe =
+      this.settings.transport === "stdio" ? await probeStdioVersion(this.settings) : {};
+    await withInitializedClient(
+      { settings: this.settings, sessionKey: params.sessionKey },
+      async ({ initializeResult }) => {
+        const info = extractStartupProbeInfo(initializeResult, {
+          ...base,
+          ...stdioProbe,
+        });
+        this.logger.info(`codex startup probe ${formatStartupProbeLog(info)}`);
+      },
+    ).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        `codex startup probe failed transport=${this.settings.transport}${this.settings.transport === "stdio" ? ` command=${this.settings.command}` : ""}: ${message}`,
+      );
+    });
+  }
 
   async listThreads(params: {
     sessionKey?: string;
@@ -2965,6 +3067,7 @@ export const __testing = {
   buildTurnStartPayloads,
   createPendingInputCoordinator,
   extractFileChangePathsFromReadResult,
+  extractStartupProbeInfo,
   extractThreadTokenUsageSnapshot,
   extractRateLimitSummaries,
 };

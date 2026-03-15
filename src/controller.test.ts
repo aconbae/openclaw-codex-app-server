@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi, PluginCommandContext } from "openclaw/plugin-sdk";
+import { CodexAppServerClient } from "./client.js";
 import { CodexPluginController } from "./controller.js";
 
 function makeStateDir(): string {
@@ -202,6 +203,10 @@ function buildTelegramCommandContext(
 
 afterEach(() => {
   vi.restoreAllMocks();
+});
+
+beforeEach(() => {
+  vi.spyOn(CodexAppServerClient.prototype, "logStartupProbe").mockResolvedValue();
 });
 
 describe("Discord controller flows", () => {

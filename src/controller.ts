@@ -516,6 +516,7 @@ export class CodexPluginController {
       return;
     }
     await this.store.load();
+    await this.client.logStartupProbe().catch(() => undefined);
     this.started = true;
   }
 
