@@ -487,6 +487,7 @@ export function formatCodexStatusText(params: {
   worktreeFolder?: string;
   bindingActive?: boolean;
   contextUsage?: ContextUsageSnapshot;
+  planMode?: boolean;
 }): string {
   const lines = ["OpenAI Codex"];
   lines.push(`Binding: ${params.bindingActive ? "active" : "none"}`);
@@ -500,6 +501,9 @@ export function formatCodexStatusText(params: {
   lines.push(`Worktree folder: ${shortenHomePath(params.worktreeFolder) ?? "unknown"}`);
   if (params.threadState || params.bindingActive) {
     lines.push(`Fast mode: ${formatCodexFastModeValue(params.threadState?.serviceTier)}`);
+  }
+  if (params.bindingActive && params.planMode !== undefined) {
+    lines.push(`Plan mode: ${params.planMode ? "on" : "off"}`);
   }
   const contextUsageText = formatCodexContextUsageSnapshot(params.contextUsage);
   if (contextUsageText) {

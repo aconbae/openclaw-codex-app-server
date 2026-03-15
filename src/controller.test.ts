@@ -470,6 +470,48 @@ describe("Discord controller flows", () => {
     );
   });
 
+  it("shows plan mode on in codex_status when the bound conversation has an active plan run", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:chan-1",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      threadTitle: "Discord Thread",
+      updatedAt: Date.now(),
+    });
+    (controller as any).activeRuns.set("discord::default::channel:chan-1::", {
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:chan-1",
+      },
+      workspaceDir: "/repo/openclaw",
+      mode: "plan",
+      handle: {
+        result: Promise.resolve({ threadId: "thread-1", text: "planned" }),
+        queueMessage: vi.fn(async () => true),
+        getThreadId: () => "thread-1",
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      },
+    });
+
+    const reply = await controller.handleCommand("codex_status", buildDiscordCommandContext({
+      commandBody: "/codex_status",
+      getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+    }));
+
+    expect(reply.text).toContain("Binding: active");
+    expect(reply.text).toContain("Plan mode: on");
+  });
+
   it("parses unicode em dash --sync for codex_rename and renames the Telegram topic", async () => {
     const { controller, clientMock, renameTopic } = await createControllerHarness();
     await (controller as any).store.upsertBinding({

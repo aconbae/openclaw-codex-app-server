@@ -103,6 +103,7 @@ describe("formatCodexStatusText", () => {
       },
       projectFolder: "/Users/huntharo/github/openclaw",
       worktreeFolder: "/Users/huntharo/.codex/worktrees/41fb/openclaw",
+      planMode: false,
       rateLimits: [
         {
           name: "5h limit",
@@ -126,6 +127,7 @@ describe("formatCodexStatusText", () => {
     expect(text).toContain("Project folder: ~/github/openclaw");
     expect(text).toContain("Worktree folder: ~/.codex/worktrees/41fb/openclaw");
     expect(text).toContain("Fast mode: off");
+    expect(text).toContain("Plan mode: off");
     expect(text).toContain("Context usage: unavailable until Codex emits a token-usage update");
     expect(text).toContain("Permissions: Default");
     expect(text).toContain("Account: huntharo@gmail.com (pro)");
@@ -170,6 +172,46 @@ describe("formatCodexStatusText", () => {
     });
 
     expect(text).toContain("Context usage: 139k / 258k tokens used (54% full)");
+  });
+
+  it("shows plan mode on when the bound conversation has an active plan run", () => {
+    const text = formatCodexStatusText({
+      bindingActive: true,
+      threadState: {
+        threadId: "thread-123",
+        threadName: "Plan TASKS doc refresh",
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        cwd: "/repo/openclaw",
+      },
+      account: {
+        type: "chatgpt",
+        email: "user@example.com",
+        planType: "pro",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw",
+      planMode: true,
+      rateLimits: [],
+    });
+
+    expect(text).toContain("Plan mode: on");
+  });
+
+  it("omits plan mode when the conversation is not bound", () => {
+    const text = formatCodexStatusText({
+      bindingActive: false,
+      account: {
+        type: "chatgpt",
+        email: "user@example.com",
+        planType: "pro",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw/workspace",
+      rateLimits: [],
+    });
+
+    expect(text).not.toContain("Plan mode:");
   });
 
   it("does not render a partial context usage line when only the window size is known", () => {

@@ -744,7 +744,11 @@ export class CodexPluginController {
             : "This conversation is not currently bound to Codex.",
         };
       case "codex_status":
-        return await this.handleStatusCommand(binding, Boolean(currentBinding));
+        return await this.handleStatusCommand(
+          conversation,
+          binding,
+          Boolean(currentBinding),
+        );
       case "codex_stop":
         return await this.handleStopCommand(conversation);
       case "codex_steer":
@@ -884,11 +888,12 @@ export class CodexPluginController {
   }
 
   private async handleStatusCommand(
+    conversation: ConversationTarget | null,
     binding: StoredBinding | null,
     bindingActive: boolean,
   ): Promise<ReplyPayload> {
     return {
-      text: await this.buildStatusText(binding, bindingActive),
+      text: await this.buildStatusText(conversation, binding, bindingActive),
     };
   }
 
@@ -2733,9 +2738,14 @@ export class CodexPluginController {
   }
 
   private async buildStatusText(
+    conversation: ConversationTarget | null,
     binding: StoredBinding | null,
     bindingActive: boolean,
   ): Promise<string> {
+    const activeRun =
+      bindingActive && conversation
+        ? this.activeRuns.get(buildConversationKey(conversation))
+        : undefined;
     const workspaceDir = resolveWorkspaceDir({
       bindingWorkspaceDir: binding?.workspaceDir,
       configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
@@ -2765,6 +2775,7 @@ export class CodexPluginController {
       projectFolder,
       worktreeFolder: threadState?.cwd?.trim() || binding?.workspaceDir || workspaceDir,
       contextUsage: binding?.contextUsage,
+      planMode: bindingActive ? activeRun?.mode === "plan" : undefined,
     });
   }
 
