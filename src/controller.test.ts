@@ -591,6 +591,43 @@ describe("Discord controller flows", () => {
     expect(String(buttons[0][0].callback_data).length).toBeLessThan(64);
   });
 
+  it("deduplicates repeated project suffixes in rename style suggestions", async () => {
+    const { controller } = await createControllerHarness();
+    (controller as any).client.readThreadState = vi.fn(async () => ({
+      threadId: "thread-1",
+      threadName: "Explore OAuth login for gifgrep (gifgrep) (gifgrep)",
+      cwd: "/repo/gifgrep",
+    }));
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/gifgrep",
+      threadTitle: "Explore OAuth login for gifgrep (gifgrep) (gifgrep)",
+      updatedAt: Date.now(),
+    });
+
+    const reply = await controller.handleCommand(
+      "codex_rename",
+      buildTelegramCommandContext({
+        args: "--sync",
+        commandBody: "/codex_rename --sync",
+        messageThreadId: 456,
+        getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+      }),
+    );
+
+    const buttons = (reply.channelData as any)?.telegram?.buttons;
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0][0].text).toBe("Explore OAuth login for gifgrep (gifgrep)");
+    expect(buttons[1][0].text).toBe("Explore OAuth login for gifgrep");
+  });
+
   it("requests approved conversation binding when binding a Discord thread", async () => {
     const { controller } = await createControllerHarness();
     const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));

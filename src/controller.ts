@@ -439,12 +439,32 @@ function buildResumeTopicName(params: { title?: string; projectKey?: string; thr
     return undefined;
   }
   const projectName = path.basename(params.projectKey?.replace(/[\\/]+$/, "").trim() || "");
-  return projectName ? `${threadName} (${projectName})` : threadName;
+  const normalizedThreadName = normalizeThreadTitleProjectSuffix(threadName, projectName);
+  return projectName ? `${normalizedThreadName} (${projectName})` : normalizedThreadName;
 }
 
-function buildThreadOnlyName(params: { title?: string; threadId: string }): string | undefined {
+function buildThreadOnlyName(params: { title?: string; projectKey?: string; threadId: string }): string | undefined {
   const threadName = params.title?.trim() || params.threadId.trim();
-  return threadName || undefined;
+  const projectName = path.basename(params.projectKey?.replace(/[\\/]+$/, "").trim() || "");
+  return normalizeThreadTitleProjectSuffix(threadName, projectName) || undefined;
+}
+
+function normalizeThreadTitleProjectSuffix(threadName: string, projectName?: string): string {
+  let normalized = threadName.trim();
+  if (!normalized) {
+    return normalized;
+  }
+  // Collapse duplicated trailing parenthetical groups from repeated sync renames.
+  normalized = normalized.replace(/(?: (\(([^()]+)\)))(?: \(\2\))+$/, " $1").trim();
+  if (projectName) {
+    const repeatedProjectSuffix = new RegExp(`(?: \\(${escapeRegExp(projectName)}\\))+$`);
+    normalized = normalized.replace(repeatedProjectSuffix, "").trim();
+  }
+  return normalized;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function truncateDiscordLabel(text: string, maxChars = 80): string {
@@ -1337,6 +1357,7 @@ export class CodexPluginController {
       .catch(() => undefined);
     const threadName = buildThreadOnlyName({
       title: threadState?.threadName || binding.threadTitle,
+      projectKey: threadState?.cwd?.trim() || binding.workspaceDir,
       threadId: binding.threadId,
     });
     const threadProjectName = buildResumeTopicName({
@@ -1404,6 +1425,7 @@ export class CodexPluginController {
           })
         : buildThreadOnlyName({
             title: threadState?.threadName || binding.threadTitle,
+            projectKey: threadState?.cwd?.trim() || binding.workspaceDir,
             threadId: binding.threadId,
           });
     if (!name) {
