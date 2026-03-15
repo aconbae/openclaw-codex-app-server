@@ -281,3 +281,52 @@ describe("extractRateLimitSummaries", () => {
     ]);
   });
 });
+
+describe("createPendingInputCoordinator", () => {
+  it("surfaces only one pending approval at a time", async () => {
+    const surfaced: Array<string | null> = [];
+    const coordinator = __testing.createPendingInputCoordinator({
+      inputTimeoutMs: 60_000,
+      onPendingInput: async (state) => {
+        surfaced.push(state?.requestId ?? null);
+      },
+    });
+
+    const first = coordinator.enqueue({
+      state: {
+        requestId: "req-1",
+        options: ["approve"],
+        expiresAt: Date.now() + 60_000,
+        method: "item/exec/requestApproval",
+      },
+      options: ["approve"],
+      actions: [],
+      methodLower: "item/exec/requestapproval",
+    });
+    const second = coordinator.enqueue({
+      state: {
+        requestId: "req-2",
+        options: ["approve"],
+        expiresAt: Date.now() + 60_000,
+        method: "item/exec/requestApproval",
+      },
+      options: ["approve"],
+      actions: [],
+      methodLower: "item/exec/requestapproval",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(surfaced).toEqual(["req-1"]);
+    expect(coordinator.current()?.state.requestId).toBe("req-1");
+
+    await coordinator.settleCurrent({ index: 0, option: "approve" });
+    await expect(first.response).resolves.toEqual({ index: 0, option: "approve" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(surfaced).toEqual(["req-1", null, "req-2"]);
+    expect(coordinator.current()?.state.requestId).toBe("req-2");
+
+    await coordinator.settleCurrent({ index: 0, option: "approve" });
+    await expect(second.response).resolves.toEqual({ index: 0, option: "approve" });
+  });
+});

@@ -1790,6 +1790,108 @@ function mapPendingInputResponse(params: {
   return response;
 }
 
+type PendingInputQueueEntry = {
+  state: PendingInputState;
+  options: string[];
+  actions: PendingInputAction[];
+  methodLower: string;
+  timedOut: boolean;
+  timeoutHandle?: ReturnType<typeof setTimeout>;
+  response: Promise<unknown>;
+  resolveResponse: (value: unknown) => void;
+};
+
+function createPendingInputCoordinator(params: {
+  inputTimeoutMs: number;
+  onPendingInput?: (state: PendingInputState | null) => Promise<void> | void;
+  onActivated?: () => void;
+  onCleared?: () => void;
+}) {
+  let current: PendingInputQueueEntry | null = null;
+  const queued: PendingInputQueueEntry[] = [];
+
+  const presentNext = async () => {
+    if (current || queued.length === 0) {
+      return;
+    }
+    const next = queued.shift();
+    if (!next) {
+      return;
+    }
+    current = next;
+    params.onActivated?.();
+    await params.onPendingInput?.(next.state);
+    next.timeoutHandle = setTimeout(() => {
+      if (current?.state.requestId !== next.state.requestId) {
+        return;
+      }
+      next.timedOut = true;
+      void settleCurrent({ text: "" });
+    }, params.inputTimeoutMs);
+  };
+
+  const clearCurrent = async () => {
+    const active = current;
+    if (!active) {
+      return;
+    }
+    current = null;
+    if (active.timeoutHandle) {
+      clearTimeout(active.timeoutHandle);
+    }
+    params.onCleared?.();
+    await params.onPendingInput?.(null);
+    await presentNext();
+  };
+
+  const settleCurrent = async (value: unknown) => {
+    const active = current;
+    if (!active) {
+      return false;
+    }
+    current = null;
+    if (active.timeoutHandle) {
+      clearTimeout(active.timeoutHandle);
+    }
+    params.onCleared?.();
+    await params.onPendingInput?.(null);
+    active.resolveResponse(value);
+    await presentNext();
+    return true;
+  };
+
+  return {
+    enqueue(
+      entry: Omit<
+        PendingInputQueueEntry,
+        "timedOut" | "timeoutHandle" | "response" | "resolveResponse"
+      >,
+    ) {
+      let resolveResponse: (value: unknown) => void = () => undefined;
+      const queuedEntry: PendingInputQueueEntry = {
+        ...entry,
+        timedOut: false,
+        response: new Promise<unknown>((resolve) => {
+          resolveResponse = resolve;
+        }),
+        resolveResponse: (value) => resolveResponse(value),
+      };
+      queued.push(queuedEntry);
+      void presentNext();
+      return queuedEntry;
+    },
+    current() {
+      return current;
+    },
+    async settleCurrent(value: unknown) {
+      return settleCurrent(value);
+    },
+    async clearCurrent() {
+      await clearCurrent();
+    },
+  };
+}
+
 async function withInitializedClient<T>(
   params: {
     settings: PluginSettings;
@@ -2210,15 +2312,16 @@ export class CodexAppServerClient {
     let interrupted = false;
     let completed = false;
     let notificationQueue = Promise.resolve();
-    let pendingInput:
-      | {
-          state: PendingInputState;
-          options: string[];
-          actions: PendingInputAction[];
-          methodLower: string;
-          resolve: (value: unknown) => void;
-        }
-      | null = null;
+    const pendingInputCoordinator = createPendingInputCoordinator({
+      inputTimeoutMs: this.settings.inputTimeoutMs,
+      onPendingInput: params.onPendingInput,
+      onActivated: () => {
+        awaitingInput = true;
+      },
+      onCleared: () => {
+        awaitingInput = false;
+      },
+    });
     let completeTurn: (() => void) | null = null;
     const completion = new Promise<void>((resolve) => {
       completeTurn = () => {
@@ -2285,9 +2388,7 @@ export class CodexAppServerClient {
         turnId ||= ids.runId ?? "";
         const methodLower = method.trim().toLowerCase();
         if (methodLower === "serverrequest/resolved") {
-          pendingInput = null;
-          awaitingInput = false;
-          await params.onPendingInput?.(null);
+          await pendingInputCoordinator.clearCurrent();
           return;
         }
         const maybeReviewText = extractReviewTextFromNotification(method, notificationParams);
@@ -2346,36 +2447,20 @@ export class CodexAppServerClient {
       this.logger.debug(
         `codex review interactive request ${method} (questionnaire=${state.questionnaire ? "yes" : "no"})`,
       );
-      awaitingInput = true;
-      await params.onPendingInput?.(state);
-      let timedOut = false;
-      const response = await new Promise<unknown>((resolve) => {
-        pendingInput = {
-          state,
-          options,
-          actions: state.actions ?? [],
-          methodLower,
-          resolve,
-        };
-        setTimeout(() => {
-          if (!pendingInput || pendingInput.state.requestId !== requestId) {
-            return;
-          }
-          timedOut = true;
-          pendingInput = null;
-          resolve({ text: "" });
-        }, this.settings.inputTimeoutMs);
+      const pendingEntry = pendingInputCoordinator.enqueue({
+        state,
+        options,
+        actions: state.actions ?? [],
+        methodLower,
       });
-      awaitingInput = false;
-      pendingInput = null;
-      await params.onPendingInput?.(null);
+      const response = await pendingEntry.response;
       const mappedResponse = mapPendingInputResponse({
         methodLower,
         requestParams,
         response,
         options,
         actions: state.actions ?? [],
-        timedOut,
+        timedOut: pendingEntry.timedOut,
       });
       const responseRecord = asRecord(response);
       const steerText =
@@ -2400,6 +2485,7 @@ export class CodexAppServerClient {
       result: handleResult,
       queueMessage: async (text) => {
         const trimmed = text.trim();
+        const pendingInput = pendingInputCoordinator.current();
         if (!trimmed || !pendingInput) {
           return false;
         }
@@ -2408,18 +2494,19 @@ export class CodexAppServerClient {
           pendingInput.options.length;
         const parsed = parseCodexUserInput(trimmed, actionSelectionCount);
         if (parsed.kind === "option") {
-          pendingInput.resolve({
+          await pendingInputCoordinator.settleCurrent({
             index: parsed.index,
             option: pendingInput.options[parsed.index] ?? "",
           });
         } else if (pendingInput.methodLower.includes("requestapproval")) {
-          pendingInput.resolve({ steerText: parsed.text });
+          await pendingInputCoordinator.settleCurrent({ steerText: parsed.text });
         } else {
-          pendingInput.resolve({ text: parsed.text });
+          await pendingInputCoordinator.settleCurrent({ text: parsed.text });
         }
         return true;
       },
       submitPendingInput: async (actionIndex) => {
+        const pendingInput = pendingInputCoordinator.current();
         if (!pendingInput) {
           return false;
         }
@@ -2427,17 +2514,18 @@ export class CodexAppServerClient {
         if (!action || action.kind === "steer") {
           return false;
         }
-        pendingInput.resolve({
+        await pendingInputCoordinator.settleCurrent({
           index: actionIndex,
           option: pendingInput.options[actionIndex] ?? "",
         });
         return true;
       },
       submitPendingInputPayload: async (payload) => {
+        const pendingInput = pendingInputCoordinator.current();
         if (!pendingInput) {
           return false;
         }
-        pendingInput.resolve(payload);
+        await pendingInputCoordinator.settleCurrent(payload);
         return true;
       },
       interrupt: async () => {
@@ -2486,15 +2574,18 @@ export class CodexAppServerClient {
     let completed = false;
     let latestContextUsage: ContextUsageSnapshot | undefined;
     let notificationQueue = Promise.resolve();
-    let pendingInput:
-      | {
-          state: PendingInputState;
-          options: string[];
-          actions: PendingInputAction[];
-          methodLower: string;
-          resolve: (value: unknown) => void;
-        }
-      | null = null;
+    const pendingInputCoordinator = createPendingInputCoordinator({
+      inputTimeoutMs: this.settings.inputTimeoutMs,
+      onPendingInput: params.onPendingInput,
+      onActivated: () => {
+        awaitingInput = true;
+        assistantText = "";
+        assistantItemId = "";
+      },
+      onCleared: () => {
+        awaitingInput = false;
+      },
+    });
     let completeTurn: (() => void) | null = null;
     const completion = new Promise<void>((resolve) => {
       completeTurn = () => {
@@ -2517,9 +2608,7 @@ export class CodexAppServerClient {
           latestContextUsage = tokenUsage;
         }
         if (methodLower === "serverrequest/resolved") {
-          pendingInput = null;
-          awaitingInput = false;
-          await params.onPendingInput?.(null);
+          await pendingInputCoordinator.clearCurrent();
           return;
         }
         if (methodLower === "turn/plan/updated") {
@@ -2617,38 +2706,20 @@ export class CodexAppServerClient {
       this.logger.debug(
         `codex turn interactive request ${method} (questionnaire=${state.questionnaire ? "yes" : "no"})`,
       );
-      awaitingInput = true;
-      assistantText = "";
-      assistantItemId = "";
-      await params.onPendingInput?.(state);
-      let timedOut = false;
-      const response = await new Promise<unknown>((resolve) => {
-        pendingInput = {
-          state,
-          options,
-          actions: state.actions ?? [],
-          methodLower,
-          resolve,
-        };
-        setTimeout(() => {
-          if (!pendingInput || pendingInput.state.requestId !== requestId) {
-            return;
-          }
-          timedOut = true;
-          pendingInput = null;
-          resolve({ text: "" });
-        }, this.settings.inputTimeoutMs);
+      const pendingEntry = pendingInputCoordinator.enqueue({
+        state,
+        options,
+        actions: state.actions ?? [],
+        methodLower,
       });
-      awaitingInput = false;
-      pendingInput = null;
-      await params.onPendingInput?.(null);
+      const response = await pendingEntry.response;
       const mappedResponse = mapPendingInputResponse({
         methodLower,
         requestParams,
         response,
         options,
         actions: state.actions ?? [],
-        timedOut,
+        timedOut: pendingEntry.timedOut,
       });
       const responseRecord = asRecord(response);
       const steerText =
@@ -2751,6 +2822,7 @@ export class CodexAppServerClient {
         if (!trimmed) {
           return false;
         }
+        const pendingInput = pendingInputCoordinator.current();
         if (pendingInput) {
           const actionSelectionCount =
             pendingInput.actions.filter((action) => action.kind !== "steer").length ||
@@ -2759,17 +2831,17 @@ export class CodexAppServerClient {
           if (parsed.kind === "option") {
             const action = pendingInput.actions[parsed.index];
             if (action?.kind === "steer") {
-              pendingInput.resolve({ steerText: "" });
+              await pendingInputCoordinator.settleCurrent({ steerText: "" });
             } else {
-              pendingInput.resolve({
+              await pendingInputCoordinator.settleCurrent({
                 index: parsed.index,
                 option: pendingInput.options[parsed.index] ?? "",
               });
             }
           } else if (pendingInput.methodLower.includes("requestapproval")) {
-            pendingInput.resolve({ steerText: parsed.text });
+            await pendingInputCoordinator.settleCurrent({ steerText: parsed.text });
           } else {
-            pendingInput.resolve({ text: parsed.text });
+            await pendingInputCoordinator.settleCurrent({ text: parsed.text });
           }
           return true;
         }
@@ -2788,6 +2860,7 @@ export class CodexAppServerClient {
         return true;
       },
       submitPendingInput: async (actionIndex) => {
+        const pendingInput = pendingInputCoordinator.current();
         if (!pendingInput) {
           return false;
         }
@@ -2795,17 +2868,18 @@ export class CodexAppServerClient {
         if (!action || action.kind === "steer") {
           return false;
         }
-        pendingInput.resolve({
+        await pendingInputCoordinator.settleCurrent({
           index: actionIndex,
           option: pendingInput.options[actionIndex] ?? "",
         });
         return true;
       },
       submitPendingInputPayload: async (payload) => {
+        const pendingInput = pendingInputCoordinator.current();
         if (!pendingInput) {
           return false;
         }
-        pendingInput.resolve(payload);
+        await pendingInputCoordinator.settleCurrent(payload);
         return true;
       },
       interrupt: async () => {
@@ -2833,6 +2907,7 @@ export class CodexAppServerClient {
 
 export const __testing = {
   buildTurnStartPayloads,
+  createPendingInputCoordinator,
   extractFileChangePathsFromReadResult,
   extractThreadTokenUsageSnapshot,
   extractRateLimitSummaries,
