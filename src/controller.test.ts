@@ -470,6 +470,36 @@ describe("Discord controller flows", () => {
     );
   });
 
+  it("shows codex_status as active when only the local restored binding exists", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "user:1177378744822943744",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/discrawl",
+      threadTitle: "Summarize tools used",
+      updatedAt: Date.now(),
+    });
+
+    const reply = await controller.handleCommand(
+      "codex_status",
+      buildDiscordCommandContext({
+        from: "discord:1177378744822943744",
+        to: "slash:1177378744822943744",
+        commandBody: "/codex_status",
+        getCurrentConversationBinding: vi.fn(async () => null),
+      }),
+    );
+
+    expect(reply.text).toContain("Binding: active");
+    expect(reply.text).toContain("Project folder: /repo/discrawl");
+    expect(reply.text).not.toContain("Binding: none");
+  });
+
   it("shows plan mode on in codex_status when the bound conversation has an active plan run", async () => {
     const { controller } = await createControllerHarness();
     await (controller as any).store.upsertBinding({

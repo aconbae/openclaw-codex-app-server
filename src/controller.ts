@@ -743,7 +743,7 @@ export class CodexPluginController {
         ? await bindingApi.getCurrentConversationBinding()
         : null;
     const binding =
-      conversation && currentBinding
+      conversation
         ? this.store.getBinding(conversation) ??
           (await this.hydrateApprovedBinding(conversation))
         : null;
@@ -772,7 +772,7 @@ export class CodexPluginController {
         return await this.handleStatusCommand(
           conversation,
           binding,
-          Boolean(currentBinding),
+          Boolean(currentBinding || binding),
         );
       case "codex_stop":
         return await this.handleStopCommand(conversation);
