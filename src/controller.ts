@@ -323,6 +323,52 @@ function buildReplyWithButtons(text: string, buttons?: PluginInteractiveButtons)
     : { text };
 }
 
+function extractReplyButtons(reply: ReplyPayload): PluginInteractiveButtons | undefined {
+  const telegramButtons = asRecord(reply.channelData?.telegram)?.buttons;
+  if (Array.isArray(telegramButtons)) {
+    return telegramButtons as PluginInteractiveButtons;
+  }
+  const interactive = asRecord((reply as ReplyPayload & { interactive?: unknown }).interactive);
+  const blocks = Array.isArray(interactive?.blocks) ? interactive.blocks : [];
+  const rows: PluginInteractiveButtons = [];
+  for (const block of blocks) {
+    const blockRecord = asRecord(block);
+    if (blockRecord?.type !== "buttons") {
+      continue;
+    }
+    const buttons = Array.isArray(blockRecord.buttons) ? blockRecord.buttons : [];
+    const row = buttons
+      .map((button) => {
+        const buttonRecord = asRecord(button);
+        if (!buttonRecord) {
+          return null;
+        }
+        const text = typeof buttonRecord?.label === "string" ? buttonRecord.label.trim() : "";
+        const callbackData =
+          typeof buttonRecord?.value === "string" ? buttonRecord.value.trim() : "";
+        if (!text || !callbackData) {
+          return null;
+        }
+        const style: "danger" | "success" | "primary" | undefined =
+          buttonRecord.style === "danger" ||
+          buttonRecord.style === "success" ||
+          buttonRecord.style === "primary"
+            ? buttonRecord.style
+            : undefined;
+        return {
+          text,
+          callback_data: callbackData,
+          style,
+        };
+      })
+      .filter((button): button is NonNullable<typeof button> => Boolean(button));
+    if (row.length > 0) {
+      rows.push(row);
+    }
+  }
+  return rows.length > 0 ? rows : undefined;
+}
+
 function parseFastAction(
   argsText: string,
 ): "toggle" | "on" | "off" | "status" | { error: string } {
@@ -685,9 +731,7 @@ export class CodexPluginController {
         }
         const result = await requestConversationBinding(params);
         if (result.status === "pending") {
-          const buttons = asRecord(result.reply.channelData?.telegram)?.buttons as
-            | PluginInteractiveButtons
-            | undefined;
+          const buttons = extractReplyButtons(result.reply);
           await ctx.respond.reply({
             text: result.reply.text ?? "Bind approval requested.",
             buttons,
@@ -768,10 +812,7 @@ export class CodexPluginController {
           }
           const result = await requestConversationBinding(params);
           if (result.status === "pending") {
-            const telegramData = asRecord(result.reply.channelData?.telegram);
-            const buttons = Array.isArray(telegramData?.buttons)
-              ? (telegramData.buttons as PluginInteractiveButtons)
-              : undefined;
+            const buttons = extractReplyButtons(result.reply);
             await this.sendDiscordPicker(conversation, {
               text: result.reply.text ?? "Bind approval requested.",
               buttons,

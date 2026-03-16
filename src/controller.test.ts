@@ -837,6 +837,79 @@ describe("Discord controller flows", () => {
     });
   });
 
+  it("renders Telegram bind approval buttons from interactive reply blocks", async () => {
+    const { controller } = await createControllerHarness();
+    const callback = await (controller as any).store.putCallback({
+      kind: "resume-thread",
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+    });
+    const reply = vi.fn(async () => {});
+
+    await controller.handleTelegramInteractive({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123:topic:456",
+      parentConversationId: "123",
+      threadId: 456,
+      requestConversationBinding: vi.fn(async () => ({
+        status: "pending" as const,
+        reply: {
+          text: "Plugin bind approval required",
+          interactive: {
+            blocks: [
+              {
+                type: "buttons",
+                buttons: [
+                  {
+                    label: "Allow once",
+                    value: "pluginbind:approval:o",
+                    style: "success",
+                  },
+                  {
+                    label: "Always allow",
+                    value: "pluginbind:approval:a",
+                    style: "primary",
+                  },
+                  {
+                    label: "Deny",
+                    value: "pluginbind:approval:d",
+                    style: "danger",
+                  },
+                ],
+              },
+            ],
+          },
+        } as any,
+      })),
+      callback: {
+        payload: callback.token,
+      },
+      respond: {
+        clearButtons: vi.fn(async () => {}),
+        reply,
+        editMessage: vi.fn(async () => {}),
+      },
+    } as any);
+
+    expect(reply).toHaveBeenCalledWith({
+      text: "Plugin bind approval required",
+      buttons: [
+        [
+          { text: "Allow once", callback_data: "pluginbind:approval:o", style: "success" },
+          { text: "Always allow", callback_data: "pluginbind:approval:a", style: "primary" },
+          { text: "Deny", callback_data: "pluginbind:approval:d", style: "danger" },
+        ],
+      ],
+    });
+  });
+
   it("offers compact rename style buttons for codex_rename --sync without a name", async () => {
     const { controller } = await createControllerHarness();
     await (controller as any).store.upsertBinding({
