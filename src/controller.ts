@@ -66,6 +66,7 @@ import {
   type ConversationTarget,
   type PendingInputState,
   type StoredBinding,
+  type StoredPendingBind,
   type StoredPendingRequest,
 } from "./types.js";
 
@@ -112,6 +113,11 @@ type ScopedBindingApi = {
 type FollowUpSummary = {
   initialReply: ReplyPayload;
   followUps: string[];
+};
+
+type HydratedBindingResult = {
+  binding: StoredBinding;
+  pendingBind?: StoredPendingBind;
 };
 
 type PlanDelivery = {
@@ -603,14 +609,24 @@ export class CodexPluginController {
         await active.handle.interrupt().catch(() => undefined);
         }
       }
-      const resolvedBinding =
-        this.store.getBinding(conversation) ??
-        (await this.hydrateApprovedBinding(conversation));
+      const existingBinding = this.store.getBinding(conversation);
+      const hydratedBinding = existingBinding ? null : await this.hydrateApprovedBinding(conversation);
+      const resolvedBinding = existingBinding ?? hydratedBinding?.binding ?? null;
       this.api.logger.debug?.(
         `codex inbound claim channel=${conversation.channel} account=${conversation.accountId} conversation=${conversation.conversationId} parent=${conversation.parentConversationId ?? "<none>"} local=${resolvedBinding ? "yes" : "no"}`,
       );
       if (!resolvedBinding) {
         return { handled: false };
+      }
+      if (hydratedBinding?.pendingBind?.syncTopic) {
+        const syncedName = buildResumeTopicName({
+          title: hydratedBinding.pendingBind.threadTitle,
+          projectKey: hydratedBinding.pendingBind.workspaceDir,
+          threadId: hydratedBinding.pendingBind.threadId,
+        });
+        if (syncedName) {
+          await this.renameConversationIfSupported(conversation, syncedName);
+        }
       }
       this.api.logger.debug?.(
         `codex inbound claim starting turn ${this.formatConversationForLog(conversation)} workspace=${resolvedBinding.workspaceDir} thread=${resolvedBinding.threadId} prompt="${summarizeTextForLog(event.content)}"`,
@@ -785,11 +801,13 @@ export class CodexPluginController {
       conversation && bindingApi.getCurrentConversationBinding
         ? await bindingApi.getCurrentConversationBinding()
         : null;
-    const binding =
-      conversation && currentBinding
-        ? this.store.getBinding(conversation) ??
-          (await this.hydrateApprovedBinding(conversation))
+    const existingBinding =
+      conversation && currentBinding ? this.store.getBinding(conversation) : null;
+    const hydratedBinding =
+      conversation && currentBinding && !existingBinding
+        ? await this.hydrateApprovedBinding(conversation)
         : null;
+    const binding = existingBinding ?? hydratedBinding?.binding ?? null;
     const args = ctx.args?.trim() ?? "";
     if (isDiscordChannel(ctx.channel)) {
       this.api.logger.debug(
@@ -799,7 +817,14 @@ export class CodexPluginController {
 
     switch (commandName) {
       case "codex_resume":
-        return await this.handleJoinCommand(conversation, binding, args, ctx.channel, ctx);
+        return await this.handleJoinCommand(
+          conversation,
+          binding,
+          args,
+          ctx.channel,
+          ctx,
+          hydratedBinding?.pendingBind,
+        );
       case "codex_detach":
         if (!conversation) {
           return { text: "This command needs a Telegram or Discord conversation." };
@@ -881,12 +906,32 @@ export class CodexPluginController {
     args: string,
     channel: string,
     ctx: PluginCommandContext,
+    hydratedPendingBind?: StoredPendingBind,
   ): Promise<ReplyPayload> {
     const bindingApi = asScopedBindingApi(ctx);
     if (!conversation) {
       return { text: "This command needs a Telegram or Discord conversation." };
     }
     const parsed = parseThreadSelectionArgs(args);
+    if (
+      hydratedPendingBind?.notifyBound &&
+      !parsed.listProjects &&
+      !parsed.query
+    ) {
+      if (hydratedPendingBind.syncTopic) {
+        const syncedName = buildResumeTopicName({
+          title: hydratedPendingBind.threadTitle,
+          projectKey: hydratedPendingBind.workspaceDir,
+          threadId: hydratedPendingBind.threadId,
+        });
+        if (syncedName) {
+          await this.renameConversationIfSupported(conversation, syncedName);
+        }
+      }
+      const summary = await this.buildBoundConversationSummaryReply(conversation);
+      this.queueFollowUpTexts(conversation, summary.followUps);
+      return summary.initialReply;
+    }
     if (parsed.listProjects || !parsed.query) {
       const passthroughArgs = [
         parsed.includeAll ? "--all" : "",
@@ -933,6 +978,8 @@ export class CodexPluginController {
           serviceWorkspaceDir: this.serviceWorkspaceDir,
       }),
       threadTitle: selection.thread.title,
+      syncTopic: parsed.syncTopic,
+      notifyBound: true,
     }, bindingApi.requestConversationBinding);
     if (bindResult.status === "pending") {
       return bindResult.reply;
@@ -2550,6 +2597,8 @@ export class CodexPluginController {
           threadId: callback.threadId,
           workspaceDir: threadState?.cwd?.trim() || callback.workspaceDir,
           threadTitle: threadState?.threadName,
+          syncTopic: callback.syncTopic,
+          notifyBound: true,
         },
         responders.requestConversationBinding,
       );
@@ -2853,10 +2902,10 @@ export class CodexPluginController {
 
   private async hydrateApprovedBinding(
     conversation: ConversationTarget,
-  ): Promise<StoredBinding | null> {
+  ): Promise<HydratedBindingResult | null> {
     const existing = this.store.getBinding(conversation);
     if (existing) {
-      return existing;
+      return { binding: existing };
     }
     const pending = this.store.getPendingBind(conversation);
     if (!pending) {
@@ -2867,8 +2916,7 @@ export class CodexPluginController {
       workspaceDir: pending.workspaceDir,
       threadTitle: pending.threadTitle,
     });
-    await this.store.removePendingBind(conversation);
-    return binding;
+    return { binding, pendingBind: pending };
   }
 
   private async requestConversationBinding(
@@ -2877,6 +2925,8 @@ export class CodexPluginController {
       threadId: string;
       workspaceDir: string;
       threadTitle?: string;
+      syncTopic?: boolean;
+      notifyBound?: boolean;
     },
     requestBinding?: (
       params?: { summary?: string },
@@ -2905,12 +2955,14 @@ export class CodexPluginController {
           conversation: {
             channel: conversation.channel,
             accountId: conversation.accountId,
-            conversationId: conversation.conversationId,
-            parentConversationId: conversation.parentConversationId,
-          },
+          conversationId: conversation.conversationId,
+          parentConversationId: conversation.parentConversationId,
+        },
           threadId: params.threadId,
           workspaceDir: params.workspaceDir,
           threadTitle: params.threadTitle,
+          syncTopic: params.syncTopic,
+          notifyBound: params.notifyBound,
           updatedAt: Date.now(),
         });
       }

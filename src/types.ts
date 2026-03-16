@@ -253,6 +253,8 @@ export type StoredPendingBind = {
   threadId: string;
   workspaceDir: string;
   threadTitle?: string;
+  syncTopic?: boolean;
+  notifyBound?: boolean;
   updatedAt: number;
 };
 
