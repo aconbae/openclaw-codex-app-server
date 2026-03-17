@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type {
+  PluginConversationBindingResolvedEvent,
   OpenClawPluginApi,
   OpenClawPluginService,
   PluginCommandContext,
@@ -585,6 +586,57 @@ export class CodexPluginController {
     this.activeRuns.clear();
     await this.client.close().catch(() => undefined);
     this.started = false;
+  }
+
+  async handleConversationBindingResolved(
+    event: PluginConversationBindingResolvedEvent,
+  ): Promise<void> {
+    await this.start();
+    const conversation: ConversationTarget = {
+      channel: event.request.conversation.channel,
+      accountId: event.request.conversation.accountId,
+      conversationId: event.request.conversation.conversationId,
+      parentConversationId: event.request.conversation.parentConversationId,
+      threadId: (() => {
+        if (typeof event.request.conversation.threadId === "number") {
+          return event.request.conversation.threadId;
+        }
+        if (typeof event.request.conversation.threadId !== "string") {
+          return undefined;
+        }
+        const normalized = Number(event.request.conversation.threadId.trim());
+        return Number.isFinite(normalized) ? normalized : undefined;
+      })(),
+    };
+    const pending = this.store.getPendingBind(conversation);
+    if (!pending) {
+      this.api.logger.debug?.(
+        `codex binding approved without pending local bind conversation=${conversation.conversationId}`,
+      );
+      return;
+    }
+    if (event.status === "denied") {
+      await this.store.removePendingBind(conversation);
+      return;
+    }
+    await this.bindConversation(conversation, {
+      threadId: pending.threadId,
+      workspaceDir: pending.workspaceDir,
+      threadTitle: pending.threadTitle,
+    });
+    if (pending.syncTopic) {
+      const syncedName = buildResumeTopicName({
+        title: pending.threadTitle,
+        projectKey: pending.workspaceDir,
+        threadId: pending.threadId,
+      });
+      if (syncedName) {
+        await this.renameConversationIfSupported(conversation, syncedName);
+      }
+    }
+    if (pending.notifyBound) {
+      await this.sendBoundConversationSummary(conversation);
+    }
   }
 
   private formatConversationForLog(conversation: ConversationTarget): string {

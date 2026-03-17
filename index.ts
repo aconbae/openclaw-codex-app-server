@@ -31,6 +31,10 @@ const plugin = {
 
     api.registerService(controller.createService());
 
+    api.onConversationBindingResolved(async (event) => {
+      await controller.handleConversationBindingResolved(event);
+    });
+
     api.on("inbound_claim", async (event) => {
       return await controller.handleInboundClaim(event);
     });

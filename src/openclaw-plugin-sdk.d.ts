@@ -44,6 +44,41 @@ declare module "openclaw/plugin-sdk" {
     Array<{ text: string; callback_data: string; style?: "danger" | "success" | "primary" }>
   >;
 
+  export type PluginConversationBinding = {
+    bindingId: string;
+    pluginId: string;
+    pluginName?: string;
+    pluginRoot: string;
+    channel: string;
+    accountId: string;
+    conversationId: string;
+    parentConversationId?: string;
+    threadId?: string | number;
+    boundAt: number;
+    summary?: string;
+    detachHint?: string;
+  };
+
+  export type PluginConversationBindingResolutionDecision = "allow-once" | "allow-always" | "deny";
+
+  export type PluginConversationBindingResolvedEvent = {
+    status: "approved" | "denied";
+    binding?: PluginConversationBinding;
+    decision: PluginConversationBindingResolutionDecision;
+    request: {
+      summary?: string;
+      detachHint?: string;
+      requestedBySenderId?: string;
+      conversation: {
+        channel: string;
+        accountId: string;
+        conversationId: string;
+        parentConversationId?: string;
+        threadId?: string | number;
+      };
+    };
+  };
+
   export type PluginInteractiveTelegramHandlerContext = {
     channel: "telegram";
     accountId: string;
@@ -211,6 +246,9 @@ declare module "openclaw/plugin-sdk" {
       namespace: string;
       handler: (ctx: any) => Promise<{ handled?: boolean } | void> | { handled?: boolean } | void;
     }) => void;
+    onConversationBindingResolved: (
+      handler: (event: PluginConversationBindingResolvedEvent) => void | Promise<void>,
+    ) => void;
     registerCommand: (command: {
       name: string;
       description: string;

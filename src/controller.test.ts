@@ -67,6 +67,7 @@ function createApiMock() {
     },
     registerService: vi.fn(),
     registerInteractiveHandler: vi.fn(),
+    onConversationBindingResolved: vi.fn(),
     registerCommand: vi.fn(),
     on: vi.fn(),
   } as unknown as OpenClawPluginApi;
@@ -745,6 +746,125 @@ describe("Discord controller flows", () => {
       "Last Agent Reply in Thread:",
       expect.objectContaining({ accountId: "default" }),
     );
+  });
+
+  it("applies pending bind effects immediately when core reports the bind was approved", async () => {
+    const { controller, renameTopic, sendMessageTelegram } = await createControllerHarness();
+    (controller as any).client.readThreadContext = vi.fn(async () => ({
+      lastUserMessage: "What were we doing here?",
+      lastAssistantMessage: "We were working on the app-server lifetime refactor.",
+    }));
+
+    await (controller as any).store.upsertPendingBind({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      threadTitle: "Discord Thread",
+      syncTopic: true,
+      notifyBound: true,
+      updatedAt: Date.now(),
+    });
+
+    await controller.handleConversationBindingResolved({
+      status: "approved",
+      binding: {
+        bindingId: "binding-1",
+        pluginId: "openclaw-codex-app-server",
+        pluginRoot: "/plugins/codex",
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+        threadId: 456,
+        boundAt: Date.now(),
+      },
+      decision: "allow-once",
+      request: {
+        summary: "Bind this conversation to Codex thread Discord Thread.",
+        conversation: {
+          channel: "telegram",
+          accountId: "default",
+          conversationId: "123:topic:456",
+          parentConversationId: "123",
+          threadId: 456,
+        },
+      },
+    } as any);
+
+    expect(renameTopic).toHaveBeenCalledWith(
+      "123",
+      456,
+      "Discord Thread (openclaw)",
+      expect.objectContaining({ accountId: "default" }),
+    );
+    expect(sendMessageTelegram).toHaveBeenCalledWith(
+      "123",
+      expect.stringContaining("Thread Name: Discord Thread"),
+      expect.objectContaining({ accountId: "default", messageThreadId: 456 }),
+    );
+    expect(sendMessageTelegram).toHaveBeenCalledWith(
+      "123",
+      "Last User Request in Thread:",
+      expect.objectContaining({ accountId: "default", messageThreadId: 456 }),
+    );
+    expect(
+      (controller as any).store.getPendingBind({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      }),
+    ).toBeNull();
+  });
+
+  it("clears pending bind state immediately when core reports the bind was denied", async () => {
+    const { controller, renameTopic, sendMessageTelegram } = await createControllerHarness();
+
+    await (controller as any).store.upsertPendingBind({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      threadTitle: "Discord Thread",
+      syncTopic: true,
+      notifyBound: true,
+      updatedAt: Date.now(),
+    });
+
+    await controller.handleConversationBindingResolved({
+      status: "denied",
+      decision: "deny",
+      request: {
+        summary: "Bind this conversation to Codex thread Discord Thread.",
+        conversation: {
+          channel: "telegram",
+          accountId: "default",
+          conversationId: "123:topic:456",
+          parentConversationId: "123",
+          threadId: 456,
+        },
+      },
+    } as any);
+
+    expect(renameTopic).not.toHaveBeenCalled();
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    expect(
+      (controller as any).store.getPendingBind({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      }),
+    ).toBeNull();
   });
 
   it("preserves syncTopic on Telegram resume pickers and renames the topic after callback bind", async () => {
