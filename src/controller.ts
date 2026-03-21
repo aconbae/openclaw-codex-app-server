@@ -841,21 +841,66 @@ export class CodexPluginController {
       conversationId,
       parentConversationId: callback.conversation.parentConversationId ?? ctx.parentConversationId,
     };
+    let interactionSettled = false;
     try {
       if (callback.kind === "resume-thread") {
-        await ctx.respond.acknowledge().catch(() => undefined);
+        await ctx.respond
+          .acknowledge()
+          .then(() => {
+            interactionSettled = true;
+          })
+          .catch(() => undefined);
       }
       await this.dispatchCallbackAction(callback, {
         conversation,
         clear: async () => {
+          const messageId = ctx.interaction.messageId?.trim();
+          if ((callback.kind === "pending-input" || callback.kind === "pending-questionnaire") && messageId) {
+            await ctx.respond
+              .acknowledge()
+              .then(() => {
+                interactionSettled = true;
+              })
+              .catch(() => undefined);
+            const completionText =
+              callback.kind === "pending-questionnaire"
+                ? "Recorded your answers and sent them to Codex."
+                : "Sent to Codex.";
+            await editDiscordComponentMessage(
+              conversation.conversationId,
+              messageId,
+              {
+                text: completionText,
+              },
+              {
+                accountId: conversation.accountId,
+              },
+            ).catch((error) => {
+              this.api.logger.warn(
+                `codex discord ${callback.kind} clear failed conversation=${conversationId}: ${String(error)}`,
+              );
+            });
+            return;
+          }
           try {
             await ctx.respond.clearComponents();
+            interactionSettled = true;
           } catch {
-            await ctx.respond.acknowledge().catch(() => undefined);
+            await ctx.respond
+              .acknowledge()
+              .then(() => {
+                interactionSettled = true;
+              })
+              .catch(() => undefined);
           }
         },
         reply: async (text) => {
+          if (interactionSettled) {
+            await ctx.respond.followUp({ text, ephemeral: true });
+            return;
+          }
           await ctx.respond.reply({ text, ephemeral: true });
+          interactionSettled = true;
         },
         editPicker: async (picker) => {
           this.api.logger.debug(
@@ -867,6 +912,7 @@ export class CodexPluginController {
             await ctx.respond.editMessage({
               components: builtPicker.components,
             });
+            interactionSettled = true;
             if (messageId) {
               registerBuiltDiscordComponentMessage({
                 buildResult: builtPicker,
@@ -881,7 +927,12 @@ export class CodexPluginController {
             );
             if (messageId) {
               if (!detail.includes("already been acknowledged")) {
-                await ctx.respond.acknowledge().catch(() => undefined);
+                await ctx.respond
+                  .acknowledge()
+                  .then(() => {
+                    interactionSettled = true;
+                  })
+                  .catch(() => undefined);
               }
               await editDiscordComponentMessage(
                 conversation.conversationId,
@@ -929,12 +980,12 @@ export class CodexPluginController {
     } catch (error) {
       const detail = error instanceof Error ? error.stack ?? error.message : String(error);
       this.api.logger.warn(`codex discord interactive failed conversation=${conversationId}: ${detail}`);
-      await ctx.respond
-        .reply({
-          text: "Codex hit an error handling that action. Please retry the command.",
-          ephemeral: true,
-        })
-        .catch(() => undefined);
+      const errorReply = {
+        text: "Codex hit an error handling that action. Please retry the command.",
+        ephemeral: true,
+      } as const;
+      const sendError = interactionSettled ? ctx.respond.followUp(errorReply) : ctx.respond.reply(errorReply);
+      await sendError.catch(() => undefined);
     }
   }
 
@@ -2858,7 +2909,9 @@ export class CodexPluginController {
         return;
       }
       await this.store.removeCallback(callback.token);
-      await responders.reply("Sent to Codex.");
+      if (callback.conversation.channel !== "discord") {
+        await responders.reply("Sent to Codex.");
+      }
       return;
     }
     if (callback.kind === "pending-questionnaire") {
@@ -2952,7 +3005,9 @@ export class CodexPluginController {
         }
         await responders.clear().catch(() => undefined);
         await this.store.removePendingRequest(pending.requestId);
-        await responders.reply("Recorded your answers and sent them to Codex.");
+        if (callback.conversation.channel !== "discord") {
+          await responders.reply("Recorded your answers and sent them to Codex.");
+        }
         return;
       }
       await this.sendPendingQuestionnaire(callback.conversation, pending.state, {
