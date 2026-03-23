@@ -645,6 +645,52 @@ function buildMarkdownCodeBlock(text: string, language = ""): string {
   return `${fence}${languageTag}\n${normalized}\n${fence}`;
 }
 
+/**
+ * Strips common shell launcher wrappers from a command string for display.
+ * For example: `/bin/zsh -lc 'git status'` → `git status`
+ *
+ * Matches upstream Codex Desktop behavior (strip_bash_lc_and_escape in
+ * codex-rs/tui/src/exec_command.rs). The raw command is preserved for
+ * approval transport; only the displayed form is simplified.
+ */
+export function stripShellLauncher(command: string): string {
+  const match = command.match(
+    /^(?:\/[/\w]*\/)?(?:bash|zsh|sh|dash|ksh|tcsh|fish)\s+-lc\s+(['"])([\s\S]*)\1\s*$/,
+  );
+  if (match) {
+    return match[2];
+  }
+  return command;
+}
+
+/**
+ * Extracts a display command from the app-server's `commandActions` array.
+ *
+ * The app-server protocol provides `commandActions` as "best-effort parsed
+ * command actions for friendly display" (see CommandAction type in
+ * codex-rs/app-server-protocol). Each action has a `.command` field that is
+ * already stripped of shell launcher wrappers by the Rust-side parser
+ * (extract_shell_command → strip_bash_lc_and_escape).
+ *
+ * When available, this is more reliable than regex-based stripping because
+ * the upstream parser uses tree-sitter for proper shell parsing.
+ */
+export function extractCommandFromActions(requestParams: unknown): string | undefined {
+  const record = asRecord(requestParams);
+  if (!record) return undefined;
+  const actions = record.commandActions;
+  if (!Array.isArray(actions) || actions.length === 0) return undefined;
+  const commands = actions
+    .map((a: unknown) => {
+      const action = asRecord(a);
+      if (!action || typeof action.command !== "string") return undefined;
+      return action.command;
+    })
+    .filter((c): c is string => c !== undefined);
+  if (commands.length === 0) return undefined;
+  return commands.join(" && ");
+}
+
 export function buildPendingPromptText(params: {
   method: string;
   requestId: string;
@@ -673,7 +719,11 @@ export function buildPendingPromptText(params: {
       ),
     );
   }
-  const command =
+  // Prefer the pre-parsed commandActions from the app-server protocol when
+  // available — the Rust side already strips shell launchers via tree-sitter.
+  // Fall back to regex-based stripShellLauncher on the raw command string.
+  const displayCommand = extractCommandFromActions(params.requestParams);
+  const rawCommand =
     findFirstStringByKeys(params.requestParams, [
       "command",
       "cmd",
@@ -681,6 +731,7 @@ export function buildPendingPromptText(params: {
       "rawCommand",
       "shellCommand",
     ]) ?? "";
+  const command = displayCommand ?? (rawCommand ? stripShellLauncher(rawCommand) : "");
   if (command) {
     lines.push("", "Command:", "", buildMarkdownCodeBlock(command, "sh"));
   }
