@@ -825,6 +825,146 @@ describe("Discord controller flows", () => {
     expect(followUp).not.toHaveBeenCalled();
   });
 
+  it("annotates delayed questionnaire replies so Codex can distinguish them from defaults", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-23T12:31:00-04:00"));
+    try {
+      const { controller } = await createControllerHarness();
+      const createdAt = Date.now() - 52 * 60_000;
+      await (controller as any).store.upsertPendingRequest({
+        requestId: "questionnaire-2",
+        conversation: {
+          channel: "discord",
+          accountId: "default",
+          conversationId: "channel:chan-1",
+        },
+        threadId: "thread-1",
+        workspaceDir: "/repo/openclaw",
+        state: {
+          requestId: "questionnaire-2",
+          options: [],
+          expiresAt: Date.now() + 7 * 24 * 60 * 60_000,
+          questionnaire: {
+            currentIndex: 1,
+            awaitingFreeform: false,
+            questions: [
+              {
+                index: 0,
+                id: "milk",
+                header: "Milk",
+                prompt: "Do you like milk on cereal?",
+                options: [
+                  { key: "A", label: "Cereal (Recommended)", description: "Default-looking choice." },
+                  { key: "B", label: "Bagels", description: "Alternate choice." },
+                ],
+                guidance: [],
+              },
+              {
+                index: 1,
+                id: "type",
+                header: "Type",
+                prompt: "What kind of milk?",
+                options: [
+                  { key: "A", label: "Whole", description: "Richer." },
+                  { key: "B", label: "2%", description: "Lighter." },
+                ],
+                guidance: [],
+              },
+            ],
+            answers: [
+              {
+                kind: "option",
+                optionKey: "A",
+                optionLabel: "Cereal (Recommended)",
+              },
+              null,
+            ],
+            responseMode: "structured",
+          },
+        },
+        createdAt,
+        updatedAt: createdAt,
+      });
+      const callback = await (controller as any).store.putCallback({
+        kind: "pending-questionnaire",
+        conversation: {
+          channel: "discord",
+          accountId: "default",
+          conversationId: "channel:chan-1",
+        },
+        requestId: "questionnaire-2",
+        questionIndex: 1,
+        action: "select",
+        optionIndex: 0,
+      });
+      const acknowledge = vi.fn(async () => {});
+      const clearComponents = vi.fn(async () => {});
+      const reply = vi.fn(async () => {});
+      const followUp = vi.fn(async () => {});
+      const submitPendingInputPayload = vi.fn(async () => true);
+      (controller as any).activeRuns.set("discord::default::channel:chan-1::", {
+        conversation: {
+          channel: "discord",
+          accountId: "default",
+          conversationId: "channel:chan-1",
+        },
+        workspaceDir: "/repo/openclaw",
+        mode: "plan",
+        handle: {
+          result: Promise.resolve({ threadId: "thread-1", text: "done" }),
+          queueMessage: vi.fn(async () => false),
+          submitPendingInput: vi.fn(async () => false),
+          submitPendingInputPayload,
+          interrupt: vi.fn(async () => {}),
+          isAwaitingInput: vi.fn(() => true),
+          getThreadId: vi.fn(() => "thread-1"),
+        },
+      });
+
+      await controller.handleDiscordInteractive({
+        channel: "discord",
+        accountId: "default",
+        interactionId: "interaction-2",
+        conversationId: "channel:chan-1",
+        auth: { isAuthorizedSender: true },
+        interaction: {
+          kind: "button",
+          data: `codexapp:${callback.token}`,
+          namespace: "codexapp",
+          payload: callback.token,
+          messageId: "message-2",
+        },
+        senderId: "user-1",
+        senderUsername: "Ada",
+        respond: {
+          acknowledge,
+          reply,
+          followUp,
+          editMessage: vi.fn(async () => {}),
+          clearComponents,
+        },
+      } as any);
+
+      expect(submitPendingInputPayload).toHaveBeenCalledWith({
+        answers: {
+          milk: {
+            answers: [
+              "Cereal (Recommended)",
+              "user_note: This answer was selected by the user in chat after 52 minutes; it was not auto-selected.",
+            ],
+          },
+          type: { answers: ["Whole"] },
+        },
+      });
+      expect(acknowledge).toHaveBeenCalledTimes(1);
+      expect(clearComponents).not.toHaveBeenCalled();
+      expect(reply).not.toHaveBeenCalled();
+      expect(followUp).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("normalizes raw Discord callback conversation ids for guild interactions", async () => {
     const { controller, sendComponentMessage } = await createControllerHarness();
     const callback = await (controller as any).store.putCallback({
@@ -2356,6 +2496,93 @@ describe("Discord controller flows", () => {
     expect(api.logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("reached an active run but was not accepted; restarting"),
     );
+  });
+
+  it("does not send the plan keepalive after a questionnaire is already visible", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-23T13:10:00-04:00"));
+    try {
+      const harness = await createControllerHarness();
+      const { controller } = harness;
+      const { sendMessageTelegram } = harness;
+      let resolveResult: ((value: unknown) => void) | undefined;
+      const result = new Promise((resolve) => {
+        resolveResult = resolve;
+      });
+      (controller as any).client.startTurn = vi.fn((params: any) => {
+        void Promise.resolve().then(() =>
+          params.onPendingInput?.({
+            requestId: "req-plan-1",
+            options: [],
+            expiresAt: Date.now() + 7 * 24 * 60 * 60_000,
+            method: "item/tool/requestUserInput",
+            questionnaire: {
+              currentIndex: 0,
+              questions: [
+                {
+                  index: 0,
+                  id: "breakfast",
+                  header: "Breakfast",
+                  prompt: "Do you like cereal or bagels?",
+                  options: [
+                    { key: "A", label: "Cereal (Recommended)", description: "Choose cereal." },
+                    { key: "B", label: "Bagels", description: "Choose bagels." },
+                  ],
+                  guidance: [],
+                  allowFreeform: true,
+                },
+              ],
+              answers: [null],
+              responseMode: "structured",
+            },
+          }),
+        );
+        return {
+          result,
+          getThreadId: () => "thread-1",
+          queueMessage: vi.fn(async () => false),
+          interrupt: vi.fn(async () => {}),
+          isAwaitingInput: () => true,
+          submitPendingInput: vi.fn(async () => false),
+          submitPendingInputPayload: vi.fn(async () => false),
+        };
+      });
+
+      await (controller as any).startPlan({
+        conversation: {
+          channel: "telegram",
+          accountId: "default",
+          conversationId: "8460800771",
+        },
+        binding: null,
+        workspaceDir: "/repo/openclaw",
+        prompt: "Ask the breakfast question.",
+      });
+
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(12_500);
+
+      const sentTexts = sendMessageTelegram.mock.calls.flatMap((call) => {
+        const [, text] = call as unknown as [unknown, unknown];
+        return typeof text === "string" ? [text] : [];
+      });
+      expect(sentTexts).toContain(
+        "Starting Codex plan mode. I’ll relay the questions and final plan as they arrive.",
+      );
+      expect((controller as any).store.getPendingRequestById("req-plan-1")).not.toBeNull();
+      expect(sentTexts).not.toContain("Codex is still planning...");
+
+      resolveResult?.({
+        threadId: "thread-1",
+        aborted: true,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("tells the user to log back in when Codex reports OpenAI auth is required", async () => {

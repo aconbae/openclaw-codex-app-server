@@ -47,6 +47,7 @@ import {
 } from "./format.js";
 import type { AccountSummary, CollaborationMode, TurnTerminalError } from "./types.js";
 import {
+  addQuestionnaireResponseNote,
   buildPendingQuestionnaireResponse,
   formatPendingQuestionnairePrompt,
   questionnaireCurrentQuestionHasAnswer,
@@ -117,6 +118,21 @@ type PickerResponders = {
     | { status: "error"; message: string }
   >;
 };
+
+const DELAYED_QUESTIONNAIRE_NOTE_THRESHOLD_MS = 15 * 60_000;
+
+function formatElapsedDuration(elapsedMs: number): string {
+  const totalMinutes = Math.max(1, Math.round(elapsedMs / 60_000));
+  if (totalMinutes < 60) {
+    return `${totalMinutes} minute${totalMinutes === 1 ? "" : "s"}`;
+  }
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (minutes === 0) {
+    return `${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  return `${hours} hour${hours === 1 ? "" : "s"} ${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
 
 type ScopedBindingApi = {
   requestConversationBinding?: (
@@ -2045,7 +2061,7 @@ export class CodexPluginController {
             .catch(() => null)
         : null;
     let keepaliveSent = false;
-    const progressTimer = setTimeout(() => {
+    let progressTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
       void (async () => {
         if (keepaliveSent) {
           return;
@@ -2054,6 +2070,13 @@ export class CodexPluginController {
         await this.sendText(params.conversation, "Codex is still planning...");
       })();
     }, PLAN_PROGRESS_DELAY_MS);
+    const stopProgressTimer = () => {
+      if (!progressTimer) {
+        return;
+      }
+      clearTimeout(progressTimer);
+      progressTimer = null;
+    };
     const run = this.client.startTurn({
       sessionKey: params.binding?.sessionKey,
       workspaceDir: params.workspaceDir,
@@ -2070,6 +2093,9 @@ export class CodexPluginController {
         },
       },
       onPendingInput: async (state) => {
+        if (state) {
+          stopProgressTimer();
+        }
         this.api.logger.debug(
           `codex plan pending input ${state ? `received (questionnaire=${state.questionnaire ? "yes" : "no"})` : "cleared"}`,
         );
@@ -2169,7 +2195,7 @@ export class CodexPluginController {
         await this.sendText(params.conversation, formatFailureText("plan", error));
       })
       .finally(async () => {
-        clearTimeout(progressTimer);
+        stopProgressTimer();
         typing?.stop();
         this.activeRuns.delete(key);
         const pending = this.store.getPendingRequestByConversation(params.conversation);
@@ -2201,7 +2227,7 @@ export class CodexPluginController {
     }
     const typing = await this.startTypingLease(params.conversation);
     let keepaliveSent = false;
-    const progressTimer = setTimeout(() => {
+    let progressTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
       void (async () => {
         if (keepaliveSent) {
           return;
@@ -2210,6 +2236,13 @@ export class CodexPluginController {
         await this.sendText(params.conversation, "Codex is still reviewing...");
       })();
     }, REVIEW_PROGRESS_DELAY_MS);
+    const stopProgressTimer = () => {
+      if (!progressTimer) {
+        return;
+      }
+      clearTimeout(progressTimer);
+      progressTimer = null;
+    };
     const run = this.client.startReview({
       sessionKey: params.binding.sessionKey,
       workspaceDir: params.workspaceDir,
@@ -2217,6 +2250,9 @@ export class CodexPluginController {
       runId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       target: params.target,
       onPendingInput: async (state) => {
+        if (state) {
+          stopProgressTimer();
+        }
         await this.handlePendingInputState(params.conversation, params.workspaceDir, state, run);
       },
       onInterrupted: async () => {
@@ -2301,7 +2337,7 @@ export class CodexPluginController {
         await this.sendText(params.conversation, formatFailureText("review", error));
       })
       .finally(async () => {
-        clearTimeout(progressTimer);
+        stopProgressTimer();
         typing?.stop();
         this.activeRuns.delete(key);
         const pending = this.store.getPendingRequestByConversation(params.conversation);
@@ -2325,12 +2361,14 @@ export class CodexPluginController {
       return;
     }
     if (state.questionnaire) {
+      const existing = this.store.getPendingRequestById(state.requestId);
       await this.store.upsertPendingRequest({
         requestId: state.requestId,
         conversation,
         threadId: run.getThreadId() ?? this.store.getBinding(conversation)?.threadId ?? "",
         workspaceDir,
         state,
+        createdAt: existing?.createdAt ?? Date.now(),
         updatedAt: Date.now(),
       });
       await this.sendPendingQuestionnaire(conversation, state);
@@ -2348,15 +2386,34 @@ export class CodexPluginController {
       }),
     );
     const buttons = this.buildPendingButtons(state, callbacks);
+    const existing = this.store.getPendingRequestById(state.requestId);
     await this.store.upsertPendingRequest({
       requestId: state.requestId,
       conversation,
       threadId: run.getThreadId() ?? this.store.getBinding(conversation)?.threadId ?? "",
       workspaceDir,
       state,
+      createdAt: existing?.createdAt ?? Date.now(),
       updatedAt: Date.now(),
     });
     await this.sendText(conversation, state.promptText ?? "Codex needs input.", { buttons });
+  }
+
+  private buildQuestionnaireSubmissionPayload(pending: StoredPendingRequest): unknown {
+    const questionnaire = pending.state.questionnaire;
+    if (!questionnaire) {
+      return {};
+    }
+    const response = buildPendingQuestionnaireResponse(questionnaire);
+    const createdAt = pending.createdAt ?? pending.updatedAt;
+    const elapsedMs = Math.max(0, Date.now() - createdAt);
+    if (elapsedMs < DELAYED_QUESTIONNAIRE_NOTE_THRESHOLD_MS) {
+      return response;
+    }
+    return addQuestionnaireResponseNote(
+      response,
+      `This answer was selected by the user in chat after ${formatElapsedDuration(elapsedMs)}; it was not auto-selected.`,
+    );
   }
 
   private async sendPendingQuestionnaire(
@@ -2505,7 +2562,7 @@ export class CodexPluginController {
     await this.store.upsertPendingRequest(pending);
     if (questionnaireIsComplete(questionnaire)) {
       const submitted = await run.submitPendingInputPayload(
-        buildPendingQuestionnaireResponse(questionnaire),
+        this.buildQuestionnaireSubmissionPayload(pending),
       );
       if (!submitted) {
         return false;
@@ -2939,9 +2996,9 @@ export class CodexPluginController {
     if (callback.kind === "pending-input") {
       await responders.clear().catch(() => undefined);
       const pending = this.store.getPendingRequestById(callback.requestId);
-      if (!pending || pending.state.expiresAt <= Date.now()) {
+      if (!pending) {
         await this.store.removeCallback(callback.token);
-        await responders.reply("That Codex request expired. Please retry.");
+        await responders.reply("That Codex request is no longer available. Please retry.");
         return;
       }
       const active = this.activeRuns.get(buildConversationKey(callback.conversation));
@@ -2962,9 +3019,9 @@ export class CodexPluginController {
     }
     if (callback.kind === "pending-questionnaire") {
       const pending = this.store.getPendingRequestById(callback.requestId);
-      if (!pending || pending.state.expiresAt <= Date.now() || !pending.state.questionnaire) {
+      if (!pending || !pending.state.questionnaire) {
         await this.store.removeCallback(callback.token);
-        await responders.reply("That Codex questionnaire expired. Please retry.");
+        await responders.reply("That Codex questionnaire is no longer available. Please retry.");
         return;
       }
       const active = this.activeRuns.get(buildConversationKey(callback.conversation));
@@ -3043,7 +3100,7 @@ export class CodexPluginController {
       await this.store.upsertPendingRequest(pending);
       if (questionnaireIsComplete(questionnaire)) {
         const submitted = await active.handle.submitPendingInputPayload(
-          buildPendingQuestionnaireResponse(questionnaire),
+          this.buildQuestionnaireSubmissionPayload(pending),
         );
         if (!submitted) {
           await responders.reply("That Codex questionnaire is no longer accepting answers.");
