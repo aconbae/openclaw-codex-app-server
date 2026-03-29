@@ -24,7 +24,13 @@ import {
   resolveDiscordAccount,
 } from "openclaw/plugin-sdk/discord";
 import { resolvePluginSettings, resolveWorkspaceDir } from "./config.js";
-import { CodexAppServerModeClient, type ActiveCodexRun, isMissingThreadError } from "./client.js";
+import {
+  CodexAppServerModeClient,
+  type ActiveCodexRun,
+  isMissingThreadError,
+  isUnavailableThreadError,
+  isUnmaterializedThreadError,
+} from "./client.js";
 import { getThreadDisplayTitle } from "./thread-display.js";
 import {
   formatAccountSummary,
@@ -1273,6 +1279,7 @@ export class CodexPluginController {
       threadTitle: pending.threadTitle,
       permissionsMode: normalizePermissionsMode(pending.permissionsMode),
       preferences: pending.preferences,
+      needsFirstTurnMaterialization: pending.needsFirstTurnMaterialization,
     });
     await this.store.removePendingBind(conversation);
     if (pending.syncTopic) {
@@ -3333,6 +3340,36 @@ export class CodexPluginController {
       params.binding,
       this.settings.defaultModel,
     );
+    let existingThreadIdForRun = params.binding?.threadId;
+    if (params.binding?.needsFirstTurnMaterialization && params.binding.threadId) {
+      try {
+        const materializedState = await this.client.readThreadState({
+          profile,
+          sessionKey: params.binding.sessionKey,
+          threadId: params.binding.threadId,
+        });
+        if (materializedState.threadName || materializedState.cwd) {
+          await this.store.upsertBinding({
+            ...params.binding,
+            threadTitle: materializedState.threadName?.trim() || params.binding.threadTitle,
+            workspaceDir: materializedState.cwd?.trim() || params.binding.workspaceDir,
+            needsFirstTurnMaterialization: false,
+            updatedAt: Date.now(),
+          });
+        }
+      } catch (error) {
+        if (isMissingThreadError(error)) {
+          existingThreadIdForRun = undefined;
+          this.api.logger.debug?.(
+            `codex turn request falling back to thread creation for first materialization ${this.formatConversationForLog(params.conversation)} boundThread=${params.binding.threadId}: ${String(error)}`,
+          );
+        } else {
+          this.api.logger.warn(
+            `codex turn request could not validate first-turn materialization ${this.formatConversationForLog(params.conversation)} boundThread=${params.binding.threadId}: ${String(error)}`,
+          );
+        }
+      }
+    }
     const run = this.client.startTurn({
       profile,
       sessionKey: params.binding?.sessionKey,
@@ -3340,7 +3377,7 @@ export class CodexPluginController {
       prompt: params.prompt,
       input: params.input,
       runId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-      existingThreadId: params.binding?.threadId,
+      existingThreadId: existingThreadIdForRun,
       model: desired.model,
       reasoningEffort: desired.reasoningEffort,
       serviceTier: desired.serviceTier ?? undefined,
@@ -4856,13 +4893,25 @@ export class CodexPluginController {
         this.getPermissionsMode(currentBinding),
         callback.requestedYolo,
       );
-      const threadState = await this.client
-        .readThreadState({
+      let threadState: ThreadState | undefined;
+      try {
+        threadState = await this.client.readThreadState({
           profile,
           sessionKey: buildPluginSessionKey(callback.threadId),
           threadId: callback.threadId,
-        })
-        .catch(() => undefined);
+        });
+      } catch (error) {
+        if (isUnavailableThreadError(error)) {
+          await this.store.removeCallback(callback.token).catch(() => undefined);
+          await responders.reply(
+            this.formatMissingThreadUnavailableMessage(callback.threadId, callback.threadTitle),
+          );
+          return;
+        }
+        if (!isUnmaterializedThreadError(error)) {
+          throw error;
+        }
+      }
       const preferences = this.buildBindingPreferencesWithOverrides(
         currentBinding?.preferences,
         {
@@ -5735,6 +5784,8 @@ export class CodexPluginController {
         syncTopic,
         preferences,
         notifyBound: true,
+        skipThreadAvailabilityCheck: true,
+        needsFirstTurnMaterialization: true,
       },
       requestConversationBinding,
     );
@@ -5858,6 +5909,7 @@ export class CodexPluginController {
       permissionsMode?: PermissionsMode;
       pendingPermissionsMode?: PermissionsMode;
       preferences?: ConversationPreferences;
+      needsFirstTurnMaterialization?: boolean;
     },
   ): Promise<StoredBinding> {
     const sessionKey = buildPluginSessionKey(params.threadId);
@@ -5880,6 +5932,7 @@ export class CodexPluginController {
       pinnedBindingMessage: existing?.pinnedBindingMessage,
       contextUsage: existing?.contextUsage,
       preferences: params.preferences ?? existing?.preferences,
+      needsFirstTurnMaterialization: params.needsFirstTurnMaterialization ?? false,
       updatedAt: Date.now(),
     };
     await this.store.upsertBinding(record);
@@ -5917,6 +5970,8 @@ export class CodexPluginController {
       syncTopic?: boolean;
       notifyBound?: boolean;
       preferences?: ConversationPreferences;
+      skipThreadAvailabilityCheck?: boolean;
+      needsFirstTurnMaterialization?: boolean;
     },
     requestBinding?: (
       params?: { summary?: string },
@@ -5942,6 +5997,25 @@ export class CodexPluginController {
         message: `Cannot resume: workspace path no longer exists on disk.\n\`${params.workspaceDir}\`\n\nThe worktree may have been removed. Check your local paths or start a new session.`,
       };
     }
+    if (!params.skipThreadAvailabilityCheck) {
+      try {
+        await this.client.readThreadState({
+          profile: normalizePermissionsMode(params.permissionsMode) ?? "default",
+          sessionKey: buildPluginSessionKey(params.threadId),
+          threadId: params.threadId,
+        });
+      } catch (error) {
+        if (isUnavailableThreadError(error)) {
+          return {
+            status: "error",
+            message: this.formatMissingThreadUnavailableMessage(params.threadId, params.threadTitle),
+          };
+        }
+        if (!isUnmaterializedThreadError(error)) {
+          throw error;
+        }
+      }
+    }
     const approval = await requestBinding({
       summary: `Bind this conversation to Codex thread ${params.threadTitle?.trim() || params.threadId}.`,
     });
@@ -5961,6 +6035,7 @@ export class CodexPluginController {
           syncTopic: params.syncTopic,
           notifyBound: params.notifyBound,
           preferences: params.preferences,
+          needsFirstTurnMaterialization: params.needsFirstTurnMaterialization,
           updatedAt: Date.now(),
         });
       }
@@ -5968,6 +6043,14 @@ export class CodexPluginController {
     }
     const binding = await this.bindConversation(conversation, params);
     return { status: "bound", binding };
+  }
+
+  private formatMissingThreadUnavailableMessage(threadId: string, threadTitle?: string): string {
+    const title = threadTitle?.trim();
+    const target = title ? `${title} (\`${threadId}\`)` : `\`${threadId}\``;
+    return `Cannot resume: Codex thread ${target} is no longer available.
+
+It may be stale or already gone from the Codex App Server. Please run /cas_resume again and pick a different thread.`;
   }
 
   private trimReplayText(value?: string, maxLength = 1200): string | undefined {

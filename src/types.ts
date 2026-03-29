@@ -281,6 +281,7 @@ export type StoredBinding = {
   pinnedBindingMessage?: InteractiveMessageRef;
   contextUsage?: ContextUsageSnapshot;
   preferences?: ConversationPreferences;
+  needsFirstTurnMaterialization?: boolean;
   updatedAt: number;
 };
 
@@ -305,6 +306,7 @@ export type StoredPendingBind = {
   syncTopic?: boolean;
   notifyBound?: boolean;
   preferences?: ConversationPreferences;
+  needsFirstTurnMaterialization?: boolean;
   updatedAt: number;
 };
 
