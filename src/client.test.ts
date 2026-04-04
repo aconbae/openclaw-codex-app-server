@@ -751,6 +751,27 @@ describe("assistant message extraction", () => {
     });
   });
 
+  it("accepts message snapshots from item/completed", () => {
+    expect(
+      __testing.extractAssistantNotificationText("item/completed", {
+        item: {
+          id: "msg-1b",
+          type: "message",
+          content: [
+            {
+              type: "output_text",
+              text: "Phase 3 is complete.",
+            },
+          ],
+        },
+      }),
+    ).toEqual({
+      mode: "snapshot",
+      text: "Phase 3 is complete.",
+      itemId: "msg-1b",
+    });
+  });
+
   it("accepts assistantmessage deltas", () => {
     expect(
       __testing.extractAssistantNotificationText("item/assistantmessage/delta", {
@@ -812,6 +833,28 @@ describe("terminal assistant text extraction", () => {
         },
       }),
     ).toBe("Nested assistant item wins.");
+  });
+
+  it("accepts message items nested in terminal payloads", () => {
+    expect(
+      __testing.extractAssistantTextFromTerminalPayload("turn/completed", {
+        turn: {
+          status: "completed",
+          result: {
+            item: {
+              id: "msg-5",
+              type: "message",
+              content: [
+                {
+                  type: "output_text",
+                  text: "Final summary from message item.",
+                },
+              ],
+            },
+          },
+        },
+      }),
+    ).toBe("Final summary from message item.");
   });
 });
 

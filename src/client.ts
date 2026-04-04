@@ -2010,7 +2010,11 @@ function extractAssistantTextFromItemPayload(
   }
   const item = asRecord(record.item) ?? record;
   const itemType = pickString(item, ["type"])?.toLowerCase();
-  if (itemType !== "agentmessage" && itemType !== "assistantmessage") {
+  if (
+    itemType !== "agentmessage" &&
+    itemType !== "assistantmessage" &&
+    itemType !== "message"
+  ) {
     return "";
   }
   return extractAssistantTextPayload(item, options);

@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi, PluginCommandContext, ReplyPayload } from "openclaw/plugin-sdk";
 import { CodexAppServerClient } from "./client.js";
 import { CodexPluginController } from "./controller.js";
+import { buildPluginSessionKey } from "./state.js";
+import { PLUGIN_ID } from "./types.js";
 
 const TEST_TELEGRAM_PEER_ID = "telegram-user-1";
 
@@ -3660,8 +3662,27 @@ describe("Discord controller flows", () => {
     expect(startTurn).toHaveBeenCalled();
   });
 
-  it("does not claim inbound Discord messages when only core binding state exists", async () => {
-    const { controller } = await createControllerHarness();
+  it("recovers inbound Discord claims from a live core binding when local state is missing", async () => {
+    const { controller, clientMock, api } = await createControllerHarness();
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        text: "hello",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => true),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    (controller as any).client.startTurn = startTurn;
+    (api.runtime.channel.bindings.resolveByConversation as any).mockReturnValue({
+      targetSessionKey: buildPluginSessionKey("thread-1"),
+      metadata: {
+        pluginId: PLUGIN_ID,
+      },
+    });
 
     const result = await controller.handleInboundClaim({
       content: "who are you?",
@@ -3672,7 +3693,53 @@ describe("Discord controller flows", () => {
       metadata: { guildId: "guild-1" },
     });
 
-    expect(result).toEqual({ handled: false });
+    expect(result).toEqual({ handled: true });
+    expect(clientMock.readThreadState).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: buildPluginSessionKey("thread-1"),
+        threadId: "thread-1",
+      }),
+    );
+    expect(startTurn).toHaveBeenCalled();
+    expect((controller as any).store.getBinding({
+      channel: "discord",
+      accountId: "default",
+      conversationId: "channel:1481858418548412579",
+      parentConversationId: undefined,
+    })).toEqual(
+      expect.objectContaining({
+        sessionKey: buildPluginSessionKey("thread-1"),
+        threadId: "thread-1",
+        workspaceDir: "/repo/openclaw",
+      }),
+    );
+  });
+
+  it("sends a desync-specific message when a live core binding cannot be recovered", async () => {
+    const { controller, api, sendMessageDiscord } = await createControllerHarness();
+    (api.runtime.channel.bindings.resolveByConversation as any).mockReturnValue({
+      targetSessionKey: buildPluginSessionKey("thread-1"),
+      metadata: {
+        pluginId: PLUGIN_ID,
+      },
+    });
+    (controller as any).client.readThreadState = vi.fn(async () => ({ cwd: undefined }));
+
+    const result = await controller.handleInboundClaim({
+      content: "who are you?",
+      channel: "discord",
+      accountId: "default",
+      conversationId: "1481858418548412579",
+      isGroup: true,
+      metadata: { guildId: "guild-1" },
+    });
+
+    expect(result).toEqual({ handled: true });
+    expect(sendMessageDiscord).toHaveBeenCalledWith(
+      "channel:1481858418548412579",
+      expect.stringContaining("local binding state got out of sync"),
+      expect.objectContaining({ accountId: "default" }),
+    );
   });
 
   it("uses a raw Discord channel id for the typing lease on inbound claims", async () => {
