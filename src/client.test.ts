@@ -765,6 +765,54 @@ describe("assistant message extraction", () => {
       itemId: "msg-2",
     });
   });
+
+  it("falls back to summary-like fields in assistant items", () => {
+    expect(
+      __testing.extractAssistantNotificationText("item/completed", {
+        item: {
+          id: "msg-3",
+          type: "assistantmessage",
+          summary: "Done after a long run.",
+        },
+      }),
+    ).toEqual({
+      mode: "snapshot",
+      text: "Done after a long run.",
+      itemId: "msg-3",
+    });
+  });
+});
+
+describe("terminal assistant text extraction", () => {
+  it("extracts final text from turn/completed output payloads", () => {
+    expect(
+      __testing.extractAssistantTextFromTerminalPayload("turn/completed", {
+        turn: {
+          status: "completed",
+          output: {
+            summary: "Final answer from terminal payload.",
+          },
+        },
+      }),
+    ).toBe("Final answer from terminal payload.");
+  });
+
+  it("prefers assistant message items nested in terminal payloads", () => {
+    expect(
+      __testing.extractAssistantTextFromTerminalPayload("turn/completed", {
+        turn: {
+          status: "completed",
+          result: {
+            item: {
+              id: "msg-4",
+              type: "assistantmessage",
+              text: "Nested assistant item wins.",
+            },
+          },
+        },
+      }),
+    ).toBe("Nested assistant item wins.");
+  });
 });
 
 describe("turn stop detection", () => {

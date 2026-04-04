@@ -77,7 +77,7 @@ export type ActiveCodexRun = {
 };
 
 const DEFAULT_PROTOCOL_VERSION = "1.0";
-const TRAILING_NOTIFICATION_SETTLE_MS = 250;
+const TRAILING_NOTIFICATION_SETTLE_MS = 1000;
 const TURN_STEER_METHODS = ["turn/steer"] as const;
 const TURN_INTERRUPT_METHODS = ["turn/interrupt"] as const;
 const execFileAsync = promisify(execFile);
@@ -1986,6 +1986,20 @@ function extractAssistantItemId(value: unknown): string | undefined {
   return pickString(item, ["id", "itemId", "item_id", "messageId", "message_id"]);
 }
 
+function extractAssistantTextPayload(value: unknown, options?: { streaming?: boolean }): string {
+  const record = asRecord(value);
+  if (!record) {
+    return "";
+  }
+  const streamingText = options?.streaming
+    ? collectStreamingText(record)
+    : (pickString(record, ["text"], { trim: false }) ?? collectStreamingText(record));
+  if (streamingText.trim()) {
+    return streamingText;
+  }
+  return dedupeJoinedText(collectText(record));
+}
+
 function extractAssistantTextFromItemPayload(
   value: unknown,
   options?: { streaming?: boolean },
@@ -1999,9 +2013,55 @@ function extractAssistantTextFromItemPayload(
   if (itemType !== "agentmessage" && itemType !== "assistantmessage") {
     return "";
   }
-  return options?.streaming
-    ? collectStreamingText(item)
-    : (pickString(item, ["text"], { trim: false }) ?? collectStreamingText(item));
+  return extractAssistantTextPayload(item, options);
+}
+
+function extractAssistantTextFromTerminalPayload(method: string, params: unknown): string {
+  const methodLower = method.trim().toLowerCase();
+  if (
+    methodLower !== "turn/completed" &&
+    methodLower !== "turn/failed" &&
+    methodLower !== "turn/cancelled"
+  ) {
+    return "";
+  }
+  const record = asRecord(params);
+  if (!record) {
+    return "";
+  }
+  const candidateRecords = [
+    asRecord(record.turn),
+    asRecord(asRecord(record.turn)?.output),
+    asRecord(asRecord(record.turn)?.result),
+    asRecord(asRecord(record.turn)?.response),
+    asRecord(record.output),
+    asRecord(record.result),
+    asRecord(record.response),
+    asRecord(record.data),
+    record,
+  ].filter((entry): entry is Record<string, unknown> => Boolean(entry));
+  for (const candidate of candidateRecords) {
+    const itemText = extractAssistantTextFromItemPayload(candidate);
+    if (itemText.trim()) {
+      return itemText;
+    }
+    const outputText = dedupeJoinedText([
+      ...collectText(candidate.text),
+      ...collectText(candidate.message),
+      ...collectText(candidate.messages),
+      ...collectText(candidate.content),
+      ...collectText(candidate.output),
+      ...collectText(candidate.result),
+      ...collectText(candidate.parts),
+      ...collectText(candidate.summary),
+      ...collectText(candidate.lastAssistantMessage),
+      ...collectText(candidate.last_assistant_message),
+    ]);
+    if (outputText) {
+      return outputText;
+    }
+  }
+  return "";
 }
 
 function extractAssistantNotificationText(
@@ -2012,7 +2072,7 @@ function extractAssistantNotificationText(
   if (methodLower === "item/agentmessage/delta" || methodLower === "item/assistantmessage/delta") {
     return {
       mode: "delta",
-      text: collectStreamingText(params),
+      text: extractAssistantTextPayload(params, { streaming: true }),
       itemId: extractAssistantItemId(params),
     };
   }
@@ -2994,6 +3054,7 @@ export class CodexAppServerClient {
     let turnId = "";
     let reviewText = "";
     let assistantText = "";
+    let lastAssistantText = "";
     let awaitingInput = false;
     let interrupted = false;
     let completed = false;
@@ -3008,12 +3069,30 @@ export class CodexAppServerClient {
       },
     });
     let completeTurn: (() => void) | null = null;
+    let terminalNotificationSeen = false;
+    let completionSettleTimer: NodeJS.Timeout | undefined;
+    const settleCompletionSoon = () => {
+      if (completed) {
+        return;
+      }
+      if (completionSettleTimer) {
+        clearTimeout(completionSettleTimer);
+      }
+      completionSettleTimer = setTimeout(() => {
+        completionSettleTimer = undefined;
+        completeTurn?.();
+      }, TRAILING_NOTIFICATION_SETTLE_MS);
+    };
     const completion = new Promise<void>((resolve) => {
       completeTurn = () => {
         if (completed) {
           return;
         }
         completed = true;
+        if (completionSettleTimer) {
+          clearTimeout(completionSettleTimer);
+          completionSettleTimer = undefined;
+        }
         resolve();
       };
     });
@@ -3049,10 +3128,9 @@ export class CodexAppServerClient {
         turnId ||= extractIds(result)?.runId ?? "";
         await completion;
         if (completed && !interrupted) {
-          await new Promise<void>((resolve) => setTimeout(resolve, TRAILING_NOTIFICATION_SETTLE_MS));
           await notificationQueue;
         }
-        const resolvedReviewText = reviewText || assistantText;
+        const resolvedReviewText = reviewText || assistantText || lastAssistantText;
         return {
           reviewText: resolvedReviewText.trim(),
           reviewThreadId: reviewThreadId || undefined,
@@ -3082,15 +3160,29 @@ export class CodexAppServerClient {
           reviewText = maybeReviewText.trim();
         }
         const assistantNotification = extractAssistantNotificationText(methodLower, notificationParams);
-        if (assistantNotification.mode === "snapshot" && assistantNotification.text.trim()) {
+        if (assistantNotification.mode === "delta" && assistantNotification.text.trim()) {
           assistantText = assistantNotification.text.trim();
+          lastAssistantText = assistantText;
+        } else if (assistantNotification.mode === "snapshot" && assistantNotification.text.trim()) {
+          assistantText = assistantNotification.text.trim();
+          lastAssistantText = assistantText;
         }
         if (
           methodLower === "turn/completed" ||
           methodLower === "turn/failed" ||
           methodLower === "turn/cancelled"
         ) {
-          completeTurn?.();
+          const terminalAssistantText = extractAssistantTextFromTerminalPayload(methodLower, notificationParams).trim();
+          if (terminalAssistantText) {
+            assistantText = terminalAssistantText;
+            lastAssistantText = terminalAssistantText;
+          }
+          terminalNotificationSeen = true;
+          settleCompletionSoon();
+          return;
+        }
+        if (terminalNotificationSeen) {
+          settleCompletionSoon();
         }
       });
       notificationQueue = next.catch((error: unknown) => {
@@ -3270,6 +3362,7 @@ export class CodexAppServerClient {
     let threadModel = "";
     let threadReasoningEffort = "";
     let assistantText = "";
+    let lastAssistantText = "";
     let sawAssistantOutput = false;
     let assistantItemId = "";
     let planExplanation = "";
@@ -3299,12 +3392,30 @@ export class CodexAppServerClient {
       onFlush: params.onFileEdits,
     });
     let completeTurn: (() => void) | null = null;
+    let terminalNotificationSeen = false;
+    let completionSettleTimer: NodeJS.Timeout | undefined;
+    const settleCompletionSoon = () => {
+      if (completed) {
+        return;
+      }
+      if (completionSettleTimer) {
+        clearTimeout(completionSettleTimer);
+      }
+      completionSettleTimer = setTimeout(() => {
+        completionSettleTimer = undefined;
+        completeTurn?.();
+      }, TRAILING_NOTIFICATION_SETTLE_MS);
+    };
     const completion = new Promise<void>((resolve) => {
       completeTurn = () => {
         if (completed) {
           return;
         }
         completed = true;
+        if (completionSettleTimer) {
+          clearTimeout(completionSettleTimer);
+          completionSettleTimer = undefined;
+        }
         resolve();
       };
     });
@@ -3387,10 +3498,15 @@ export class CodexAppServerClient {
             assistantText && assistantNotification.text.startsWith(assistantText)
               ? assistantNotification.text
               : `${assistantText}${assistantNotification.text}`;
+          const currentAssistantText = assistantText.trim();
+          if (currentAssistantText) {
+            lastAssistantText = currentAssistantText;
+          }
         } else if (assistantNotification.mode === "snapshot" && assistantNotification.text) {
           const snapshotText = assistantNotification.text.trim();
           if (snapshotText) {
             assistantText = snapshotText;
+            lastAssistantText = snapshotText;
           }
         }
         if (
@@ -3398,6 +3514,12 @@ export class CodexAppServerClient {
           methodLower === "turn/failed" ||
           methodLower === "turn/cancelled"
         ) {
+          terminalNotificationSeen = true;
+          const terminalAssistantText = extractAssistantTextFromTerminalPayload(method, notificationParams).trim();
+          if (terminalAssistantText) {
+            assistantText = terminalAssistantText;
+            lastAssistantText = terminalAssistantText;
+          }
           const terminalState = extractTurnTerminalState(method, notificationParams);
           terminalStatus = terminalState?.status ?? terminalStatus;
           terminalError = terminalState?.error ?? terminalError;
@@ -3405,7 +3527,11 @@ export class CodexAppServerClient {
           this.logger.debug(
             `codex turn terminal notification run=${params.runId} thread=${threadId || "<pending>"} turn=${turnId || "<pending>"} method=${methodLower}`,
           );
-          completeTurn?.();
+          settleCompletionSoon();
+          return;
+        }
+        if (terminalNotificationSeen) {
+          settleCompletionSoon();
         }
       });
       notificationQueue = next.catch((error: unknown) => {
@@ -3602,17 +3728,17 @@ export class CodexAppServerClient {
         );
         await completion;
         if (completed && !interrupted) {
-          await new Promise<void>((resolve) => setTimeout(resolve, TRAILING_NOTIFICATION_SETTLE_MS));
           await notificationQueue;
         }
+        const resolvedAssistantText = assistantText.trim() || lastAssistantText.trim();
         this.logger.debug(
-          `codex turn completion settled run=${params.runId} thread=${threadId || "<none>"} turn=${turnId || "<none>"} interrupted=${interrupted ? "yes" : "no"} assistantChars=${assistantText.length}`,
+          `codex turn completion settled run=${params.runId} thread=${threadId || "<none>"} turn=${turnId || "<none>"} interrupted=${interrupted ? "yes" : "no"} assistantChars=${resolvedAssistantText.length}`,
         );
         const stoppedReason = resolveTurnStoppedReason({
           interrupted,
           terminalStatus,
           approvalCancelled,
-          assistantText,
+          assistantText: resolvedAssistantText,
           hasPlanArtifact:
             Boolean(finalPlanMarkdown) || planDraftByItemId.size > 0 || planSteps.length > 0,
         });
@@ -3621,7 +3747,7 @@ export class CodexAppServerClient {
           text:
             finalPlanMarkdown || planDraftByItemId.size > 0 || planSteps.length > 0
               ? undefined
-              : assistantText || undefined,
+              : resolvedAssistantText || undefined,
           planArtifact: finalPlanMarkdown
             ? {
                 explanation: planExplanation || undefined,
@@ -3904,6 +4030,7 @@ export const __testing = {
   extractApprovalDecision,
   extractAssistantNotificationText,
   extractAssistantTextFromItemPayload,
+  extractAssistantTextFromTerminalPayload,
   extractTurnTerminalState,
   extractFileEditSummariesFromNotification,
   extractFileChangePathsFromReadResult,
