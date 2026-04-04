@@ -3651,7 +3651,7 @@ export class CodexAppServerClient {
           this.logger.debug(
             `codex turn thread created run=${params.runId} thread=${threadId} model=${threadModel || "<none>"} reasoningEffort=${threadReasoningEffort || "<none>"}`,
           );
-          if (params.serviceTier || params.approvalPolicy || params.sandbox) {
+          if (params.serviceTier !== undefined || params.approvalPolicy || params.sandbox) {
             const resumed = await requestWithFallbacks({
               client,
               methods: ["thread/resume"],

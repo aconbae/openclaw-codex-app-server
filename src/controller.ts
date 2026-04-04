@@ -204,7 +204,7 @@ type DesiredThreadConfiguration = {
   effectiveState: ThreadState | undefined;
   model?: string;
   reasoningEffort?: ReturnType<typeof normalizeReasoningEffort>;
-  serviceTier: string | null;
+  serviceTier: string | null | undefined;
   approvalPolicy?: string;
   sandbox?: string;
 };
@@ -793,9 +793,14 @@ function normalizePreferenceServiceTier(value: string | undefined | null): strin
   return normalized;
 }
 
-function requestServiceTierFromPreference(value: string | undefined | null): string | null {
+function requestServiceTierFromPreference(
+  value: string | undefined | null,
+): string | null | undefined {
   const normalized = normalizePreferenceServiceTier(value);
-  if (!normalized || normalized === "default") {
+  if (!normalized) {
+    return undefined;
+  }
+  if (normalized === "default") {
     return null;
   }
   return normalized;
@@ -830,8 +835,12 @@ function getBindingPendingPermissionsMode(binding: StoredBinding | null): Permis
 function applyBindingPreferencesToThreadState(
   threadState: ThreadState | undefined,
   binding: StoredBinding | null,
+  configuredDefaultServiceTier?: string | null,
 ): ThreadState | undefined {
-  if (!threadState && !binding) {
+  const normalizedConfiguredDefaultServiceTier = normalizePreferenceServiceTier(
+    configuredDefaultServiceTier,
+  );
+  if (!threadState && !binding && !normalizedConfiguredDefaultServiceTier) {
     return undefined;
   }
   const preferredModel = binding?.preferences?.preferredModel?.trim();
@@ -848,7 +857,8 @@ function applyBindingPreferencesToThreadState(
   const nextState: ThreadState = {
     ...baseState,
     model: preferredModel || baseState.model,
-    serviceTier: preferredServiceTier ?? baseState.serviceTier,
+    serviceTier:
+      preferredServiceTier ?? normalizedConfiguredDefaultServiceTier ?? baseState.serviceTier,
     approvalPolicy: permissions.approvalPolicy || baseState.approvalPolicy,
     sandbox: permissions.sandbox || baseState.sandbox,
     reasoningEffort: preferredReasoningEffort || baseState.reasoningEffort,
@@ -868,8 +878,14 @@ function buildDesiredThreadConfiguration(
   threadState: ThreadState | undefined,
   binding: StoredBinding | null,
   modelFallback?: string,
+  configuredDefaultServiceTier?: string | null,
 ): DesiredThreadConfiguration {
-  const effectiveState = applyBindingPreferencesToThreadState(threadState, binding) ?? threadState;
+  const effectiveState =
+    applyBindingPreferencesToThreadState(
+      threadState,
+      binding,
+      configuredDefaultServiceTier,
+    ) ?? threadState;
   const model = effectiveState?.model?.trim() || modelFallback;
   return {
     effectiveState,
@@ -2171,7 +2187,12 @@ export class CodexPluginController {
       sessionKey: binding.sessionKey,
       threadId: binding.threadId,
     }).catch(() => undefined);
-    const desired = buildDesiredThreadConfiguration(state, binding);
+    const desired = buildDesiredThreadConfiguration(
+      state,
+      binding,
+      undefined,
+      this.settings.defaultServiceTier,
+    );
     return {
       state,
       effectiveState: desired.effectiveState,
@@ -2250,7 +2271,12 @@ export class CodexPluginController {
         sessionKey: binding.sessionKey,
         threadId: binding.threadId,
       }).catch(() => undefined));
-    let desired = buildDesiredThreadConfiguration(state, binding, opts?.modelFallback);
+    let desired = buildDesiredThreadConfiguration(
+      state,
+      binding,
+      opts?.modelFallback,
+      this.settings.defaultServiceTier,
+    );
     if (desired.model && desired.model !== state?.model?.trim()) {
       try {
         state = await this.client.setThreadModel({
@@ -2259,7 +2285,12 @@ export class CodexPluginController {
           threadId: binding.threadId,
           model: desired.model,
         });
-        desired = buildDesiredThreadConfiguration(state, binding, opts?.modelFallback);
+        desired = buildDesiredThreadConfiguration(
+          state,
+          binding,
+          opts?.modelFallback,
+          this.settings.defaultServiceTier,
+        );
       } catch (error) {
         this.api.logger.warn(
           `codex failed to ${opts?.context ?? "reconcile thread settings"} model: ${String(error)}`,
@@ -2268,7 +2299,7 @@ export class CodexPluginController {
     }
     const currentServiceTier = normalizePreferenceServiceTier(state?.serviceTier);
     const desiredServiceTier = normalizePreferenceServiceTier(desired.effectiveState?.serviceTier);
-    if (desiredServiceTier !== currentServiceTier) {
+    if (desired.serviceTier !== undefined && desiredServiceTier !== currentServiceTier) {
       try {
         state = await this.client.setThreadServiceTier({
           profile,
@@ -2276,7 +2307,12 @@ export class CodexPluginController {
           threadId: binding.threadId,
           serviceTier: desired.serviceTier,
         });
-        desired = buildDesiredThreadConfiguration(state, binding, opts?.modelFallback);
+        desired = buildDesiredThreadConfiguration(
+          state,
+          binding,
+          opts?.modelFallback,
+          this.settings.defaultServiceTier,
+        );
       } catch (error) {
         this.api.logger.warn(
           `codex failed to ${opts?.context ?? "reconcile thread settings"} fast mode: ${String(error)}`,
@@ -3364,6 +3400,7 @@ export class CodexPluginController {
       undefined,
       params.binding,
       this.settings.defaultModel,
+      this.settings.defaultServiceTier,
     );
     const run = this.client.startTurn({
       profile,
@@ -3615,6 +3652,7 @@ export class CodexPluginController {
       threadState ?? undefined,
       params.binding,
       this.settings.defaultModel,
+      this.settings.defaultServiceTier,
     );
     const effectiveThreadState = desired.effectiveState;
     const run = this.client.startTurn({
@@ -3804,6 +3842,7 @@ export class CodexPluginController {
       threadState ?? undefined,
       params.binding,
       this.settings.defaultModel,
+      this.settings.defaultServiceTier,
     );
     const run = this.client.startReview({
       profile,
@@ -5155,7 +5194,7 @@ export class CodexPluginController {
       };
       await this.store.upsertBinding(updatedBinding);
       this.api.logger.debug?.(
-        `codex status control toggle-fast conversation=${this.formatConversationForLog(callback.conversation)} requested=${nextTier ?? "<none>"} raw=${formatThreadStateForLog(updatedState)} effective=${formatThreadStateForLog(applyBindingPreferencesToThreadState(updatedState, updatedBinding))} ${formatBindingPreferencesForLog(updatedBinding)}`,
+        `codex status control toggle-fast conversation=${this.formatConversationForLog(callback.conversation)} requested=${nextTier ?? "<none>"} raw=${formatThreadStateForLog(updatedState)} effective=${formatThreadStateForLog(applyBindingPreferencesToThreadState(updatedState, updatedBinding, this.settings.defaultServiceTier))} ${formatBindingPreferencesForLog(updatedBinding)}`,
       );
       const statusCard = await this.buildStatusCard(
         {
@@ -5600,7 +5639,7 @@ export class CodexPluginController {
       };
       await this.store.upsertBinding(updatedBinding);
       this.api.logger.debug?.(
-        `codex status control set-model conversation=${this.formatConversationForLog(callback.conversation)} requested=${callback.model} raw=${formatThreadStateForLog(nextState)} effective=${formatThreadStateForLog(applyBindingPreferencesToThreadState(nextState, updatedBinding))} ${formatBindingPreferencesForLog(updatedBinding)}`,
+        `codex status control set-model conversation=${this.formatConversationForLog(callback.conversation)} requested=${callback.model} raw=${formatThreadStateForLog(nextState)} effective=${formatThreadStateForLog(applyBindingPreferencesToThreadState(nextState, updatedBinding, this.settings.defaultServiceTier))} ${formatBindingPreferencesForLog(updatedBinding)}`,
       );
       if (callback.returnToStatus) {
         const statusCard = await this.buildStatusCard(
@@ -6245,7 +6284,12 @@ export class CodexPluginController {
       }).catch(() => []),
       this.resolveProjectFolder(binding?.workspaceDir || workspaceDir),
     ]);
-    const effectiveThreadState = buildDesiredThreadConfiguration(threadState, binding).effectiveState;
+    const effectiveThreadState = buildDesiredThreadConfiguration(
+      threadState,
+      binding,
+      undefined,
+      this.settings.defaultServiceTier,
+    ).effectiveState;
     const displayThreadState =
       effectiveThreadState ??
       (binding

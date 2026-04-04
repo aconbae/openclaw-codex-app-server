@@ -42,7 +42,7 @@ function makeStateDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-app-server-test-"));
 }
 
-function createApiMock() {
+function createApiMock(options?: { pluginConfig?: Record<string, unknown> }) {
   const stateDir = makeStateDir();
   const sendComponentMessage = vi.fn(async (..._args: unknown[]) => ({ messageId: "discord-component-1", channelId: "channel:chan-1" }));
   const sendMessageDiscord = vi.fn(async (..._args: unknown[]) => ({ messageId: "discord-msg-1", channelId: "channel:chan-1" }));
@@ -98,6 +98,7 @@ function createApiMock() {
     pluginConfig: {
       enabled: true,
       defaultWorkspaceDir: "/repo/openclaw",
+      ...(options?.pluginConfig ?? {}),
     },
     logger: {
       debug: vi.fn(),
@@ -165,7 +166,7 @@ function createApiMock() {
   };
 }
 
-async function createControllerHarness() {
+async function createControllerHarness(options?: { pluginConfig?: Record<string, unknown> }) {
   const {
     api,
     sendComponentMessage,
@@ -176,7 +177,7 @@ async function createControllerHarness() {
     resolveTelegramToken,
     editChannel,
     stateDir,
-  } = createApiMock();
+  } = createApiMock(options);
   const controller = new CodexPluginController(api);
   await controller.start();
   const threadState: any = {
@@ -1811,6 +1812,44 @@ describe("Discord controller flows", () => {
       }),
       expect.objectContaining({ accountId: "default" }),
     );
+  });
+
+  it("shows fast mode off when defaultServiceTier is configured to default", async () => {
+    const { controller, sendMessageTelegram, clientMock } = await createControllerHarness({
+      pluginConfig: { defaultServiceTier: "default" },
+    });
+    clientMock.readThreadState.mockResolvedValue({
+      threadId: "thread-1",
+      threadName: "Discord Thread",
+      model: "openai/gpt-5.4",
+      cwd: "/repo/openclaw",
+      serviceTier: "fast",
+      approvalPolicy: "on-request",
+      sandbox: "workspace-write",
+    });
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    const reply = await controller.handleCommand(
+      "cas_status",
+      buildTelegramCommandContext({
+        commandBody: "/cas_status",
+        getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+      }),
+    );
+
+    expect(reply).toEqual({});
+    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as [string, string] | undefined;
+    expect(firstCall?.[1]).toContain("Fast mode: off");
   });
 
   it("sends and pins status control buttons when a binding exists", async () => {
