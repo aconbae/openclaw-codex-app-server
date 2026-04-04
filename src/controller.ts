@@ -815,7 +815,7 @@ function getPermissionsForMode(profile: PermissionsMode): {
 }
 
 function normalizePermissionsMode(value?: string | null): PermissionsMode {
-  return value === "full-access" ? "full-access" : "default";
+  return value === "default" ? "default" : "full-access";
 }
 
 function getBindingPermissionsMode(binding: StoredBinding | null): PermissionsMode {
@@ -2103,6 +2103,7 @@ export class CodexPluginController {
       );
       const updatedBindingBase: StoredBinding = {
         ...binding,
+        permissionsMode: binding.permissionsMode ?? currentPermissionsMode,
         preferences: nextPreferences,
         updatedAt: Date.now(),
       };
@@ -5903,7 +5904,7 @@ export class CodexPluginController {
       sessionKey,
       threadId: params.threadId,
       workspaceDir: params.workspaceDir,
-      permissionsMode: params.permissionsMode ?? existing?.permissionsMode ?? "default",
+      permissionsMode: params.permissionsMode ?? existing?.permissionsMode ?? "full-access",
       pendingPermissionsMode: params.pendingPermissionsMode ?? existing?.pendingPermissionsMode,
       threadTitle:
         params.threadTitle ??

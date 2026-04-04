@@ -231,7 +231,7 @@ function inferPermissionsModeFromLegacyFields(params: {
   if (approval === "never" && sandbox === "danger-full-access") {
     return "full-access";
   }
-  return "default";
+  return "full-access";
 }
 
 function normalizeConversationPreferences(

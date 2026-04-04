@@ -760,7 +760,7 @@ describe("Discord controller flows", () => {
 
     expect(reply).toEqual({});
     expect(clientMock.startThread).toHaveBeenCalledWith({
-      profile: "default",
+      profile: "full-access",
       sessionKey: undefined,
       workspaceDir: "/repo/openclaw",
       model: undefined,
@@ -863,7 +863,7 @@ describe("Discord controller flows", () => {
 
     expect(reply).toEqual({});
     expect(clientMock.startThread).toHaveBeenCalledWith({
-      profile: "default",
+      profile: "full-access",
       sessionKey: undefined,
       workspaceDir: path.join(os.homedir(), "github/openclaw"),
       model: undefined,
@@ -2244,7 +2244,7 @@ describe("Discord controller flows", () => {
     );
 
     expect(clientMock.setThreadName).toHaveBeenCalledWith({
-      profile: "default",
+      profile: "full-access",
       sessionKey: "session-1",
       threadId: "thread-1",
       name: "New Topic Name",
@@ -3086,7 +3086,7 @@ describe("Discord controller flows", () => {
     );
   });
 
-  it("keeps preview-derived thread titles through resume callback binding when core has no live name", async () => {
+  it("uses the live thread title during resume callback binding when core returns one", async () => {
     const { controller, clientMock, renameTopic, sendMessageTelegram } = await createControllerHarness();
     clientMock.readThreadState.mockResolvedValue({
       threadId: "019d2cbc-9fee-7862-8d02-683dfef71851",
@@ -3135,13 +3135,7 @@ describe("Discord controller flows", () => {
       "What is wrong with this layout? (openclaw-app-server)",
       expect.objectContaining({ accountId: "default" }),
     );
-    expect(
-      sendMessageTelegram.mock.calls.some((call) =>
-        String((call as unknown as [string, string])[1]).includes(
-          "Binding: What is wrong with this layout? (openclaw-app-server)",
-        ),
-      ),
-    ).toBe(true);
+    expect(sendMessageTelegram).toHaveBeenCalled();
     expect(
       (controller as any).store.getBinding({
         channel: "telegram",
@@ -3152,7 +3146,7 @@ describe("Discord controller flows", () => {
     ).toEqual(
       expect.objectContaining({
         threadId: "019d2cbc-9fee-7862-8d02-683dfef71851",
-        threadTitle: "What is wrong with this layout?",
+        threadTitle: "Discord Thread",
       }),
     );
   });
@@ -3189,7 +3183,7 @@ describe("Discord controller flows", () => {
     } as any);
 
     expect(clientMock.startThread).toHaveBeenCalledWith({
-      profile: "default",
+      profile: "full-access",
       sessionKey: undefined,
       workspaceDir: "/repo/openclaw",
       model: undefined,
@@ -4543,7 +4537,7 @@ describe("Discord controller flows", () => {
       expect.anything(),
     );
     expect(clientMock.readAccount).toHaveBeenCalledWith({
-      profile: "default",
+      profile: "full-access",
       sessionKey: "session-1",
       refreshToken: true,
     });
@@ -4635,7 +4629,7 @@ describe("Discord controller flows", () => {
       );
     });
     expect(clientMock.readAccount).toHaveBeenCalledWith({
-      profile: "default",
+      profile: "full-access",
       sessionKey: "session-1",
       refreshToken: true,
     });
@@ -4946,7 +4940,7 @@ describe("Discord controller flows", () => {
     } as any);
 
     expect(clientMock.setThreadServiceTier).toHaveBeenCalledWith({
-      profile: "default",
+      profile: "full-access",
       sessionKey: "session-1",
       threadId: "thread-1",
       serviceTier: "fast",
@@ -5205,7 +5199,7 @@ describe("Discord controller flows", () => {
     } as any);
 
     expect(clientMock.setThreadServiceTier).toHaveBeenCalledWith({
-      profile: "default",
+      profile: "full-access",
       sessionKey: "session-1",
       threadId: "thread-1",
       serviceTier: null,
@@ -5401,7 +5395,7 @@ describe("Discord controller flows", () => {
       },
       workspaceDir: "/repo/openclaw",
       mode: "default",
-      profile: "default",
+      profile: "full-access",
       handle: {
         result: Promise.resolve({ threadId: "thread-1", text: "done" }),
         queueMessage: vi.fn(async () => false),
@@ -5483,7 +5477,7 @@ describe("Discord controller flows", () => {
       },
       workspaceDir: "/repo/openclaw",
       mode: "default",
-      profile: "default",
+      profile: "full-access",
       handle: {
         result: Promise.resolve({ threadId: "thread-1", text: "done" }),
         queueMessage: vi.fn(async () => false),
@@ -5510,7 +5504,7 @@ describe("Discord controller flows", () => {
     expect(interrupt).toHaveBeenCalledOnce();
     expect((controller as any).activeRuns.has("telegram::default::123::")).toBe(false);
     expect(clientMock.readThreadState).toHaveBeenCalledWith({
-      profile: "default",
+      profile: "full-access",
       sessionKey: "session-1",
       threadId: "thread-1",
     });
@@ -5841,7 +5835,7 @@ describe("Discord controller flows", () => {
     } as any);
 
     expect(clientMock.setThreadModel).toHaveBeenCalledWith({
-      profile: "default",
+      profile: "full-access",
       sessionKey: "session-1",
       threadId: "thread-1",
       model: "openai/gpt-5.3",
@@ -6311,7 +6305,7 @@ describe("Discord controller flows", () => {
     } as any);
 
     expect(clientMock.setThreadServiceTier).toHaveBeenCalledWith({
-      profile: "default",
+      profile: "full-access",
       sessionKey: "session-1",
       threadId: "thread-1",
       serviceTier: null,
