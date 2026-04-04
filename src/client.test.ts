@@ -734,6 +734,39 @@ describe("createPendingInputCoordinator", () => {
   });
 });
 
+describe("assistant message extraction", () => {
+  it("accepts assistantmessage snapshots from item/completed", () => {
+    expect(
+      __testing.extractAssistantNotificationText("item/completed", {
+        item: {
+          id: "msg-1",
+          type: "assistantmessage",
+          text: "Done with summary text.",
+        },
+      }),
+    ).toEqual({
+      mode: "snapshot",
+      text: "Done with summary text.",
+      itemId: "msg-1",
+    });
+  });
+
+  it("accepts assistantmessage deltas", () => {
+    expect(
+      __testing.extractAssistantNotificationText("item/assistantmessage/delta", {
+        itemId: "msg-2",
+        delta: {
+          text: "Partial summary",
+        },
+      }),
+    ).toEqual({
+      mode: "delta",
+      text: "Partial summary",
+      itemId: "msg-2",
+    });
+  });
+});
+
 describe("turn stop detection", () => {
   it("treats silent approval cancels as an approval stop reason", () => {
     expect(

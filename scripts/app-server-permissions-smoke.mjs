@@ -94,7 +94,7 @@ function extractAssistantTextFromItemPayload(value) {
 
 function extractAssistantNotificationText(method, params) {
   const methodLower = method.trim().toLowerCase();
-  if (methodLower === "item/agentmessage/delta") {
+  if (methodLower === "item/agentmessage/delta" || methodLower === "item/assistantmessage/delta") {
     return {
       mode: "delta",
       text: collectText(params).join("\n"),

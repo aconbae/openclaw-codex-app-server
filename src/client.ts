@@ -1996,7 +1996,7 @@ function extractAssistantTextFromItemPayload(
   }
   const item = asRecord(record.item) ?? record;
   const itemType = pickString(item, ["type"])?.toLowerCase();
-  if (itemType !== "agentmessage") {
+  if (itemType !== "agentmessage" && itemType !== "assistantmessage") {
     return "";
   }
   return options?.streaming
@@ -2009,7 +2009,7 @@ function extractAssistantNotificationText(
   params: unknown,
 ): { mode: "delta" | "snapshot" | "ignore"; text: string; itemId?: string } {
   const methodLower = method.trim().toLowerCase();
-  if (methodLower === "item/agentmessage/delta") {
+  if (methodLower === "item/agentmessage/delta" || methodLower === "item/assistantmessage/delta") {
     return {
       mode: "delta",
       text: collectStreamingText(params),
@@ -3902,6 +3902,8 @@ export const __testing = {
   createFileEditNoticeBatcher,
   createPendingInputCoordinator,
   extractApprovalDecision,
+  extractAssistantNotificationText,
+  extractAssistantTextFromItemPayload,
   extractTurnTerminalState,
   extractFileEditSummariesFromNotification,
   extractFileChangePathsFromReadResult,
