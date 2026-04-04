@@ -1281,10 +1281,28 @@ function normalizeConversationRole(value: string | undefined): "user" | "assista
   if (normalized === "user" || normalized === "usermessage") {
     return "user";
   }
-  if (normalized === "assistant" || normalized === "agentmessage" || normalized === "assistantmessage") {
+  if (
+    normalized === "assistant" ||
+    normalized === "agentmessage" ||
+    normalized === "assistantmessage"
+  ) {
     return "assistant";
   }
   return undefined;
+}
+
+async function readThreadReplayWithClient(params: {
+  client: JsonRpcClient;
+  settings: PluginSettings;
+  threadId: string;
+}): Promise<ThreadReplay> {
+  const result = await requestWithFallbacks({
+    client: params.client,
+    methods: ["thread/read"],
+    payloads: [{ threadId: params.threadId, includeTurns: true }],
+    timeoutMs: params.settings.requestTimeoutMs,
+  });
+  return extractThreadReplayFromReadResult(result);
 }
 
 function collectMessageText(record: Record<string, unknown>): string {
@@ -2073,7 +2091,11 @@ function extractAssistantNotificationText(
   params: unknown,
 ): { mode: "delta" | "snapshot" | "ignore"; text: string; itemId?: string } {
   const methodLower = method.trim().toLowerCase();
-  if (methodLower === "item/agentmessage/delta" || methodLower === "item/assistantmessage/delta") {
+  if (
+    methodLower === "item/agentmessage/delta" ||
+    methodLower === "item/assistantmessage/delta" ||
+    methodLower === "item/message/delta"
+  ) {
     return {
       mode: "delta",
       text: extractAssistantTextPayload(params, { streaming: true }),
@@ -3028,15 +3050,12 @@ export class CodexAppServerClient {
   }): Promise<ThreadReplay> {
     return await this.withClient(
       { sessionKey: params.sessionKey },
-      async ({ client, settings }) => {
-        const result = await requestWithFallbacks({
+      async ({ client, settings }) =>
+        await readThreadReplayWithClient({
           client,
-          methods: ["thread/read"],
-          payloads: [{ threadId: params.threadId, includeTurns: true }],
-          timeoutMs: settings.requestTimeoutMs,
-        });
-        return extractThreadReplayFromReadResult(result);
-      },
+          settings,
+          threadId: params.threadId,
+        }),
     );
   }
 
@@ -3734,7 +3753,34 @@ export class CodexAppServerClient {
         if (completed && !interrupted) {
           await notificationQueue;
         }
-        const resolvedAssistantText = assistantText.trim() || lastAssistantText.trim();
+        let resolvedAssistantText = assistantText.trim() || lastAssistantText.trim();
+        if (!resolvedAssistantText && threadId && !interrupted) {
+          let recoveredAssistantText = "";
+          for (let attempt = 1; attempt <= 3 && !recoveredAssistantText; attempt += 1) {
+            const replay = await readThreadReplayWithClient({
+              client,
+              settings: this.settings,
+              threadId,
+            }).catch((error) => {
+              this.logger.debug(
+                `codex turn completion replay read failed run=${params.runId} thread=${threadId} turn=${turnId || "<none>"} attempt=${attempt}: ${String(error)}`,
+              );
+              return undefined;
+            });
+            recoveredAssistantText = replay?.lastAssistantMessage?.trim() || "";
+            if (!recoveredAssistantText && attempt < 3) {
+              await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
+            }
+          }
+          if (recoveredAssistantText) {
+            assistantText = recoveredAssistantText;
+            lastAssistantText = recoveredAssistantText;
+            resolvedAssistantText = recoveredAssistantText;
+            this.logger.debug(
+              `codex turn completion recovered assistant text from thread/read run=${params.runId} thread=${threadId} turn=${turnId || "<none>"} chars=${resolvedAssistantText.length}`,
+            );
+          }
+        }
         this.logger.debug(
           `codex turn completion settled run=${params.runId} thread=${threadId || "<none>"} turn=${turnId || "<none>"} interrupted=${interrupted ? "yes" : "no"} assistantChars=${resolvedAssistantText.length}`,
         );
@@ -4042,6 +4088,7 @@ export const __testing = {
   formatFileEditNotice,
   extractThreadTokenUsageSnapshot,
   extractRateLimitSummaries,
+  extractThreadReplayFromReadResult,
   formatStdioProcessLog,
   resolveTurnStoppedReason,
 };

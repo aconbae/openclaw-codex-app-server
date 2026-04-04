@@ -380,6 +380,94 @@ describe("CodexAppServerClient.startReview", () => {
   });
 });
 
+describe("CodexAppServerClient.startTurn", () => {
+  it("recovers final assistant text from thread/read when completion arrives without text", async () => {
+    const client = new CodexAppServerClient(
+      {
+        enabled: true,
+        transport: "stdio",
+        command: "codex",
+        args: [],
+        requestTimeoutMs: 1_000,
+      },
+      {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      },
+    );
+    const request = vi.fn(async (method: string) => {
+      if (method === "thread/start") {
+        return { threadId: "thread-123", model: "gpt-5.4" };
+      }
+      if (method === "turn/start") {
+        queueMicrotask(async () => {
+          await (client as any).dispatchNotification("turn/completed", {
+            turn: {
+              status: "completed",
+            },
+          });
+        });
+        return { threadId: "thread-123", runId: "turn-123" };
+      }
+      if (method === "thread/read") {
+        return {
+          thread: {
+            turns: [
+              {
+                items: [
+                  {
+                    type: "message",
+                    role: "assistant",
+                    content: [
+                      {
+                        type: "output_text",
+                        text: "Recovered from thread read.",
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        };
+      }
+      return {};
+    });
+    (client as any).ensureConnected = vi.fn(async () => ({
+      client: {
+        connect: vi.fn(),
+        close: vi.fn(),
+        notify: vi.fn(),
+        request,
+        setNotificationHandler: vi.fn(),
+        setRequestHandler: vi.fn(),
+      },
+      initializeResult: {},
+    }));
+
+    const run = client.startTurn({
+      sessionKey: "session-123",
+      workspaceDir: "/repo/openclaw",
+      runId: "run-123",
+      prompt: "Ship it",
+      model: "gpt-5.4",
+    });
+    const result = await run.result;
+
+    expect("text" in result ? result.text : undefined).toBe("Recovered from thread read.");
+    expect(request).toHaveBeenCalledWith(
+      "thread/read",
+      {
+        threadId: "thread-123",
+        includeTurns: true,
+      },
+      1_000,
+    );
+  });
+});
+
 describe("extractStartupProbeInfo", () => {
   it("extracts server info from initialize responses without losing CLI probe details", () => {
     expect(
@@ -787,6 +875,21 @@ describe("assistant message extraction", () => {
     });
   });
 
+  it("accepts message deltas", () => {
+    expect(
+      __testing.extractAssistantNotificationText("item/message/delta", {
+        itemId: "msg-2b",
+        delta: {
+          text: "Long streamed summary",
+        },
+      }),
+    ).toEqual({
+      mode: "delta",
+      text: "Long streamed summary",
+      itemId: "msg-2b",
+    });
+  });
+
   it("falls back to summary-like fields in assistant items", () => {
     expect(
       __testing.extractAssistantNotificationText("item/completed", {
@@ -800,6 +903,36 @@ describe("assistant message extraction", () => {
       mode: "snapshot",
       text: "Done after a long run.",
       itemId: "msg-3",
+    });
+  });
+});
+
+describe("thread replay extraction", () => {
+  it("captures assistant text from thread/read message items", () => {
+    expect(
+      __testing.extractThreadReplayFromReadResult({
+        thread: {
+          turns: [
+            {
+              items: [
+                {
+                  type: "message",
+                  role: "user",
+                  content: [{ type: "input_text", text: "Do the thing" }],
+                },
+                {
+                  type: "message",
+                  role: "assistant",
+                  content: [{ type: "output_text", text: "Done from thread read." }],
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    ).toEqual({
+      lastUserMessage: "Do the thing",
+      lastAssistantMessage: "Done from thread read.",
     });
   });
 });
