@@ -2093,8 +2093,7 @@ function extractAssistantNotificationText(
   const methodLower = method.trim().toLowerCase();
   if (
     methodLower === "item/agentmessage/delta" ||
-    methodLower === "item/assistantmessage/delta" ||
-    methodLower === "item/message/delta"
+    methodLower === "item/assistantmessage/delta"
   ) {
     return {
       mode: "delta",
@@ -2102,7 +2101,10 @@ function extractAssistantNotificationText(
       itemId: extractAssistantItemId(params),
     };
   }
-  if (methodLower === "item/completed") {
+  if (
+    methodLower === "item/completed" ||
+    methodLower === "rawresponseitem/completed"
+  ) {
     return {
       mode: "snapshot",
       text: extractAssistantTextFromItemPayload(params),

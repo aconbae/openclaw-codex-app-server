@@ -875,18 +875,24 @@ describe("assistant message extraction", () => {
     });
   });
 
-  it("accepts message deltas", () => {
+  it("accepts raw response message snapshots", () => {
     expect(
-      __testing.extractAssistantNotificationText("item/message/delta", {
-        itemId: "msg-2b",
-        delta: {
-          text: "Long streamed summary",
+      __testing.extractAssistantNotificationText("rawResponseItem/completed", {
+        item: {
+          type: "message",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: "Long final summary",
+            },
+          ],
         },
       }),
     ).toEqual({
-      mode: "delta",
-      text: "Long streamed summary",
-      itemId: "msg-2b",
+      mode: "snapshot",
+      text: "Long final summary",
+      itemId: undefined,
     });
   });
 
