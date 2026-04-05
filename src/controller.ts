@@ -992,6 +992,10 @@ const PLAN_PROGRESS_DELAY_MS = 12_000;
 const REVIEW_PROGRESS_DELAY_MS = 12_000;
 const COMPACT_PROGRESS_DELAY_MS = 12_000;
 const COMPACT_PROGRESS_INTERVAL_MS = 15_000;
+const TELEGRAM_LIVE_ASSISTANT_THROTTLE_MS = 1_200;
+const TELEGRAM_LIVE_ASSISTANT_MIN_STABLE_CHARS = 140;
+const TELEGRAM_LIVE_ASSISTANT_HARD_FLUSH_CHARS = 320;
+const TELEGRAM_LIVE_ASSISTANT_REWRITE_MIN_CHARS = 220;
 const PLAN_INLINE_TEXT_LIMIT = 2600;
 
 function isTransportClosedMessage(error: unknown): boolean {
@@ -1017,6 +1021,69 @@ function formatFailureText(kind: "plan" | "review" | "compact", error: unknown):
 
 function formatInterruptedText(kind: "plan" | "review"): string {
   return `Codex ${kind} was interrupted before it finished.`;
+}
+
+function findTelegramLiveAssistantStableBoundary(text: string): number {
+  if (!text) {
+    return 0;
+  }
+
+  let best = 0;
+  const paragraphBoundary = /\n\s*\n/g;
+  for (const match of text.matchAll(paragraphBoundary)) {
+    const index = match.index;
+    if (typeof index !== "number") {
+      continue;
+    }
+    best = Math.max(best, index + match[0].length);
+  }
+
+  const sentenceBoundary = /[.!?。！？](?:["'”’)\]]*)/g;
+  for (const match of text.matchAll(sentenceBoundary)) {
+    const index = match.index;
+    if (typeof index !== "number") {
+      continue;
+    }
+    const end = index + match[0].length;
+    const nextChar = text[end];
+    if (nextChar === undefined || /\s/.test(nextChar)) {
+      best = Math.max(best, end);
+    }
+  }
+
+  if (text.length >= TELEGRAM_LIVE_ASSISTANT_MIN_STABLE_CHARS) {
+    const lineBoundary = /\n/g;
+    for (const match of text.matchAll(lineBoundary)) {
+      const index = match.index;
+      if (typeof index !== "number") {
+        continue;
+      }
+      best = Math.max(best, index + 1);
+    }
+  }
+
+  if (best >= TELEGRAM_LIVE_ASSISTANT_MIN_STABLE_CHARS) {
+    return best;
+  }
+
+  if (text.length < TELEGRAM_LIVE_ASSISTANT_HARD_FLUSH_CHARS) {
+    return 0;
+  }
+
+  if (best > 0) {
+    return best;
+  }
+
+  const window = text.slice(0, TELEGRAM_LIVE_ASSISTANT_HARD_FLUSH_CHARS);
+  const whitespaceBoundary = Math.max(window.lastIndexOf("\n"), window.lastIndexOf(" "));
+  if (whitespaceBoundary >= Math.floor(TELEGRAM_LIVE_ASSISTANT_MIN_STABLE_CHARS / 2)) {
+    return whitespaceBoundary + 1;
+  }
+  return TELEGRAM_LIVE_ASSISTANT_HARD_FLUSH_CHARS;
+}
+
+function formatTelegramLiveAssistantRewrite(text: string): string {
+  return `Codex update:\n${text.trim()}`;
 }
 
 function formatContextUsageText(usage: { totalTokens?: number; contextWindow?: number }): string | undefined {
@@ -2664,7 +2731,9 @@ export class CodexPluginController {
       if (!text) {
         return [];
       }
-      const chunks = this.api.runtime.channel.text.chunkText(text, chunkLimit).filter((chunk) => chunk.length > 0);
+      const chunks = this.api.runtime.channel.text
+        .chunkText(text, chunkLimit)
+        .filter((chunk) => chunk.length > 0);
       return chunks.length > 0 ? chunks : [text];
     };
 
@@ -2672,6 +2741,25 @@ export class CodexPluginController {
     let pendingText = "";
     let sentText = "";
     let renderQueue = Promise.resolve();
+    let renderTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearRenderTimer = () => {
+      if (!renderTimer) {
+        return;
+      }
+      clearTimeout(renderTimer);
+      renderTimer = null;
+    };
+
+    const scheduleRender = () => {
+      if (renderTimer) {
+        return;
+      }
+      renderTimer = setTimeout(() => {
+        renderTimer = null;
+        void enqueueRender(true);
+      }, TELEGRAM_LIVE_ASSISTANT_THROTTLE_MS);
+    };
 
     const sendSuffix = async (suffix: string) => {
       const chunks = chunkText(suffix);
@@ -2688,28 +2776,66 @@ export class CodexPluginController {
       return true;
     };
 
-    const renderLatest = async () => {
+    const sendRewrite = async (text: string) => {
+      const delivered = await this.sendTextWithDeliveryRef(
+        conversation,
+        formatTelegramLiveAssistantRewrite(text),
+      );
+      if (!delivered) {
+        return false;
+      }
+      sentText = text.trim();
+      return true;
+    };
+
+    const renderLatest = async (force = false) => {
+      clearRenderTimer();
       const nextText = pendingText.trim();
       if (!nextText || nextText === sentText) {
         return;
       }
       if (sentText && !nextText.startsWith(sentText)) {
+        if (!force && nextText.length < TELEGRAM_LIVE_ASSISTANT_REWRITE_MIN_CHARS) {
+          scheduleRender();
+          return;
+        }
+        await sendRewrite(nextText);
         return;
       }
-      const suffix = sentText ? nextText.slice(sentText.length) : nextText;
-      if (!suffix) {
-        sentText = nextText;
-        return;
-      }
-      const sent = await sendSuffix(suffix);
-      if (sent) {
-        sentText = nextText;
+      while (true) {
+        const currentText = pendingText.trim();
+        if (!currentText || currentText === sentText) {
+          return;
+        }
+        const suffix = sentText ? currentText.slice(sentText.length) : currentText;
+        if (!suffix) {
+          sentText = currentText;
+          return;
+        }
+        const flushLength = force ? suffix.length : findTelegramLiveAssistantStableBoundary(suffix);
+        if (flushLength <= 0) {
+          scheduleRender();
+          return;
+        }
+        const flushed = suffix.slice(0, flushLength);
+        if (!flushed) {
+          scheduleRender();
+          return;
+        }
+        const sent = await sendSuffix(flushed);
+        if (!sent) {
+          return;
+        }
+        sentText = `${sentText}${flushed}`.trim();
+        if (!force) {
+          return;
+        }
       }
     };
 
-    const enqueueRender = () => {
+    const enqueueRender = (force = false) => {
       renderQueue = renderQueue
-        .then(renderLatest)
+        .then(() => renderLatest(force))
         .catch((error: unknown) => {
           this.api.logger.warn(
             `codex telegram live assistant render failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
@@ -2729,18 +2855,16 @@ export class CodexPluginController {
         }
         observedText = trimmed;
         pendingText = trimmed;
-        await enqueueRender();
+        await enqueueRender(false);
       },
       finalize: async (text?: string) => {
         const trimmed = text?.trim();
         if (trimmed) {
           observedText = trimmed;
           pendingText = trimmed;
-          await enqueueRender();
-        } else {
-          await renderQueue;
         }
-        const finalSource = trimmed || observedText.trim();
+        await enqueueRender(true);
+        const finalSource = (trimmed || observedText).trim();
         if (!finalSource) {
           return sentText.length > 0;
         }
@@ -2749,10 +2873,13 @@ export class CodexPluginController {
         }
         if (sentText && finalSource.startsWith(sentText)) {
           pendingText = finalSource;
-          await enqueueRender();
+          await enqueueRender(true);
           return finalSource === sentText;
         }
-        const delivered = await this.sendTextWithDeliveryRef(conversation, finalSource);
+        const delivered = await this.sendTextWithDeliveryRef(
+          conversation,
+          sentText ? formatTelegramLiveAssistantRewrite(finalSource) : finalSource,
+        );
         if (delivered) {
           sentText = finalSource;
           return true;

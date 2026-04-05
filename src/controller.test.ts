@@ -5020,7 +5020,7 @@ describe("Discord controller flows", () => {
     );
   });
 
-  it("keeps Telegram live assistant history as append-only messages", async () => {
+  it("waits to send short Telegram live text until completion instead of fragmenting it", async () => {
     const { controller, sendMessageTelegram } = await createControllerHarness();
     const editTelegram = vi.spyOn(controller as any, "callTelegramEditMessageApi");
     (controller as any).client.startTurn = vi.fn((params: { onAssistantMessage?: (text: string) => Promise<void> }) => {
@@ -5065,20 +5065,94 @@ describe("Discord controller flows", () => {
     });
 
     await flushAsyncWork();
-    expect(sendMessageTelegram).toHaveBeenCalledTimes(2);
+    expect(sendMessageTelegram).toHaveBeenCalledTimes(1);
     expect(sendMessageTelegram).toHaveBeenNthCalledWith(
       1,
       TEST_TELEGRAM_PEER_ID,
-      "Hello",
-      expect.anything(),
-    );
-    expect(sendMessageTelegram).toHaveBeenNthCalledWith(
-      2,
-      TEST_TELEGRAM_PEER_ID,
-      " there",
+      "Hello there",
       expect.anything(),
     );
     expect(editTelegram).not.toHaveBeenCalled();
+  });
+
+  it("sends a labeled Telegram update when the streamed reply rewrites earlier text", async () => {
+    vi.useFakeTimers();
+    try {
+      const { controller, sendMessageTelegram } = await createControllerHarness();
+      const previewText =
+        "This is the first streamed sentence that should appear in chat before the reply is fully settled.";
+      const finalText =
+        "This is the revised final answer with cleaner wording and the completed recommendation list.";
+
+      (controller as any).client.startTurn = vi.fn((params: { onAssistantMessage?: (text: string) => Promise<void> }) => {
+        queueMicrotask(async () => {
+          await params.onAssistantMessage?.(previewText);
+        });
+        return {
+          result: new Promise((resolve) => {
+            setTimeout(() => {
+              resolve({
+                threadId: "thread-1",
+                text: finalText,
+                terminalStatus: "completed",
+              });
+            }, 2_000);
+          }),
+          getThreadId: () => "thread-1",
+          queueMessage: vi.fn(async () => false),
+          interrupt: vi.fn(async () => {}),
+          isAwaitingInput: () => false,
+          submitPendingInput: vi.fn(async () => false),
+          submitPendingInputPayload: vi.fn(async () => false),
+        };
+      });
+
+      const startPromise = (controller as any).startTurn({
+        conversation: {
+          channel: "telegram",
+          accountId: "default",
+          conversationId: TEST_TELEGRAM_PEER_ID,
+        },
+        binding: {
+          conversation: {
+            channel: "telegram",
+            accountId: "default",
+            conversationId: TEST_TELEGRAM_PEER_ID,
+          },
+          sessionKey: "session-1",
+          threadId: "thread-1",
+          workspaceDir: "/repo/openclaw",
+          updatedAt: Date.now(),
+        },
+        workspaceDir: "/repo/openclaw",
+        prompt: "who are you?",
+        reason: "inbound",
+      });
+
+      await vi.advanceTimersByTimeAsync(1_200);
+      expect(sendMessageTelegram).toHaveBeenCalledTimes(1);
+      expect(sendMessageTelegram).toHaveBeenNthCalledWith(
+        1,
+        TEST_TELEGRAM_PEER_ID,
+        previewText,
+        expect.anything(),
+      );
+
+      await vi.advanceTimersByTimeAsync(800);
+      vi.useRealTimers();
+      await startPromise;
+      await flushAsyncWork();
+
+      expect(sendMessageTelegram).toHaveBeenCalledTimes(2);
+      expect(sendMessageTelegram).toHaveBeenNthCalledWith(
+        2,
+        TEST_TELEGRAM_PEER_ID,
+        `Codex update:\n${finalText}`,
+        expect.anything(),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("sends short Discord replies only once at completion when preview streaming never starts", async () => {
