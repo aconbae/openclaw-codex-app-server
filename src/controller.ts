@@ -2645,7 +2645,121 @@ export class CodexPluginController {
     if (isDiscordChannel(conversation.channel)) {
       return this.createDiscordLiveAssistantReplyWriter(conversation);
     }
+    if (isTelegramChannel(conversation.channel)) {
+      return this.createTelegramLiveAssistantReplyWriter(conversation);
+    }
     return this.createChunkedLiveAssistantReplyWriter(conversation);
+  }
+
+  private createTelegramLiveAssistantReplyWriter(
+    conversation: ConversationTarget,
+  ): LiveAssistantReplyWriter {
+    const chunkLimit = this.api.runtime.channel.text.resolveTextChunkLimit(
+      undefined,
+      "telegram",
+      conversation.accountId,
+      { fallbackLimit: 4000 },
+    );
+    const chunkText = (text: string): string[] => {
+      if (!text) {
+        return [];
+      }
+      const chunks = this.api.runtime.channel.text.chunkText(text, chunkLimit).filter((chunk) => chunk.length > 0);
+      return chunks.length > 0 ? chunks : [text];
+    };
+
+    let observedText = "";
+    let pendingText = "";
+    let sentText = "";
+    let renderQueue = Promise.resolve();
+
+    const sendSuffix = async (suffix: string) => {
+      const chunks = chunkText(suffix);
+      if (chunks.length === 0) {
+        return false;
+      }
+      const outbound = await this.loadTelegramOutboundAdapter();
+      for (const chunk of chunks) {
+        if (!chunk) {
+          continue;
+        }
+        await this.sendTelegramTextChunk(outbound, conversation, chunk);
+      }
+      return true;
+    };
+
+    const renderLatest = async () => {
+      const nextText = pendingText.trim();
+      if (!nextText || nextText === sentText) {
+        return;
+      }
+      if (sentText && !nextText.startsWith(sentText)) {
+        return;
+      }
+      const suffix = sentText ? nextText.slice(sentText.length) : nextText;
+      if (!suffix) {
+        sentText = nextText;
+        return;
+      }
+      const sent = await sendSuffix(suffix);
+      if (sent) {
+        sentText = nextText;
+      }
+    };
+
+    const enqueueRender = () => {
+      renderQueue = renderQueue
+        .then(renderLatest)
+        .catch((error: unknown) => {
+          this.api.logger.warn(
+            `codex telegram live assistant render failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+          );
+        });
+      return renderQueue;
+    };
+
+    return {
+      update: async (text: string) => {
+        const trimmed = text.trim();
+        if (!trimmed) {
+          return;
+        }
+        if (observedText && observedText.startsWith(trimmed) && trimmed.length < observedText.length) {
+          return;
+        }
+        observedText = trimmed;
+        pendingText = trimmed;
+        await enqueueRender();
+      },
+      finalize: async (text?: string) => {
+        const trimmed = text?.trim();
+        if (trimmed) {
+          observedText = trimmed;
+          pendingText = trimmed;
+          await enqueueRender();
+        } else {
+          await renderQueue;
+        }
+        const finalSource = trimmed || observedText.trim();
+        if (!finalSource) {
+          return sentText.length > 0;
+        }
+        if (finalSource === sentText) {
+          return true;
+        }
+        if (sentText && finalSource.startsWith(sentText)) {
+          pendingText = finalSource;
+          await enqueueRender();
+          return finalSource === sentText;
+        }
+        const delivered = await this.sendTextWithDeliveryRef(conversation, finalSource);
+        if (delivered) {
+          sentText = finalSource;
+          return true;
+        }
+        return false;
+      },
+    };
   }
 
   private createChunkedLiveAssistantReplyWriter(

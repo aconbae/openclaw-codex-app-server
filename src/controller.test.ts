@@ -5020,6 +5020,67 @@ describe("Discord controller flows", () => {
     );
   });
 
+  it("keeps Telegram live assistant history as append-only messages", async () => {
+    const { controller, sendMessageTelegram } = await createControllerHarness();
+    const editTelegram = vi.spyOn(controller as any, "callTelegramEditMessageApi");
+    (controller as any).client.startTurn = vi.fn((params: { onAssistantMessage?: (text: string) => Promise<void> }) => {
+      queueMicrotask(async () => {
+        await params.onAssistantMessage?.("Hello");
+      });
+      return {
+        result: Promise.resolve({
+          threadId: "thread-1",
+          text: "Hello there",
+          terminalStatus: "completed",
+        }),
+        getThreadId: () => "thread-1",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      };
+    });
+
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      },
+      binding: {
+        conversation: {
+          channel: "telegram",
+          accountId: "default",
+          conversationId: TEST_TELEGRAM_PEER_ID,
+        },
+        sessionKey: "session-1",
+        threadId: "thread-1",
+        workspaceDir: "/repo/openclaw",
+        updatedAt: Date.now(),
+      },
+      workspaceDir: "/repo/openclaw",
+      prompt: "who are you?",
+      reason: "inbound",
+    });
+
+    await flushAsyncWork();
+    expect(sendMessageTelegram).toHaveBeenCalledTimes(2);
+    expect(sendMessageTelegram).toHaveBeenNthCalledWith(
+      1,
+      TEST_TELEGRAM_PEER_ID,
+      "Hello",
+      expect.anything(),
+    );
+    expect(sendMessageTelegram).toHaveBeenNthCalledWith(
+      2,
+      TEST_TELEGRAM_PEER_ID,
+      " there",
+      expect.anything(),
+    );
+    expect(editTelegram).not.toHaveBeenCalled();
+  });
+
   it("sends short Discord replies only once at completion when preview streaming never starts", async () => {
     const { controller, sendMessageDiscord } = await createControllerHarness();
     (controller as any).client.startTurn = vi.fn((params: { onAssistantMessage?: (text: string) => Promise<void> }) => {
