@@ -16,7 +16,7 @@ Default chat turns now behave like a stateful event consumer instead of a one-sh
 
 Provider rendering is intentionally not identical across channels:
 
-- Telegram now keeps append-only chat history for live assistant output. As assistant text expands, the controller sends only the newly observed suffix as fresh Telegram messages instead of editing earlier progress updates in place.
+- Telegram uses a grow-only transcript path in the controller. As assistant text expands, the plugin edits existing chunks and appends new ones as needed.
 - Discord follows OpenClaw's host-side preview model more closely. The controller keeps a single throttled preview message during streaming, then reuses that message as the first final chunk and only sends spillover chunks after completion.
 - Do not collapse both providers back to one generic renderer unless the OpenClaw plugin SDK grows a first-class provider-neutral draft-stream lifecycle. Today the SDK exposes chunking helpers, outbound sends, typing leases, and Discord component-message edits, but not the host's internal reply pipeline or draft lifecycle helpers.
 
