@@ -110,6 +110,11 @@ type ActiveRunRecord = {
   handle: ActiveCodexRun;
 };
 
+type LiveAssistantReplyWriter = {
+  update: (text: string) => Promise<void>;
+  finalize: (text?: string) => Promise<boolean>;
+};
+
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
 const TEXT_ATTACHMENT_FILE_EXTENSIONS = new Set([
@@ -133,6 +138,9 @@ const TEXT_ATTACHMENT_MIME_TYPES = new Set([
   "text/yaml",
 ]);
 const MAX_TEXT_ATTACHMENT_BYTES = 64 * 1024;
+const DISCORD_LIVE_ASSISTANT_PREVIEW_THROTTLE_MS = 1_200;
+const DISCORD_LIVE_ASSISTANT_PREVIEW_MIN_CHARS = 30;
+const DISCORD_LIVE_ASSISTANT_PREVIEW_MAX_CHARS = 2_000;
 
 type TelegramOutboundAdapter = {
   sendText?: (ctx: {
@@ -2589,6 +2597,287 @@ export class CodexPluginController {
     }
   }
 
+  private async updateDeliveredTextMessage(
+    conversation: ConversationTarget,
+    message: DeliveredMessageRef,
+    text: string,
+  ): Promise<boolean> {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return false;
+    }
+    try {
+      if (message.provider === "telegram") {
+        const token = await this.resolveTelegramBotToken(conversation.accountId);
+        if (!token) {
+          return false;
+        }
+        await this.callTelegramEditMessageApi(token, {
+          chat_id: message.chatId,
+          message_id: Number(message.messageId),
+          text: trimmed,
+        });
+        return true;
+      }
+      const spec: DiscordComponentMessageSpec = {
+        text: trimmed,
+      };
+      await editDiscordComponentMessage(message.channelId, message.messageId, spec, {
+        accountId: conversation.accountId,
+      });
+      registerBuiltDiscordComponentMessage({
+        buildResult: buildDiscordComponentMessage({
+          spec,
+          accountId: conversation.accountId,
+        }),
+        messageId: message.messageId,
+      });
+      return true;
+    } catch (error) {
+      this.api.logger.warn(
+        `codex live assistant message update failed ${this.formatConversationForLog(conversation)} provider=${message.provider}: ${String(error)}`,
+      );
+      return false;
+    }
+  }
+
+  private createLiveAssistantReplyWriter(conversation: ConversationTarget): LiveAssistantReplyWriter {
+    if (isDiscordChannel(conversation.channel)) {
+      return this.createDiscordLiveAssistantReplyWriter(conversation);
+    }
+    return this.createChunkedLiveAssistantReplyWriter(conversation);
+  }
+
+  private createChunkedLiveAssistantReplyWriter(
+    conversation: ConversationTarget,
+  ): LiveAssistantReplyWriter {
+    const fallbackLimit = isTelegramChannel(conversation.channel) ? 4000 : 2000;
+    const chunkLimit = this.api.runtime.channel.text.resolveTextChunkLimit(
+      undefined,
+      conversation.channel,
+      conversation.accountId,
+      { fallbackLimit },
+    );
+    const chunkText = (text: string): string[] => {
+      const trimmed = text.trim();
+      if (!trimmed) {
+        return [];
+      }
+      const chunks = this.api.runtime.channel.text.chunkText(trimmed, chunkLimit).filter(Boolean);
+      return chunks.length > 0 ? chunks : [trimmed];
+    };
+
+    let deliveredChunks: DeliveredMessageRef[] = [];
+    let renderedChunks: string[] = [];
+    let renderedText = "";
+    let pendingText = "";
+    let renderQueue = Promise.resolve();
+
+    const renderLatest = async () => {
+      const nextText = pendingText.trim();
+      if (!nextText || nextText === renderedText) {
+        return;
+      }
+      if (renderedText && nextText.length < renderedText.length) {
+        return;
+      }
+      const nextChunks = chunkText(nextText);
+      for (let index = 0; index < nextChunks.length; index += 1) {
+        const chunk = nextChunks[index];
+        if (!chunk) {
+          continue;
+        }
+        const delivered = deliveredChunks[index];
+        if (delivered) {
+          if (renderedChunks[index] !== chunk) {
+            const updated = await this.updateDeliveredTextMessage(conversation, delivered, chunk);
+            if (!updated) {
+              return;
+            }
+          }
+          continue;
+        }
+        const nextDelivered = await this.sendTextWithDeliveryRef(conversation, chunk);
+        if (!nextDelivered) {
+          return;
+        }
+        deliveredChunks.push(nextDelivered);
+      }
+      renderedChunks = nextChunks;
+      renderedText = nextText;
+    };
+
+    const enqueueRender = () => {
+      renderQueue = renderQueue
+        .then(renderLatest)
+        .catch((error: unknown) => {
+          this.api.logger.warn(
+            `codex live assistant render failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+          );
+        });
+      return renderQueue;
+    };
+
+    return {
+      update: async (text: string) => {
+        const trimmed = text.trim();
+        if (!trimmed) {
+          return;
+        }
+        pendingText = trimmed;
+        await enqueueRender();
+      },
+      finalize: async (text?: string) => {
+        const trimmed = text?.trim();
+        if (trimmed) {
+          pendingText = trimmed;
+          await enqueueRender();
+        } else {
+          await renderQueue;
+        }
+        return trimmed ? renderedText === trimmed : renderedChunks.length > 0;
+      },
+    };
+  }
+
+  private createDiscordLiveAssistantReplyWriter(
+    conversation: ConversationTarget,
+  ): LiveAssistantReplyWriter {
+    const chunkLimit = this.api.runtime.channel.text.resolveTextChunkLimit(
+      undefined,
+      "discord",
+      conversation.accountId,
+      { fallbackLimit: DISCORD_LIVE_ASSISTANT_PREVIEW_MAX_CHARS },
+    );
+    const chunkText = (text: string): string[] => {
+      const trimmed = text.trim();
+      if (!trimmed) {
+        return [];
+      }
+      const chunks = this.api.runtime.channel.text.chunkText(trimmed, chunkLimit).filter(Boolean);
+      return chunks.length > 0 ? chunks : [trimmed];
+    };
+
+    let previewMessage: DeliveredMessageRef | null = null;
+    let previewText = "";
+    let observedText = "";
+    let pendingPreviewText = "";
+    let previewQueue = Promise.resolve();
+    let previewTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearPreviewTimer = () => {
+      if (!previewTimer) {
+        return;
+      }
+      clearTimeout(previewTimer);
+      previewTimer = null;
+    };
+
+    const renderPreview = async () => {
+      previewTimer = null;
+      const nextText = pendingPreviewText.trim();
+      if (!nextText || nextText === previewText) {
+        return;
+      }
+      if (!previewMessage && nextText.length < DISCORD_LIVE_ASSISTANT_PREVIEW_MIN_CHARS) {
+        return;
+      }
+      if (nextText.length > DISCORD_LIVE_ASSISTANT_PREVIEW_MAX_CHARS) {
+        return;
+      }
+      if (previewText && previewText.startsWith(nextText) && nextText.length < previewText.length) {
+        return;
+      }
+      if (!previewMessage) {
+        previewMessage = await this.sendSingleTextWithDeliveryRef(conversation, nextText);
+        if (!previewMessage) {
+          return;
+        }
+        previewText = nextText;
+        return;
+      }
+      const updated = await this.updateDeliveredTextMessage(conversation, previewMessage, nextText);
+      if (!updated) {
+        return;
+      }
+      previewText = nextText;
+    };
+
+    const enqueuePreviewRender = () => {
+      previewQueue = previewQueue
+        .then(renderPreview)
+        .catch((error: unknown) => {
+          this.api.logger.warn(
+            `codex live assistant preview render failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+          );
+        });
+      return previewQueue;
+    };
+
+    const schedulePreviewRender = () => {
+      if (previewTimer) {
+        return;
+      }
+      previewTimer = setTimeout(() => {
+        void enqueuePreviewRender();
+      }, DISCORD_LIVE_ASSISTANT_PREVIEW_THROTTLE_MS);
+    };
+
+    return {
+      update: async (text: string) => {
+        const trimmed = text.trim();
+        if (!trimmed) {
+          return;
+        }
+        if (observedText && observedText.startsWith(trimmed) && trimmed.length < observedText.length) {
+          return;
+        }
+        observedText = trimmed;
+        pendingPreviewText = trimmed;
+        if (trimmed.length >= DISCORD_LIVE_ASSISTANT_PREVIEW_MIN_CHARS || previewMessage) {
+          schedulePreviewRender();
+        }
+      },
+      finalize: async (text?: string) => {
+        clearPreviewTimer();
+        await previewQueue;
+
+        const explicitFinalText = text?.trim();
+        const finalSource = explicitFinalText || observedText.trim();
+        if (!previewMessage) {
+          if (!explicitFinalText && finalSource) {
+            const delivered = await this.sendTextWithDeliveryRef(conversation, finalSource);
+            return delivered !== null;
+          }
+          return false;
+        }
+        if (!finalSource) {
+          return previewText.length > 0;
+        }
+
+        const finalChunks = chunkText(finalSource);
+        if (finalChunks.length === 0) {
+          return previewText.length > 0;
+        }
+        const [firstChunk, ...spilloverChunks] = finalChunks;
+        if (firstChunk && firstChunk !== previewText) {
+          const updated = await this.updateDeliveredTextMessage(conversation, previewMessage, firstChunk);
+          if (!updated) {
+            return false;
+          }
+          previewText = firstChunk;
+        }
+        for (const chunk of spilloverChunks) {
+          const delivered = await this.sendSingleTextWithDeliveryRef(conversation, chunk);
+          if (!delivered) {
+            return false;
+          }
+        }
+        return true;
+      },
+    };
+  }
+
   private async buildModelPicker(
     conversation: ConversationTarget,
     binding: StoredBinding,
@@ -3453,6 +3742,7 @@ export class CodexPluginController {
       }
     }
     const typing = await this.startTypingLease(params.conversation);
+    const liveAssistantReply = this.createLiveAssistantReplyWriter(params.conversation);
     this.api.logger.debug?.(
       `codex turn starting app-server run ${this.formatConversationForLog(params.conversation)} typing=${typing ? "yes" : "no"} session=${params.binding?.sessionKey ?? "<none>"} existingThread=${params.binding?.threadId ?? "<none>"} profile=${profile} mode=${params.collaborationMode?.mode ?? "default"}`,
     );
@@ -3476,6 +3766,9 @@ export class CodexPluginController {
       approvalPolicy: desired.approvalPolicy,
       sandbox: desired.sandbox,
       collaborationMode: params.collaborationMode,
+      onAssistantMessage: async (text) => {
+        await liveAssistantReply.update(text);
+      },
       onPendingInput: async (state) => {
         this.api.logger.debug?.(
           `codex turn pending input ${state ? "received" : "cleared"} ${this.formatConversationForLog(params.conversation)} questionnaire=${state?.questionnaire ? "yes" : "no"}`,
@@ -3537,6 +3830,16 @@ export class CodexPluginController {
         this.api.logger.debug?.(
           `codex turn completed ${this.formatConversationForLog(params.conversation)} thread=${threadId ?? "<none>"} aborted=${result.aborted ? "yes" : "no"} stoppedReason=${result.stoppedReason ?? "none"} terminalStatus=${result.terminalStatus ?? "none"} text=${result.text ? "yes" : "no"} plan=${result.planArtifact ? "yes" : "no"}`,
         );
+        const liveAssistantDelivered = await liveAssistantReply.finalize(result.text?.trim());
+        if (
+          liveAssistantDelivered &&
+          result.terminalStatus !== "failed" &&
+          !result.aborted &&
+          result.stoppedReason !== "approval" &&
+          !result.planArtifact?.markdown
+        ) {
+          return;
+        }
         const completionText =
           result.terminalStatus === "failed"
             ? await this.describeTurnFailure({
@@ -7019,6 +7322,44 @@ export class CodexPluginController {
       text,
       buttons: opts?.buttons,
     });
+  }
+
+  private async sendSingleTextWithDeliveryRef(
+    conversation: ConversationTarget,
+    text: string,
+  ): Promise<DeliveredMessageRef | null> {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return null;
+    }
+    if (isTelegramChannel(conversation.channel)) {
+      const outbound = await this.loadTelegramOutboundAdapter();
+      const result = await this.sendTelegramTextChunk(outbound, conversation, trimmed);
+      return {
+        provider: "telegram",
+        messageId: result.messageId,
+        chatId:
+          typeof result.chatId === "string"
+            ? result.chatId
+            : conversation.parentConversationId ?? conversation.conversationId,
+      };
+    }
+    if (isDiscordChannel(conversation.channel)) {
+      const result = await this.api.runtime.channel.discord.sendMessageDiscord(
+        conversation.conversationId,
+        trimmed,
+        {
+          accountId: conversation.accountId,
+        },
+      );
+      return {
+        provider: "discord",
+        messageId: result.messageId,
+        channelId: result.channelId,
+      };
+    }
+    await this.sendText(conversation, trimmed);
+    return null;
   }
 
   private async sendTextWithDeliveryRef(

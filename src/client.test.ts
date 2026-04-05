@@ -381,6 +381,90 @@ describe("CodexAppServerClient.startReview", () => {
 });
 
 describe("CodexAppServerClient.startTurn", () => {
+  it("emits live assistant updates before turn settlement", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new CodexAppServerClient(
+        {
+          enabled: true,
+          transport: "stdio",
+          command: "codex",
+          args: [],
+          requestTimeoutMs: 1_000,
+        },
+        {
+          debug: vi.fn(),
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+        },
+      );
+      const updates: string[] = [];
+      const request = vi.fn(async (method: string) => {
+        if (method === "thread/start") {
+          return { threadId: "thread-123", model: "gpt-5.4" };
+        }
+        if (method === "turn/start") {
+          queueMicrotask(async () => {
+            await (client as any).dispatchNotification("item/agentMessage/delta", {
+              threadId: "thread-123",
+              turnId: "turn-123",
+              itemId: "msg-123",
+              delta: "Hello",
+            });
+            await (client as any).dispatchNotification("item/completed", {
+              threadId: "thread-123",
+              turnId: "turn-123",
+              item: {
+                type: "agentMessage",
+                id: "msg-123",
+                text: "Hello from Codex.",
+              },
+            });
+            await (client as any).dispatchNotification("turn/completed", {
+              threadId: "thread-123",
+              turn: {
+                status: "completed",
+              },
+            });
+          });
+          return { threadId: "thread-123", runId: "turn-123" };
+        }
+        return {};
+      });
+      (client as any).ensureConnected = vi.fn(async () => ({
+        client: {
+          connect: vi.fn(),
+          close: vi.fn(),
+          notify: vi.fn(),
+          request,
+          setNotificationHandler: vi.fn(),
+          setRequestHandler: vi.fn(),
+        },
+        initializeResult: {},
+      }));
+
+      const run = client.startTurn({
+        sessionKey: "session-123",
+        workspaceDir: "/repo/openclaw",
+        runId: "run-123",
+        prompt: "Ship it",
+        model: "gpt-5.4",
+        onAssistantMessage: async (text) => {
+          updates.push(text);
+        },
+      });
+      const resultPromise = run.result;
+      await vi.advanceTimersByTimeAsync(1_500);
+      const result = await resultPromise;
+
+      expect(updates).toContain("Hello from Codex.");
+      expect("text" in result ? result.text : undefined).toBe("Hello from Codex.");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("recovers final assistant text from thread/read when completion arrives without text", async () => {
     const client = new CodexAppServerClient(
       {

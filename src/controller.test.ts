@@ -4964,6 +4964,220 @@ describe("Discord controller flows", () => {
     expect(clientMock.readAccount).not.toHaveBeenCalled();
   });
 
+  it("suppresses the empty completion fallback when live assistant text was already delivered", async () => {
+    const { controller, sendMessageTelegram } = await createControllerHarness();
+    (controller as any).client.startTurn = vi.fn((params: { onAssistantMessage?: (text: string) => Promise<void> }) => {
+      queueMicrotask(async () => {
+        await params.onAssistantMessage?.("Live summary from Codex.");
+      });
+      return {
+        result: Promise.resolve({
+          threadId: "thread-1",
+          text: "",
+          terminalStatus: "completed",
+        }),
+        getThreadId: () => "thread-1",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      };
+    });
+
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      },
+      binding: {
+        conversation: {
+          channel: "telegram",
+          accountId: "default",
+          conversationId: TEST_TELEGRAM_PEER_ID,
+        },
+        sessionKey: "session-1",
+        threadId: "thread-1",
+        workspaceDir: "/repo/openclaw",
+        updatedAt: Date.now(),
+      },
+      workspaceDir: "/repo/openclaw",
+      prompt: "who are you?",
+      reason: "inbound",
+    });
+
+    await flushAsyncWork();
+    expect(sendMessageTelegram).toHaveBeenCalledWith(
+      TEST_TELEGRAM_PEER_ID,
+      "Live summary from Codex.",
+      expect.anything(),
+    );
+    expect(sendMessageTelegram).not.toHaveBeenCalledWith(
+      TEST_TELEGRAM_PEER_ID,
+      "Codex completed without a text reply.",
+      expect.anything(),
+    );
+  });
+
+  it("sends short Discord replies only once at completion when preview streaming never starts", async () => {
+    const { controller, sendMessageDiscord } = await createControllerHarness();
+    (controller as any).client.startTurn = vi.fn((params: { onAssistantMessage?: (text: string) => Promise<void> }) => {
+      queueMicrotask(async () => {
+        await params.onAssistantMessage?.("Hello");
+        await params.onAssistantMessage?.("Hello there");
+      });
+      return {
+        result: Promise.resolve({
+          threadId: "thread-1",
+          text: "Hello there",
+          terminalStatus: "completed",
+        }),
+        getThreadId: () => "thread-1",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      };
+    });
+
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:chan-1",
+      },
+      binding: {
+        conversation: {
+          channel: "discord",
+          accountId: "default",
+          conversationId: "channel:chan-1",
+        },
+        sessionKey: "session-1",
+        threadId: "thread-1",
+        workspaceDir: "/repo/openclaw",
+        updatedAt: Date.now(),
+      },
+      workspaceDir: "/repo/openclaw",
+      prompt: "who are you?",
+      reason: "inbound",
+    });
+
+    await flushAsyncWork();
+    expect(sendMessageDiscord).toHaveBeenCalledTimes(1);
+    expect(sendMessageDiscord).toHaveBeenCalledWith(
+      "channel:chan-1",
+      "Hello there",
+      expect.objectContaining({
+        accountId: "default",
+      }),
+    );
+    expect(discordSdkState.editDiscordComponentMessage).not.toHaveBeenCalled();
+  });
+
+  it("reuses the Discord preview message as the first final chunk before sending spillover chunks", async () => {
+    vi.useFakeTimers();
+    try {
+      const { controller, sendMessageDiscord, api } = await createControllerHarness();
+      const previewText =
+        "This is a long Discord preview message that should stream before the turn completes.";
+      const finalText = `${previewText} Final spillover chunk.`;
+      const firstFinalChunk = "This is a long Discord preview message";
+      const spilloverChunk = "that should stream before the turn completes. Final spillover chunk.";
+
+      (api as any).runtime.channel.text.chunkText = vi.fn((text: string) => {
+        if (text.length <= firstFinalChunk.length) {
+          return [text];
+        }
+        return [text.slice(0, firstFinalChunk.length), text.slice(firstFinalChunk.length)];
+      });
+
+      (controller as any).client.startTurn = vi.fn((params: { onAssistantMessage?: (text: string) => Promise<void> }) => {
+        queueMicrotask(async () => {
+          await params.onAssistantMessage?.(previewText);
+        });
+        return {
+          result: new Promise((resolve) => {
+            setTimeout(() => {
+              resolve({
+                threadId: "thread-1",
+                text: finalText,
+                terminalStatus: "completed",
+              });
+            }, 2_000);
+          }),
+          getThreadId: () => "thread-1",
+          queueMessage: vi.fn(async () => false),
+          interrupt: vi.fn(async () => {}),
+          isAwaitingInput: () => false,
+          submitPendingInput: vi.fn(async () => false),
+          submitPendingInputPayload: vi.fn(async () => false),
+        };
+      });
+
+      const startPromise = (controller as any).startTurn({
+        conversation: {
+          channel: "discord",
+          accountId: "default",
+          conversationId: "channel:chan-1",
+        },
+        binding: {
+          conversation: {
+            channel: "discord",
+            accountId: "default",
+            conversationId: "channel:chan-1",
+          },
+          sessionKey: "session-1",
+          threadId: "thread-1",
+          workspaceDir: "/repo/openclaw",
+          updatedAt: Date.now(),
+        },
+        workspaceDir: "/repo/openclaw",
+        prompt: "who are you?",
+        reason: "inbound",
+      });
+
+      await vi.advanceTimersByTimeAsync(1_200);
+      expect(sendMessageDiscord).toHaveBeenCalledTimes(1);
+      expect(sendMessageDiscord).toHaveBeenNthCalledWith(
+        1,
+        "channel:chan-1",
+        previewText,
+        expect.objectContaining({
+          accountId: "default",
+        }),
+      );
+
+      await vi.advanceTimersByTimeAsync(800);
+      vi.useRealTimers();
+      await startPromise;
+      await flushAsyncWork();
+
+      expect(discordSdkState.editDiscordComponentMessage).toHaveBeenCalledWith(
+        "channel:chan-1",
+        "discord-msg-1",
+        expect.objectContaining({
+          text: firstFinalChunk,
+        }),
+        expect.objectContaining({
+          accountId: "default",
+        }),
+      );
+      expect(sendMessageDiscord).toHaveBeenCalledTimes(2);
+      expect(sendMessageDiscord).toHaveBeenNthCalledWith(
+        2,
+        "channel:chan-1",
+        spilloverChunk,
+        expect.objectContaining({
+          accountId: "default",
+        }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not probe auth after an approval cancel completes without assistant text", async () => {
     const { controller, clientMock, sendMessageTelegram } = await createControllerHarness();
     (controller as any).client.startTurn = vi.fn(() => ({

@@ -77,6 +77,7 @@ export type ActiveCodexRun = {
 };
 
 const DEFAULT_PROTOCOL_VERSION = "1.0";
+const ASSISTANT_UPDATE_BATCH_MS = 250;
 const TRAILING_NOTIFICATION_SETTLE_MS = 1000;
 const TURN_STEER_METHODS = ["turn/steer"] as const;
 const TURN_INTERRUPT_METHODS = ["turn/interrupt"] as const;
@@ -1527,6 +1528,66 @@ function createFileEditNoticeBatcher(params: {
       if (text) {
         await params.onFlush?.(text);
       }
+    },
+  };
+}
+
+function createAssistantTextUpdateBatcher(params: {
+  onFlush?: (text: string) => Promise<void> | void;
+  onError?: (error: unknown) => void;
+}) {
+  let pendingText = "";
+  let flushedText = "";
+  let flushTimer: NodeJS.Timeout | undefined;
+  let flushQueue = Promise.resolve();
+
+  const runFlush = async () => {
+    const text = pendingText.trim();
+    if (!text || text === flushedText) {
+      return;
+    }
+    flushedText = text;
+    await params.onFlush?.(text);
+  };
+
+  const enqueueFlush = () => {
+    flushQueue = flushQueue
+      .then(runFlush)
+      .catch((error: unknown) => {
+        params.onError?.(error);
+      });
+    return flushQueue;
+  };
+
+  return {
+    update(text: string, options?: { immediate?: boolean }) {
+      const trimmed = text.trim();
+      if (!trimmed) {
+        return;
+      }
+      pendingText = trimmed;
+      if (options?.immediate) {
+        if (flushTimer) {
+          clearTimeout(flushTimer);
+          flushTimer = undefined;
+        }
+        void enqueueFlush();
+        return;
+      }
+      if (flushTimer) {
+        return;
+      }
+      flushTimer = setTimeout(() => {
+        flushTimer = undefined;
+        void enqueueFlush();
+      }, ASSISTANT_UPDATE_BATCH_MS);
+    },
+    async flush() {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = undefined;
+      }
+      await enqueueFlush();
     },
   };
 }
@@ -3411,6 +3472,7 @@ export class CodexAppServerClient {
     approvalPolicy?: string;
     sandbox?: string;
     collaborationMode?: CollaborationMode;
+    onAssistantMessage?: (text: string) => Promise<void> | void;
     onPendingInput?: (state: PendingInputState | null) => Promise<void> | void;
     onFileEdits?: (text: string) => Promise<void> | void;
     onInterrupted?: () => Promise<void> | void;
@@ -3448,6 +3510,14 @@ export class CodexAppServerClient {
     });
     const fileEditNoticeBatcher = createFileEditNoticeBatcher({
       onFlush: params.onFileEdits,
+    });
+    const assistantTextUpdateBatcher = createAssistantTextUpdateBatcher({
+      onFlush: params.onAssistantMessage,
+      onError: (error) => {
+        this.logger.debug(
+          `codex turn assistant update delivery failed run=${params.runId}: ${String(error)}`,
+        );
+      },
     });
     let completeTurn: (() => void) | null = null;
     let terminalNotificationSeen = false;
@@ -3567,6 +3637,12 @@ export class CodexAppServerClient {
             lastAssistantText = snapshotText;
           }
         }
+        const liveAssistantText = assistantText.trim() || lastAssistantText.trim();
+        if (liveAssistantText) {
+          assistantTextUpdateBatcher.update(liveAssistantText, {
+            immediate: assistantNotification.mode === "snapshot",
+          });
+        }
         if (
           methodLower === "turn/completed" ||
           methodLower === "turn/failed" ||
@@ -3582,6 +3658,7 @@ export class CodexAppServerClient {
           terminalStatus = terminalState?.status ?? terminalStatus;
           terminalError = terminalState?.error ?? terminalError;
           await fileEditNoticeBatcher.flush();
+          await assistantTextUpdateBatcher.flush();
           this.logger.debug(
             `codex turn terminal notification run=${params.runId} thread=${threadId || "<pending>"} turn=${turnId || "<pending>"} method=${methodLower}`,
           );
@@ -3811,11 +3888,14 @@ export class CodexAppServerClient {
             assistantText = recoveredAssistantText;
             lastAssistantText = recoveredAssistantText;
             resolvedAssistantText = recoveredAssistantText;
+            assistantTextUpdateBatcher.update(recoveredAssistantText, { immediate: true });
+            await assistantTextUpdateBatcher.flush();
             this.logger.debug(
               `codex turn completion recovered assistant text from thread/read run=${params.runId} thread=${threadId} turn=${turnId || "<none>"} chars=${resolvedAssistantText.length}`,
             );
           }
         }
+        await assistantTextUpdateBatcher.flush();
         this.logger.debug(
           `codex turn completion settled run=${params.runId} thread=${threadId || "<none>"} turn=${turnId || "<none>"} interrupted=${interrupted ? "yes" : "no"} assistantChars=${resolvedAssistantText.length}`,
         );

@@ -5,6 +5,28 @@
 
 Design notes and upstream behavior captures live under [`docs/specs/`](./docs/specs). Before changing approval, trust, sandbox, file-edit, or media-handling behavior, review [`docs/specs/PERMISSIONS.md`](./docs/specs/PERMISSIONS.md) and [`docs/specs/MEDIA.md`](./docs/specs/MEDIA.md).
 
+## Assistant Output Architecture
+Default chat turns now behave like a stateful event consumer instead of a one-shot final-text extractor.
+
+- `src/client.ts` remains the upstream-facing notification processor. It consumes App Server notifications serially, keeps assistant state from canonical assistant surfaces, and emits batched live assistant text snapshots through `startTurn(... onAssistantMessage)`.
+- `src/controller.ts` owns provider UX. For successful default turns, it renders assistant text into provider-native progressive replies and treats what the user already saw in chat as the canonical reply.
+- The empty successful-turn fallback string, `Codex completed without a text reply.`, is now only for cases where no assistant text was ever rendered. Do not reintroduce logic that sends that fallback after live assistant text has already been delivered.
+- The plugin still has a local post-terminal settle boundary in the client for turn completion and replay recovery, but successful chat delivery should not depend on that boundary once live assistant text is visible.
+- Plan mode and review mode keep their own delivery paths. The live assistant transcript architecture here applies to the default turn flow.
+
+Provider rendering is intentionally not identical across channels:
+
+- Telegram uses a grow-only transcript path in the controller. As assistant text expands, the plugin edits existing chunks and appends new ones as needed.
+- Discord follows OpenClaw's host-side preview model more closely. The controller keeps a single throttled preview message during streaming, then reuses that message as the first final chunk and only sends spillover chunks after completion.
+- Do not collapse both providers back to one generic renderer unless the OpenClaw plugin SDK grows a first-class provider-neutral draft-stream lifecycle. Today the SDK exposes chunking helpers, outbound sends, typing leases, and Discord component-message edits, but not the host's internal reply pipeline or draft lifecycle helpers.
+
+When changing assistant-output behavior:
+
+- Keep protocol parsing upstream-grounded. `item/completed` and `thread/read` are normalized `ThreadItem` surfaces; `rawResponseItem/completed` is a raw `ResponseItem` surface.
+- Preserve the split of responsibilities: client gathers and normalizes assistant state, controller decides how to render it in Telegram and Discord.
+- Keep Discord preview behavior host-aligned: one editable preview message, throttled updates, then finalize in place plus spillover chunks instead of building a multi-message live transcript up front.
+- Update both `src/client.test.ts` and `src/controller.test.ts` for any regression involving live assistant streaming, completion fallback behavior, or provider message editing.
+
 ## Project Management
 Use the repo-local [`project-manager`](./.agents/skills/project-manager/SKILL.md) skill for GitHub issue and project-board work in this repository.
 
