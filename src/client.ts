@@ -2018,6 +2018,17 @@ function extractAssistantTextPayload(value: unknown, options?: { streaming?: boo
   return dedupeJoinedText(collectText(record));
 }
 
+function isAssistantLikeItem(item: Record<string, unknown>): boolean {
+  const itemType = pickString(item, ["type"])?.toLowerCase();
+  if (itemType === "agentmessage" || itemType === "assistantmessage") {
+    return true;
+  }
+  if (itemType === "message") {
+    return normalizeConversationRole(pickString(item, ["role"])) === "assistant";
+  }
+  return false;
+}
+
 function extractAssistantTextFromItemPayload(
   value: unknown,
   options?: { streaming?: boolean },
@@ -2027,15 +2038,39 @@ function extractAssistantTextFromItemPayload(
     return "";
   }
   const item = asRecord(record.item) ?? record;
-  const itemType = pickString(item, ["type"])?.toLowerCase();
-  if (
-    itemType !== "agentmessage" &&
-    itemType !== "assistantmessage" &&
-    itemType !== "message"
-  ) {
+  if (!isAssistantLikeItem(item)) {
     return "";
   }
   return extractAssistantTextPayload(item, options);
+}
+
+function extractAssistantSnapshotFromNotificationPayload(value: unknown): string {
+  const record = asRecord(value);
+  if (!record) {
+    return "";
+  }
+  const candidateRecords = [
+    asRecord(record.item),
+    asRecord(record.responseItem),
+    asRecord(record.response_item),
+    asRecord(record.message),
+    asRecord(record.output),
+    asRecord(record.result),
+    asRecord(record.response),
+    asRecord(record.data),
+    asRecord(asRecord(record.turn)?.item),
+    asRecord(asRecord(record.turn)?.output),
+    asRecord(asRecord(record.turn)?.result),
+    asRecord(asRecord(record.turn)?.response),
+    record,
+  ].filter((entry): entry is Record<string, unknown> => Boolean(entry));
+  for (const candidate of candidateRecords) {
+    const text = extractAssistantTextFromItemPayload(candidate);
+    if (text.trim()) {
+      return text;
+    }
+  }
+  return "";
 }
 
 function extractAssistantTextFromTerminalPayload(method: string, params: unknown): string {
@@ -2101,13 +2136,11 @@ function extractAssistantNotificationText(
       itemId: extractAssistantItemId(params),
     };
   }
-  if (
-    methodLower === "item/completed" ||
-    methodLower === "rawresponseitem/completed"
-  ) {
+  const snapshotText = extractAssistantSnapshotFromNotificationPayload(params);
+  if (snapshotText.trim()) {
     return {
       mode: "snapshot",
-      text: extractAssistantTextFromItemPayload(params),
+      text: snapshotText,
       itemId: extractAssistantItemId(params),
     };
   }

@@ -823,12 +823,12 @@ describe("createPendingInputCoordinator", () => {
 });
 
 describe("assistant message extraction", () => {
-  it("accepts assistantmessage snapshots from item/completed", () => {
+  it("accepts normalized agentMessage snapshots from item/completed", () => {
     expect(
       __testing.extractAssistantNotificationText("item/completed", {
         item: {
           id: "msg-1",
-          type: "assistantmessage",
+          type: "agentMessage",
           text: "Done with summary text.",
         },
       }),
@@ -839,12 +839,29 @@ describe("assistant message extraction", () => {
     });
   });
 
-  it("accepts message snapshots from item/completed", () => {
+  it("keeps supporting legacy assistantmessage snapshots from item/completed", () => {
+    expect(
+      __testing.extractAssistantNotificationText("item/completed", {
+        item: {
+          id: "msg-1a",
+          type: "assistantmessage",
+          text: "Legacy summary text.",
+        },
+      }),
+    ).toEqual({
+      mode: "snapshot",
+      text: "Legacy summary text.",
+      itemId: "msg-1a",
+    });
+  });
+
+  it("accepts assistant-role message snapshots from item/completed", () => {
     expect(
       __testing.extractAssistantNotificationText("item/completed", {
         item: {
           id: "msg-1b",
           type: "message",
+          role: "assistant",
           content: [
             {
               type: "output_text",
@@ -892,6 +909,47 @@ describe("assistant message extraction", () => {
     ).toEqual({
       mode: "snapshot",
       text: "Long final summary",
+      itemId: undefined,
+    });
+  });
+
+  it("ignores non-assistant raw response messages", () => {
+    expect(
+      __testing.extractAssistantNotificationText("rawResponseItem/completed", {
+        item: {
+          type: "message",
+          role: "user",
+          content: [
+            {
+              type: "output_text",
+              text: "User text should not surface.",
+            },
+          ],
+        },
+      }),
+    ).toEqual({
+      mode: "ignore",
+      text: "",
+    });
+  });
+
+  it("accepts assistant messages from thread/realtime/itemAdded", () => {
+    expect(
+      __testing.extractAssistantNotificationText("thread/realtime/itemAdded", {
+        item: {
+          type: "message",
+          role: "assistant",
+          content: [
+            {
+              type: "output_text",
+              text: "Realtime assistant text.",
+            },
+          ],
+        },
+      }),
+    ).toEqual({
+      mode: "snapshot",
+      text: "Realtime assistant text.",
       itemId: undefined,
     });
   });
