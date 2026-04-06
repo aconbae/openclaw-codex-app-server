@@ -567,6 +567,37 @@ describe("Discord controller flows", () => {
     expect(planUsage).toEqual({ text: "Usage: /cas_plan <goal> | /cas_plan off" });
   });
 
+  it("still lets cas_steer send an explicit steer message to the active run", async () => {
+    const { controller } = await createControllerHarness();
+    const queueMessage = vi.fn(async () => true);
+    (controller as any).activeRuns.set("discord::default::channel:chan-1::", {
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:chan-1",
+      },
+      workspaceDir: "/repo/openclaw",
+      mode: "default",
+      handle: {
+        result: Promise.resolve({ threadId: "thread-1", text: "stale" }),
+        queueMessage,
+        getThreadId: () => "thread-1",
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      },
+    });
+
+    const reply = await controller.handleCommand("cas_steer", buildDiscordCommandContext({
+      args: "please shorten it",
+      commandBody: "/cas_steer please shorten it",
+    }));
+
+    expect(queueMessage).toHaveBeenCalledWith("please shorten it");
+    expect(reply).toEqual({ text: "Sent steer message to Codex." });
+  });
+
   it("offers a New button on /cas_resume and flips into the new-thread project picker", async () => {
     const { controller } = await createControllerHarness();
 
@@ -4312,7 +4343,7 @@ describe("Discord controller flows", () => {
     );
   });
 
-  it("restarts a Discord bound run when the active queue path fails", async () => {
+  it("restarts a Discord bound run for a fresh inbound prompt instead of steering the active run", async () => {
     const { controller } = await createControllerHarness();
     await (controller as any).store.upsertBinding({
       conversation: {
@@ -4326,6 +4357,7 @@ describe("Discord controller flows", () => {
       updatedAt: Date.now(),
     });
     const staleInterrupt = vi.fn(async () => {});
+    const staleQueueMessage = vi.fn(async () => true);
     (controller as any).activeRuns.set("discord::default::channel:1481858418548412579::", {
       conversation: {
         channel: "discord",
@@ -4336,9 +4368,7 @@ describe("Discord controller flows", () => {
       mode: "default",
       handle: {
         result: Promise.resolve({ threadId: "thread-1", text: "stale" }),
-        queueMessage: vi.fn(async () => {
-          throw new Error("codex app server rpc error (-32600): Invalid request: missing field `threadId`");
-        }),
+        queueMessage: staleQueueMessage,
         getThreadId: () => "thread-1",
         interrupt: staleInterrupt,
         isAwaitingInput: () => false,
@@ -4370,6 +4400,7 @@ describe("Discord controller flows", () => {
     });
 
     expect(result).toEqual({ handled: true });
+    expect(staleQueueMessage).not.toHaveBeenCalled();
     expect(staleInterrupt).toHaveBeenCalled();
     expect(startTurn).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -4379,9 +4410,10 @@ describe("Discord controller flows", () => {
     );
   });
 
-  it("warns and restarts when an active run declines a queued prompt", async () => {
+  it("restarts an active run for a fresh prompt instead of queueing it as steer", async () => {
     const { controller, api } = await createControllerHarness();
     const staleInterrupt = vi.fn(async () => {});
+    const staleQueueMessage = vi.fn(async () => false);
     (controller as any).activeRuns.set("discord::default::channel:chan-1::", {
       conversation: {
         channel: "discord",
@@ -4392,7 +4424,7 @@ describe("Discord controller flows", () => {
       mode: "default",
       handle: {
         result: Promise.resolve({ threadId: "thread-1", text: "stale" }),
-        queueMessage: vi.fn(async () => false),
+        queueMessage: staleQueueMessage,
         getThreadId: () => "thread-1",
         interrupt: staleInterrupt,
         isAwaitingInput: () => false,
@@ -4436,10 +4468,11 @@ describe("Discord controller flows", () => {
       reason: "command",
     });
 
+    expect(staleQueueMessage).not.toHaveBeenCalled();
     expect(staleInterrupt).toHaveBeenCalled();
     expect(startTurn).toHaveBeenCalled();
-    expect(api.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("reached an active run but was not accepted; restarting"),
+    expect(api.logger.debug).toHaveBeenCalledWith(
+      expect.stringContaining("restarting active run for fresh prompt"),
     );
   });
 

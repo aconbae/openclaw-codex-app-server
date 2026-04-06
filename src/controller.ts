@@ -1443,25 +1443,11 @@ export class CodexPluginController {
               return { handled: true };
             }
           }
-          if (requiresStructuredInput) {
-            this.api.logger.debug?.(
-              `codex inbound claim restarting active run for structured input conversation=${conversation.conversationId}`,
-            );
-          } else {
-            try {
-              const handled = await active.handle.queueMessage(event.content);
-              if (handled) {
-                return { handled: true };
-              }
-              this.api.logger.warn(
-                `codex inbound claim could not enqueue message for active run; restarting thread conversation=${conversation.conversationId}`,
-              );
-            } catch (error) {
-              this.api.logger.warn(
-                `codex inbound claim active run enqueue failed; restarting thread conversation=${conversation.conversationId}: ${String(error)}`,
-              );
-            }
-          }
+          this.api.logger.debug?.(
+            requiresStructuredInput
+              ? `codex inbound claim restarting active run for structured input conversation=${conversation.conversationId}`
+              : `codex inbound claim restarting active run for fresh inbound prompt conversation=${conversation.conversationId}`,
+          );
           this.activeRuns.delete(activeKey);
           await active.handle.interrupt().catch(() => undefined);
         }
@@ -3712,34 +3698,15 @@ export class CodexPluginController {
         this.api.logger.debug?.(
           `codex turn request replacing active plan run ${this.formatConversationForLog(params.conversation)}`,
         );
-        this.activeRuns.delete(key);
-        await existing.handle.interrupt().catch(() => undefined);
-      } else if (!isQueueCompatibleTurnInput(params.prompt, params.input)) {
-        this.api.logger.debug?.(
-          `codex turn request restarting active run for structured input ${this.formatConversationForLog(params.conversation)} mode=${existing.mode}`,
-        );
-        this.activeRuns.delete(key);
-        await existing.handle.interrupt().catch(() => undefined);
       } else {
-        try {
-          const handled = await existing.handle.queueMessage(params.prompt);
-          if (handled) {
-            this.api.logger.debug?.(
-              `codex turn request queued onto active run ${this.formatConversationForLog(params.conversation)} mode=${existing.mode}`,
-            );
-            return;
-          }
-          this.api.logger.warn(
-            `codex turn request reached an active run but was not accepted; restarting ${this.formatConversationForLog(params.conversation)} mode=${existing.mode}`,
-          );
-        } catch (error) {
-          this.api.logger.warn(
-            `codex turn request active run enqueue failed; restarting ${this.formatConversationForLog(params.conversation)} mode=${existing.mode}: ${String(error)}`,
-          );
-        }
-        this.activeRuns.delete(key);
-        await existing.handle.interrupt().catch(() => undefined);
+        this.api.logger.debug?.(
+          !isQueueCompatibleTurnInput(params.prompt, params.input)
+            ? `codex turn request restarting active run for structured input ${this.formatConversationForLog(params.conversation)} mode=${existing.mode}`
+            : `codex turn request restarting active run for fresh prompt ${this.formatConversationForLog(params.conversation)} mode=${existing.mode}`,
+        );
       }
+      this.activeRuns.delete(key);
+      await existing.handle.interrupt().catch(() => undefined);
     }
     const typing = await this.startTypingLease(params.conversation);
     const liveAssistantReply = this.createLiveAssistantReplyWriter(params.conversation);
