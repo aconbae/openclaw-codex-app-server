@@ -94,6 +94,45 @@ function createApiMock(options?: { pluginConfig?: Record<string, unknown> }) {
         }),
     ),
   };
+  const discordOutbound = {
+    sendText: vi.fn(async (ctx: { to: string; text: string; accountId?: string; threadId?: string | number }) =>
+      await sendMessageDiscord(ctx.to, ctx.text, {
+        accountId: ctx.accountId,
+      }),
+    ),
+    sendMedia: vi.fn(
+      async (ctx: {
+        to: string;
+        text: string;
+        mediaUrl: string;
+        accountId?: string;
+        threadId?: string | number;
+        mediaLocalRoots?: readonly string[];
+      }) =>
+        await sendMessageDiscord(ctx.to, ctx.text, {
+          accountId: ctx.accountId,
+          mediaUrl: ctx.mediaUrl,
+          mediaLocalRoots: ctx.mediaLocalRoots,
+        }),
+    ),
+    sendPayload: vi.fn(
+      async (ctx: {
+        to: string;
+        payload: ReplyPayload;
+        accountId?: string;
+        threadId?: string | number;
+        mediaLocalRoots?: readonly string[];
+      }) =>
+        await sendComponentMessage(
+          ctx.to,
+          ((ctx.payload.channelData as { discord?: { components?: unknown } } | undefined)?.discord
+            ?.components as ReplyPayload) ?? { text: ctx.payload.text ?? "" },
+          {
+            accountId: ctx.accountId,
+          },
+        ),
+    ),
+  };
   const api = {
     id: "test-plugin",
     config: {},
@@ -124,7 +163,13 @@ function createApiMock(options?: { pluginConfig?: Record<string, unknown> }) {
             opts?.fallbackLimit ?? 2000,
         },
         outbound: {
-          loadAdapter: vi.fn(async (channel: string) => (channel === "telegram" ? telegramOutbound : undefined)),
+          loadAdapter: vi.fn(async (channel: string) =>
+            channel === "telegram"
+              ? telegramOutbound
+              : channel === "discord"
+                ? undefined
+                : undefined,
+          ),
         },
         telegram: {
           sendMessageTelegram,
@@ -164,6 +209,7 @@ function createApiMock(options?: { pluginConfig?: Record<string, unknown> }) {
     renameTopic,
     resolveTelegramToken,
     editChannel,
+    discordOutbound,
     stateDir,
   };
 }
@@ -178,6 +224,7 @@ async function createControllerHarness(options?: { pluginConfig?: Record<string,
     renameTopic,
     resolveTelegramToken,
     editChannel,
+    discordOutbound,
     stateDir,
   } = createApiMock(options);
   const controller = new CodexPluginController(api);
@@ -269,7 +316,107 @@ async function createControllerHarness(options?: { pluginConfig?: Record<string,
     renameTopic,
     resolveTelegramToken,
     editChannel,
+    discordOutbound,
     stateDir,
+  };
+}
+
+async function createControllerHarnessWithoutLegacyDiscordRuntime() {
+  const harness = createApiMock();
+  delete (harness.api as any).runtime.channel.discord;
+  (harness.api as any).runtime.channel.outbound.loadAdapter = vi.fn(async (channel: string) =>
+    channel === "telegram"
+      ? harness.telegramOutbound
+      : channel === "discord"
+        ? harness.discordOutbound
+        : undefined,
+  );
+  const controller = new CodexPluginController(harness.api);
+  await controller.start();
+  const clientMock = {
+    listThreads: vi.fn(async () => [
+      {
+        threadId: "thread-1",
+        title: "Discord Thread",
+        projectKey: "/repo/openclaw",
+        createdAt: Date.now() - 60_000,
+        updatedAt: Date.now() - 30_000,
+      },
+    ]),
+    readThreadState: vi.fn(async () => ({
+      threadId: "thread-1",
+      threadName: "Discord Thread",
+      model: "openai/gpt-5.4",
+      cwd: "/repo/openclaw",
+      serviceTier: "default",
+      approvalPolicy: "on-request",
+      sandbox: "workspace-write",
+    })),
+    readThreadContext: vi.fn(async () => ({
+      lastUserMessage: undefined,
+      lastAssistantMessage: undefined,
+    })),
+    readAccount: vi.fn(async () => ({
+      email: "test@example.com",
+      planType: "pro",
+      type: "chatgpt",
+    })),
+    readRateLimits: vi.fn(async () => []),
+  };
+  (controller as any).client = clientMock;
+  (controller as any).readThreadHasChanges = vi.fn(async () => false);
+  return {
+    controller,
+    discordOutbound: harness.discordOutbound,
+  };
+}
+
+async function createControllerHarnessWithoutDiscordSendSurfaces() {
+  const harness = createApiMock();
+  delete (harness.api as any).runtime.channel.discord;
+  (harness.api as any).runtime.channel.outbound.loadAdapter = vi.fn(async (channel: string) =>
+    channel === "telegram" ? harness.telegramOutbound : undefined,
+  );
+  const controller = new CodexPluginController(harness.api);
+  await controller.start();
+  const clientMock = {
+    listThreads: vi.fn(async () => [
+      {
+        threadId: "thread-1",
+        title: "Discord Thread",
+        projectKey: "/repo/openclaw",
+        createdAt: Date.now() - 60_000,
+        updatedAt: Date.now() - 30_000,
+      },
+    ]),
+    listSkills: vi.fn(async () => [
+      { name: "skill-a", description: "Skill A", cwd: "/repo/openclaw" },
+      { name: "skill-b", description: "Skill B", cwd: "/repo/openclaw" },
+    ]),
+    readThreadState: vi.fn(async () => ({
+      threadId: "thread-1",
+      threadName: "Discord Thread",
+      model: "openai/gpt-5.4",
+      cwd: "/repo/openclaw",
+      serviceTier: "default",
+      approvalPolicy: "on-request",
+      sandbox: "workspace-write",
+    })),
+    readThreadContext: vi.fn(async () => ({
+      lastUserMessage: undefined,
+      lastAssistantMessage: undefined,
+    })),
+    readAccount: vi.fn(async () => ({
+      email: "test@example.com",
+      planType: "pro",
+      type: "chatgpt",
+    })),
+    readRateLimits: vi.fn(async () => []),
+  };
+  (controller as any).client = clientMock;
+  (controller as any).readThreadHasChanges = vi.fn(async () => false);
+  return {
+    controller,
   };
 }
 
@@ -484,6 +631,59 @@ describe("Discord controller flows", () => {
       "channel:chan-1",
       expect.objectContaining({
         text: expect.stringContaining("Showing recent Codex threads"),
+      }),
+      expect.objectContaining({
+        accountId: "default",
+      }),
+    );
+  });
+
+  it("sends resume pickers through the Discord outbound adapter when the legacy runtime is absent", async () => {
+    const { controller, discordOutbound } = await createControllerHarnessWithoutLegacyDiscordRuntime();
+
+    const reply = await controller.handleCommand("cas_resume", buildDiscordCommandContext());
+
+    expect(reply).toEqual({
+      text: "Sent a Codex thread picker to this Discord conversation.",
+    });
+    expect(discordOutbound.sendPayload).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "channel:chan-1",
+        accountId: "default",
+        payload: expect.objectContaining({
+          text: expect.stringContaining("Showing recent Codex threads"),
+          channelData: expect.objectContaining({
+            discord: expect.objectContaining({
+              components: expect.objectContaining({
+                blocks: expect.any(Array),
+              }),
+            }),
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("sends resume pickers through the Discord runtime api when adapter and legacy runtime are absent", async () => {
+    const { controller } = await createControllerHarnessWithoutDiscordSendSurfaces();
+    const sendDiscordComponentMessage = vi.fn(async () => ({
+      messageId: "discord-component-1",
+      channelId: "channel:chan-1",
+    }));
+    vi.spyOn(controller as any, "loadDiscordRuntimeApi").mockResolvedValue({
+      sendDiscordComponentMessage,
+    });
+
+    const reply = await controller.handleCommand("cas_resume", buildDiscordCommandContext());
+
+    expect(reply).toEqual({
+      text: "Sent a Codex thread picker to this Discord conversation.",
+    });
+    expect(sendDiscordComponentMessage).toHaveBeenCalledWith(
+      "channel:chan-1",
+      expect.objectContaining({
+        text: expect.stringContaining("Showing recent Codex threads"),
+        blocks: expect.any(Array),
       }),
       expect.objectContaining({
         accountId: "default",
@@ -1076,6 +1276,55 @@ describe("Discord controller flows", () => {
       }),
       expect.objectContaining({ accountId: "default" }),
     );
+  });
+
+  it("sends Discord skills through the runtime api when adapter and legacy runtime are absent", async () => {
+    const { controller } = await createControllerHarnessWithoutDiscordSendSurfaces();
+    const sendDiscordComponentMessage = vi.fn(async () => ({
+      messageId: "discord-component-1",
+      channelId: "channel:chan-1",
+    }));
+    vi.spyOn(controller as any, "loadDiscordRuntimeApi").mockResolvedValue({
+      sendDiscordComponentMessage,
+    });
+
+    const reply = await controller.handleCommand("cas_skills", buildDiscordCommandContext({
+      commandBody: "/cas_skills",
+    }));
+
+    expect(reply).toEqual({
+      text: "Sent Codex skills to this Discord conversation.",
+    });
+    expect(sendDiscordComponentMessage).toHaveBeenCalledWith(
+      "channel:chan-1",
+      expect.objectContaining({
+        text: expect.stringContaining("Type `$skill-name` in this chat to run one directly."),
+        blocks: expect.any(Array),
+      }),
+      expect.objectContaining({ accountId: "default" }),
+    );
+  });
+
+  it("resolves the Discord bot token through the host api when the sdk facade is unavailable", async () => {
+    const { controller } = await createControllerHarness();
+    (controller as any).lastRuntimeConfig = { plugins: { discord: {} } };
+    vi.spyOn(controller as any, "loadDiscordSdk").mockRejectedValue(
+      new Error(
+        "Cannot find module '/Users/huntharo/github/openclaw/dist/plugin-sdk/root-alias.cjs/discord'",
+      ),
+    );
+    const resolveDiscordAccount = vi.fn(() => ({ token: "discord-token" }));
+    vi.spyOn(controller as any, "loadDiscordExtensionApi").mockResolvedValue({
+      resolveDiscordAccount,
+    });
+
+    const token = await (controller as any).resolveDiscordBotToken("default");
+
+    expect(token).toBe("discord-token");
+    expect(resolveDiscordAccount).toHaveBeenCalledWith({
+      cfg: { plugins: { discord: {} } },
+      accountId: "default",
+    });
   });
 
   it("deduplicates skills with the same name in the skills picker", async () => {
