@@ -16,6 +16,10 @@ import type {
   ReplyPayload,
   ConversationRef,
 } from "openclaw/plugin-sdk";
+import {
+  getCurrentPluginConversationBinding,
+  getSessionBindingService,
+} from "openclaw/plugin-sdk/conversation-runtime";
 import type { DiscordComponentMessageSpec } from "openclaw/plugin-sdk/discord";
 import { resolvePluginSettings, resolveWorkspaceDir } from "./config.js";
 import { CodexAppServerModeClient, type ActiveCodexRun, isMissingThreadError } from "./client.js";
@@ -175,6 +179,7 @@ type LiveAssistantReplyWriter = {
 
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
+const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TEXT_ATTACHMENT_FILE_EXTENSIONS = new Set([
   ".json",
   ".log",
@@ -608,6 +613,63 @@ function parseThreadIdFromSessionKey(sessionKey: string | undefined): string | u
   }
   const threadId = trimmed.slice(prefix.length).trim();
   return threadId || undefined;
+}
+
+const BINDING_RECOVERY_PREFIX = "[oc-cas-recovery:";
+
+function encodeBindingRecoveryPayload(params: {
+  threadId: string;
+  workspaceDir: string;
+  threadTitle?: string;
+}): string {
+  const payload = Buffer.from(
+    JSON.stringify({
+      threadId: params.threadId,
+      workspaceDir: params.workspaceDir,
+      threadTitle: params.threadTitle,
+    }),
+    "utf8",
+  ).toString("base64url");
+  return `${BINDING_RECOVERY_PREFIX}${payload}]`;
+}
+
+function parseBindingRecoveryPayload(
+  text: string | undefined,
+): { threadId: string; workspaceDir: string; threadTitle?: string } | null {
+  if (!text) {
+    return null;
+  }
+  const start = text.indexOf(BINDING_RECOVERY_PREFIX);
+  if (start < 0) {
+    return null;
+  }
+  const end = text.indexOf("]", start + BINDING_RECOVERY_PREFIX.length);
+  if (end < 0) {
+    return null;
+  }
+  const encoded = text.slice(start + BINDING_RECOVERY_PREFIX.length, end).trim();
+  if (!encoded) {
+    return null;
+  }
+  try {
+    const decoded = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as {
+      threadId?: unknown;
+      workspaceDir?: unknown;
+      threadTitle?: unknown;
+    };
+    const threadId =
+      typeof decoded.threadId === "string" ? decoded.threadId.trim() : "";
+    const workspaceDir =
+      typeof decoded.workspaceDir === "string" ? decoded.workspaceDir.trim() : "";
+    const threadTitle =
+      typeof decoded.threadTitle === "string" ? decoded.threadTitle.trim() : undefined;
+    if (!threadId || !workspaceDir) {
+      return null;
+    }
+    return { threadId, workspaceDir, threadTitle };
+  } catch {
+    return null;
+  }
 }
 
 function asStringArray(value: unknown): string[] {
@@ -1442,8 +1504,22 @@ export class CodexPluginController {
     };
     const pending = this.store.getPendingBind(conversation);
     if (!pending) {
-      this.api.logger.debug?.(
-        `codex binding approved without pending local bind conversation=${conversation.conversationId}`,
+      const recovered = parseBindingRecoveryPayload(
+        typeof event.request.summary === "string" ? event.request.summary : undefined,
+      );
+      if (!recovered) {
+        this.api.logger.debug?.(
+          `codex binding approved without pending local bind conversation=${conversation.conversationId}`,
+        );
+        return;
+      }
+      await this.bindConversation(conversation, {
+        threadId: recovered.threadId,
+        workspaceDir: recovered.workspaceDir,
+        threadTitle: recovered.threadTitle,
+      });
+      this.api.logger.info?.(
+        `codex binding approval recovered from summary ${this.formatConversationForLog(conversation)} threadId=${recovered.threadId} workspace=${recovered.workspaceDir}`,
       );
       return;
     }
@@ -1548,6 +1624,9 @@ export class CodexPluginController {
         `codex inbound claim channel=${conversation.channel} account=${conversation.accountId} conversation=${conversation.conversationId} parent=${conversation.parentConversationId ?? "<none>"} local=${existingBinding ? "yes" : "no"} recovered=${hydratedBinding?.binding ? "yes" : "no"}`,
       );
       if (!resolvedBinding) {
+        this.api.logger.warn?.(
+          `codex inbound claim rejected without recoverable binding ${this.formatConversationForLog(conversation)} local=${existingBinding ? "yes" : "no"} recovered=${hydratedBinding?.binding ? "yes" : "no"} outcome=${hydratedBinding ? ("desyncMessage" in hydratedBinding ? "desync" : "binding") : "none"}`,
+        );
         return { handled: false };
       }
       if (hydratedBinding?.pendingBind?.syncTopic) {
@@ -2117,7 +2196,7 @@ export class CodexPluginController {
         }
       }
       await this.sendBoundConversationNotifications(conversation);
-      return {};
+      return { text: "Bound this conversation to Codex." };
     }
     if (pendingBind && !binding && !parsed.listProjects && !parsed.query) {
       const syncTopic = parsed.syncTopic || Boolean(pendingBind.syncTopic);
@@ -2149,6 +2228,7 @@ export class CodexPluginController {
       if (bindResult.status === "error") {
         return { text: bindResult.message };
       }
+      await this.store.upsertBinding(bindResult.binding);
       if (syncTopic) {
         const syncedName = buildResumeTopicName({
           title: pendingBind.threadTitle,
@@ -2160,7 +2240,92 @@ export class CodexPluginController {
         }
       }
       await this.sendBoundConversationNotifications(conversation);
-      return {};
+      return { text: "Bound this conversation to Codex." };
+    }
+    const recentDetached = !binding && !parsed.listProjects
+      ? this.store.getRecentDetachedThread(conversation)
+      : null;
+    if (!binding && !parsed.listProjects && !parsed.query && recentDetached) {
+      const preferences = this.buildBindingPreferencesWithOverrides(
+        recentDetached.preferences,
+        overrides,
+        parsed.requestedModel,
+      );
+      const bindResult = await this.requestConversationBinding(
+        conversation,
+        {
+          threadId: recentDetached.threadId,
+          workspaceDir: recentDetached.workspaceDir,
+          permissionsMode: this.resolveRequestedPermissionsMode(
+            normalizePermissionsMode(recentDetached.permissionsMode),
+            parsed.requestedYolo,
+          ),
+          threadTitle: recentDetached.threadTitle,
+          syncTopic: parsed.syncTopic,
+          preferences,
+          notifyBound: true,
+        },
+        bindingApi.requestConversationBinding,
+      );
+      if (bindResult.status === "pending") {
+        return bindResult.reply;
+      }
+      if (bindResult.status === "error") {
+        return { text: bindResult.message };
+      }
+      await this.store.upsertBinding(bindResult.binding);
+      if (parsed.syncTopic) {
+        const syncedName = buildResumeTopicName({
+          title: recentDetached.threadTitle,
+          projectKey: recentDetached.workspaceDir,
+          threadId: recentDetached.threadId,
+        });
+        if (syncedName) {
+          await this.renameConversationIfSupported(conversation, syncedName);
+        }
+      }
+      await this.sendBoundConversationNotifications(conversation);
+      return { text: "Bound this conversation to Codex." };
+    }
+    if (!binding && !parsed.listProjects && parsed.query && recentDetached) {
+      const normalizedQuery = parsed.query.trim().toLowerCase();
+      const normalizedThreadId = recentDetached.threadId.trim().toLowerCase();
+      const normalizedTitle = recentDetached.threadTitle?.trim().toLowerCase() ?? "";
+      if (
+        normalizedQuery === normalizedThreadId ||
+        (normalizedTitle && normalizedTitle.includes(normalizedQuery))
+      ) {
+        const preferences = this.buildBindingPreferencesWithOverrides(
+          recentDetached.preferences,
+          overrides,
+          parsed.requestedModel,
+        );
+        const bindResult = await this.requestConversationBinding(
+          conversation,
+          {
+            threadId: recentDetached.threadId,
+            workspaceDir: recentDetached.workspaceDir,
+            permissionsMode: this.resolveRequestedPermissionsMode(
+              normalizePermissionsMode(recentDetached.permissionsMode),
+              parsed.requestedYolo,
+            ),
+            threadTitle: recentDetached.threadTitle,
+            syncTopic: parsed.syncTopic,
+            preferences,
+            notifyBound: true,
+          },
+          bindingApi.requestConversationBinding,
+        );
+        if (bindResult.status === "pending") {
+          return bindResult.reply;
+        }
+        if (bindResult.status === "error") {
+          return { text: bindResult.message };
+        }
+        await this.store.upsertBinding(bindResult.binding);
+        await this.sendBoundConversationNotifications(conversation);
+        return { text: "Bound this conversation to Codex." };
+      }
     }
     if (parsed.listProjects || !parsed.query) {
       const passthroughArgs = formatThreadSelectionFlags(parsed);
@@ -2221,6 +2386,7 @@ export class CodexPluginController {
     if (bindResult.status === "error") {
       return { text: bindResult.message };
     }
+    await this.store.upsertBinding(bindResult.binding);
     if (parsed.syncTopic) {
       const syncedName = buildResumeTopicName({
         title: getThreadDisplayTitle(selection.thread),
@@ -2232,7 +2398,7 @@ export class CodexPluginController {
       }
     }
     await this.sendBoundConversationNotifications(conversation);
-    return {};
+    return { text: "Bound this conversation to Codex." };
   }
 
   private async handleStatusCommand(
@@ -6642,8 +6808,18 @@ export class CodexPluginController {
     conversation: ConversationTarget,
   ): Promise<HydratedBindingOutcome | null> {
     const bindingsApi = this.api.runtime.channel.bindings;
-    const resolveByConversation = bindingsApi?.resolveByConversation;
+    const legacyResolveByConversation = bindingsApi?.resolveByConversation;
+    const bindingService = getSessionBindingService();
+    const resolveByConversation =
+      typeof legacyResolveByConversation === "function"
+        ? legacyResolveByConversation.bind(bindingsApi)
+        : bindingService.resolveByConversation.bind(bindingService);
     if (typeof resolveByConversation !== "function") {
+      const bindingKeys =
+        bindingsApi && typeof bindingsApi === "object" ? Object.keys(bindingsApi).join(",") : "<none>";
+      this.api.logger.warn?.(
+        `codex runtime binding recovery unavailable ${this.formatConversationForLog(conversation)} bindingsApiKeys=${bindingKeys}`,
+      );
       return null;
     }
     const runtimeConversation = toRuntimeBindingConversationRef(conversation);
@@ -6658,10 +6834,38 @@ export class CodexPluginController {
       typeof metadata?.threadId === "string" ? metadata.threadId.trim() : "";
     const threadId = threadIdFromMetadata || parseThreadIdFromSessionKey(sessionKey) || "";
     const isOwnedBinding = metadataPluginId === PLUGIN_ID || Boolean(parseThreadIdFromSessionKey(sessionKey));
-    if (!runtimeBinding || !isOwnedBinding) {
+    if (!runtimeBinding) {
+      this.api.logger.warn?.(
+        `codex runtime binding recovery miss ${this.formatConversationForLog(conversation)}`,
+      );
+      return null;
+    }
+    if (!isOwnedBinding) {
+      this.api.logger.warn?.(
+        `codex runtime binding recovery resolved foreign binding ${this.formatConversationForLog(conversation)} metadataPluginId=${metadataPluginId || "<none>"} sessionKey=${sessionKey || "<none>"}`,
+      );
       return null;
     }
     if (!threadId || !sessionKey) {
+      const pluginBinding = await getCurrentPluginConversationBinding({
+        pluginRoot: PLUGIN_ROOT,
+        conversation: runtimeConversation,
+      });
+      const recovered = parseBindingRecoveryPayload(pluginBinding?.summary);
+      if (recovered) {
+        this.api.logger.info?.(
+          `codex runtime binding recovery restored from plugin binding summary ${this.formatConversationForLog(conversation)} threadId=${recovered.threadId} workspace=${recovered.workspaceDir}`,
+        );
+        const binding = await this.bindConversation(conversation, {
+          threadId: recovered.threadId,
+          workspaceDir: recovered.workspaceDir,
+          threadTitle: recovered.threadTitle,
+        });
+        return { binding };
+      }
+      this.api.logger.warn?.(
+        `codex runtime binding recovery missing runtime identifiers ${this.formatConversationForLog(conversation)} threadId=${threadId || "<none>"} sessionKey=${sessionKey || "<none>"}`,
+      );
       return {
         desyncMessage: this.buildBindingDesyncMessage({ threadId: threadId || undefined }),
         threadId: threadId || undefined,
@@ -6677,12 +6881,18 @@ export class CodexPluginController {
       permissionsMode = recovered.permissionsMode ?? permissionsMode;
     }
     if (!workspaceDir) {
+      this.api.logger.warn?.(
+        `codex runtime binding recovery missing workspace ${this.formatConversationForLog(conversation)} threadId=${threadId} sessionKey=${sessionKey}`,
+      );
       return {
         desyncMessage: this.buildBindingDesyncMessage({ threadId }),
         threadId,
         sessionKey,
       };
     }
+    this.api.logger.info?.(
+      `codex runtime binding recovered ${this.formatConversationForLog(conversation)} threadId=${threadId} workspace=${workspaceDir}`,
+    );
     const binding = await this.bindConversation(conversation, {
       threadId,
       workspaceDir,
@@ -6749,7 +6959,11 @@ export class CodexPluginController {
       };
     }
     const approval = await requestBinding({
-      summary: `Bind this conversation to Codex thread ${params.threadTitle?.trim() || params.threadId}.`,
+      summary: `Bind this conversation to Codex thread ${params.threadTitle?.trim() || params.threadId}. ${encodeBindingRecoveryPayload({
+        threadId: params.threadId,
+        workspaceDir: params.workspaceDir,
+        threadTitle: params.threadTitle,
+      })}`,
     });
     if (approval.status !== "bound") {
       if (approval.status === "pending") {
@@ -7621,6 +7835,9 @@ export class CodexPluginController {
 
   private async unbindConversation(conversation: ConversationTarget): Promise<void> {
     const binding = this.store.getBinding(conversation);
+    if (binding) {
+      await this.store.rememberDetachedThread(binding);
+    }
     if (binding?.pinnedBindingMessage) {
       await this.unpinStoredBindingMessage(binding);
     }

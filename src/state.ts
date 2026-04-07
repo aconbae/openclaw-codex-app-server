@@ -8,6 +8,7 @@ import type {
   ConversationTarget,
   ConversationPreferences,
   PermissionsMode,
+  RecentDetachedThread,
   StoreSnapshot,
   StoredBinding,
   StoredPendingBind,
@@ -204,6 +205,7 @@ function cloneSnapshot(value?: Partial<StoreSnapshot>): StoreSnapshot {
   return {
     version: STORE_VERSION,
     bindings: value?.bindings ?? [],
+    recentDetachedThreads: value?.recentDetachedThreads ?? [],
     pendingBinds: value?.pendingBinds ?? [],
     pendingRequests: value?.pendingRequests ?? [],
     callbacks: value?.callbacks ?? [],
@@ -354,6 +356,42 @@ export class PluginStateStore {
     return this.snapshot.bindings.find((entry) => toConversationKey(entry.conversation) === key) ?? null;
   }
 
+  getRecentDetachedThread(target: ConversationTarget): RecentDetachedThread | null {
+    const key = toConversationKey(target);
+    return (
+      this.snapshot.recentDetachedThreads.find(
+        (entry) => toConversationKey(entry.conversation) === key,
+      ) ?? null
+    );
+  }
+
+  async rememberDetachedThread(binding: StoredBinding): Promise<void> {
+    const key = toConversationKey(binding.conversation);
+    const now = Date.now();
+    const entry: RecentDetachedThread = {
+      conversation: binding.conversation,
+      sessionKey: binding.sessionKey,
+      threadId: binding.threadId,
+      workspaceDir: binding.workspaceDir,
+      permissionsMode: binding.permissionsMode,
+      pendingPermissionsMode: binding.pendingPermissionsMode,
+      threadTitle: binding.threadTitle,
+      pinnedBindingMessage: binding.pinnedBindingMessage,
+      contextUsage: binding.contextUsage,
+      preferences: binding.preferences,
+      detachedAt: now,
+      updatedAt: now,
+    };
+    this.snapshot.recentDetachedThreads = [
+      entry,
+      ...this.snapshot.recentDetachedThreads.filter(
+        (current) =>
+          !(toConversationKey(current.conversation) === key && current.threadId === entry.threadId),
+      ),
+    ].slice(0, 50);
+    await this.save();
+  }
+
   async upsertBinding(binding: StoredBinding): Promise<void> {
     const key = toConversationKey(binding.conversation);
     this.snapshot.bindings = this.snapshot.bindings.filter(
@@ -361,6 +399,13 @@ export class PluginStateStore {
     );
     this.snapshot.pendingBinds = this.snapshot.pendingBinds.filter(
       (entry) => toConversationKey(entry.conversation) !== key,
+    );
+    this.snapshot.recentDetachedThreads = this.snapshot.recentDetachedThreads.filter(
+      (entry) =>
+        !(
+          toConversationKey(entry.conversation) === key &&
+          entry.threadId === binding.threadId
+        ),
     );
     this.snapshot.bindings.push(binding);
     await this.save();

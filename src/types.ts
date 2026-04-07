@@ -2,7 +2,7 @@ import type { ConversationRef, PluginInteractiveButtons } from "openclaw/plugin-
 
 export const PLUGIN_ID = "openclaw-codex-app-server";
 export const INTERACTIVE_NAMESPACE = "codexapp";
-export const STORE_VERSION = 2;
+export const STORE_VERSION = 3;
 export const CALLBACK_TOKEN_BYTES = 9;
 export const CALLBACK_TTL_MS = 30 * 60_000;
 export const PENDING_INPUT_TTL_MS = 7 * 24 * 60 * 60_000;
@@ -281,6 +281,21 @@ export type StoredBinding = {
   pinnedBindingMessage?: InteractiveMessageRef;
   contextUsage?: ContextUsageSnapshot;
   preferences?: ConversationPreferences;
+  updatedAt: number;
+};
+
+export type RecentDetachedThread = {
+  conversation: ConversationRef;
+  sessionKey: string;
+  threadId: string;
+  workspaceDir: string;
+  permissionsMode?: PermissionsMode;
+  pendingPermissionsMode?: PermissionsMode;
+  threadTitle?: string;
+  pinnedBindingMessage?: InteractiveMessageRef;
+  contextUsage?: ContextUsageSnapshot;
+  preferences?: ConversationPreferences;
+  detachedAt: number;
   updatedAt: number;
 };
 
@@ -563,6 +578,7 @@ export type CallbackAction =
 export type StoreSnapshot = {
   version: number;
   bindings: StoredBinding[];
+  recentDetachedThreads: RecentDetachedThread[];
   pendingBinds: StoredPendingBind[];
   pendingRequests: StoredPendingRequest[];
   callbacks: CallbackAction[];
