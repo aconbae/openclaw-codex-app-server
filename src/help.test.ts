@@ -2,11 +2,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawPluginApi, PluginCommandContext } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi, PluginCommandContext } from "./openclaw-types.js";
 import { CodexAppServerClient } from "./client.js";
 import { COMMANDS } from "./commands.js";
 import { CodexPluginController } from "./controller.js";
 import { COMMAND_HELP, renderCommandHelpText } from "./help.js";
+
+type RelaxedCommandContextOverrides = Partial<
+  Omit<PluginCommandContext, "requestConversationBinding" | "getCurrentConversationBinding">
+> & {
+  requestConversationBinding?: (...args: unknown[]) => Promise<unknown>;
+  getCurrentConversationBinding?: () => Promise<unknown>;
+};
 
 function createApiMock(): OpenClawPluginApi {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-help-test-"));
@@ -42,7 +49,7 @@ function createApiMock(): OpenClawPluginApi {
 }
 
 function buildDiscordCommandContext(
-  overrides: Partial<PluginCommandContext> & Record<string, unknown> = {},
+  overrides: RelaxedCommandContextOverrides & Record<string, unknown> = {},
 ): PluginCommandContext {
   return {
     senderId: "user-1",

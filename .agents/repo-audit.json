@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "closeout": {
+    "clean_worktree_required": true
+  },
+  "gates": {
+    "mandatory": []
+  },
+  "runtime": {
+    "go": {
+      "refresh_proof_required": false
+    }
+  },
+  "spec": {
+    "system": "none",
+    "archive_required": false
+  }
+}

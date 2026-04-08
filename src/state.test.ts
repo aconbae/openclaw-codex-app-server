@@ -281,6 +281,81 @@ describe("state store", () => {
     expect(binding?.permissionsMode).toBe("full-access");
   });
 
+  it("normalizes duplicate Telegram chat bindings across reload", async () => {
+    const dir = await makeStoreDir();
+    const stateDir = path.join(dir, "openclaw-codex-app-server");
+    await fs.mkdir(stateDir, { recursive: true });
+    await fs.writeFile(
+      path.join(stateDir, "state.json"),
+      `${JSON.stringify({
+        version: 3,
+        bindings: [
+          {
+            conversation: {
+              channel: "telegram",
+              accountId: "default",
+              conversationId: "5170171897",
+            },
+            sessionKey: buildPluginSessionKey("thread-1"),
+            threadId: "thread-1",
+            workspaceDir: "/tmp/work-a",
+            contextUsage: {
+              totalTokens: 100,
+              contextWindow: 1000,
+              remainingPercent: 90,
+            },
+            updatedAt: 1,
+          },
+          {
+            conversation: {
+              channel: "telegram",
+              accountId: "default",
+              conversationId: "5170171897",
+              parentConversationId: "5170171897",
+            },
+            sessionKey: buildPluginSessionKey("thread-1"),
+            threadId: "thread-1",
+            workspaceDir: "/tmp/work-b",
+            pinnedBindingMessage: {
+              provider: "telegram",
+              messageId: "99",
+              chatId: "5170171897",
+            },
+            updatedAt: 2,
+          },
+        ],
+        pendingBinds: [],
+        pendingRequests: [],
+        callbacks: [],
+      }, null, 2)}\n`,
+      "utf8",
+    );
+
+    const reloaded = await makeStore(dir);
+    const binding = reloaded.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "5170171897",
+      parentConversationId: "5170171897",
+    });
+
+    expect(reloaded.listBindings()).toHaveLength(1);
+    expect(binding).toEqual(
+      expect.objectContaining({
+        workspaceDir: "/tmp/work-b",
+        contextUsage: expect.objectContaining({
+          totalTokens: 100,
+        }),
+        pinnedBindingMessage: {
+          provider: "telegram",
+          messageId: "99",
+          chatId: "5170171897",
+        },
+      }),
+    );
+    expect(binding?.conversation.parentConversationId).toBeUndefined();
+  });
+
   it("migrates legacy profile and permission fields into permissions mode", async () => {
     const dir = await makeStoreDir();
     const stateDir = path.join(dir, "openclaw-codex-app-server");

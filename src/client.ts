@@ -3,7 +3,7 @@ import * as path from "node:path";
 import readline from "node:readline";
 import { promisify } from "node:util";
 import WebSocket from "ws";
-import type { PluginLogger } from "openclaw/plugin-sdk";
+import type { PluginLogger } from "./openclaw-types.js";
 import { modelSupportsFast, modelSupportsReasoning } from "./model-capabilities.js";
 import { createPendingInputState, parseCodexUserInput } from "./pending-input.js";
 import {
@@ -81,6 +81,7 @@ const ASSISTANT_UPDATE_BATCH_MS = 250;
 const TRAILING_NOTIFICATION_SETTLE_MS = 1000;
 const TURN_STEER_METHODS = ["turn/steer"] as const;
 const TURN_INTERRUPT_METHODS = ["turn/interrupt"] as const;
+const CODEX_CHILD_ENV_DENYLIST = ["OPENAI_API_KEY"] as const;
 const execFileAsync = promisify(execFile);
 
 type StartupProbeInfo = {
@@ -118,6 +119,35 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     return null;
   }
   return value as Record<string, unknown>;
+}
+
+function omitEnvKeysCaseInsensitive(
+  baseEnv: NodeJS.ProcessEnv,
+  keys: Iterable<string>,
+): NodeJS.ProcessEnv {
+  const env = { ...baseEnv };
+  const denied = new Set<string>();
+  for (const key of keys) {
+    const normalizedKey = key.trim();
+    if (normalizedKey) {
+      denied.add(normalizedKey.toUpperCase());
+    }
+  }
+  if (denied.size === 0) {
+    return env;
+  }
+  for (const actualKey of Object.keys(env)) {
+    if (denied.has(actualKey.toUpperCase())) {
+      delete env[actualKey];
+    }
+  }
+  return env;
+}
+
+function buildCodexAppServerChildEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  // The Codex child should use its own login state instead of inheriting the host's
+  // OpenAI provider key and silently switching to API-key billing.
+  return omitEnvKeysCaseInsensitive(baseEnv, CODEX_CHILD_ENV_DENYLIST);
 }
 
 function pickString(
@@ -659,9 +689,10 @@ class StdioJsonRpcClient implements JsonRpcClient {
     if (this.process) {
       return;
     }
+    const childEnv = buildCodexAppServerChildEnv();
     const child = spawn(this.command, ["app-server", ...this.args], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: childEnv,
     });
     if (!child.stdin || !child.stdout || !child.stderr) {
       throw new Error("codex app server stdio pipes unavailable");
@@ -1363,21 +1394,35 @@ function extractConversationMessages(
 
 function extractThreadReplayFromReadResult(value: unknown): ThreadReplay {
   const messages = extractConversationMessages(value);
-  let lastUserMessage: string | undefined;
-  let lastAssistantMessage: string | undefined;
+  let lastUserIndex = -1;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (!lastAssistantMessage && message?.role === "assistant") {
-      lastAssistantMessage = message.text;
-    }
-    if (!lastUserMessage && message?.role === "user") {
-      lastUserMessage = message.text;
-    }
-    if (lastUserMessage && lastAssistantMessage) {
+    if (messages[index]?.role === "user") {
+      lastUserIndex = index;
       break;
     }
   }
+
+  const lastUserMessage = lastUserIndex >= 0 ? messages[lastUserIndex]?.text : undefined;
+  let lastAssistantMessage: string | undefined;
+  if (lastUserIndex >= 0) {
+    for (let index = lastUserIndex + 1; index < messages.length; index += 1) {
+      if (messages[index]?.role === "assistant") {
+        lastAssistantMessage = messages[index].text;
+      }
+    }
+  } else {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.role === "assistant") {
+        lastAssistantMessage = messages[index].text;
+        break;
+      }
+    }
+  }
   return { lastUserMessage, lastAssistantMessage };
+}
+
+function normalizeReplayMatchText(text: string | undefined): string {
+  return text?.trim().replace(/\s+/g, " ") ?? "";
 }
 
 function normalizeApprovalFilePath(rawPath: string, workspaceDir?: string): string {
@@ -3497,6 +3542,19 @@ export class CodexAppServerClient {
     let terminalError: TurnTerminalError | undefined;
     let approvalCancelled = false;
     let notificationQueue = Promise.resolve();
+    const existingThreadAtStart = Boolean(params.existingThreadId?.trim());
+    const bufferedNotifications: Array<{
+      method: string;
+      notificationParams: unknown;
+      ids: ReturnType<typeof extractIds>;
+    }> = [];
+    const bufferedRequests: Array<{
+      method: string;
+      requestParams: unknown;
+      ids: ReturnType<typeof extractIds>;
+      resolve: (value: unknown) => void;
+      reject: (error: unknown) => void;
+    }> = [];
     const pendingInputCoordinator = createPendingInputCoordinator({
       onPendingInput: params.onPendingInput,
       onActivated: () => {
@@ -3551,131 +3609,149 @@ export class CodexAppServerClient {
     const connectionPromise = this.ensureConnected();
     const getClient = async () => (await connectionPromise).client;
 
-    const removeNotificationListener = this.addNotificationListener((method, notificationParams) => {
-      const next = notificationQueue.then(async () => {
-        const methodLower = method.trim().toLowerCase();
-        const ids = extractIds(notificationParams);
-        if (ids.threadId && threadId && ids.threadId !== threadId) {
-          return;
-        }
-        threadId ||= ids.threadId ?? "";
-        turnId ||= ids.runId ?? "";
-        const tokenUsage = extractThreadTokenUsageSnapshot(notificationParams);
-        if (tokenUsage) {
-          latestContextUsage = tokenUsage;
-        }
-        if (methodLower === "item/started") {
-          const fileEditSummaries = extractFileEditSummariesFromNotification(
-            notificationParams,
-            params.workspaceDir,
-          );
-          if (fileEditSummaries.length > 0) {
-            fileEditNoticeBatcher.add(fileEditSummaries);
-            return;
-          }
-        }
-        if (methodLower === "serverrequest/resolved") {
-          await pendingInputCoordinator.clearCurrent();
-          return;
-        }
-        if (methodLower === "turn/plan/updated") {
-          const planUpdate = extractTurnPlanUpdate(notificationParams);
-          planExplanation = planUpdate.explanation?.trim() ?? planExplanation;
-          if (planUpdate.steps.length > 0) {
-            planSteps = planUpdate.steps;
-          }
-        }
-        if (methodLower === "item/plan/delta") {
-          const planDelta = extractPlanDeltaNotification(notificationParams);
-          if (planDelta.itemId && planDelta.delta) {
-            const existing = planDraftByItemId.get(planDelta.itemId) ?? "";
-            planDraftByItemId.set(planDelta.itemId, `${existing}${planDelta.delta}`);
-          }
-          return;
-        }
-        if (methodLower === "item/completed") {
-          const completedPlan = extractCompletedPlanText(notificationParams);
-          if (completedPlan.text?.trim()) {
-            finalPlanMarkdown = completedPlan.text.trim();
-            if (completedPlan.itemId) {
-              planDraftByItemId.set(completedPlan.itemId, finalPlanMarkdown);
-            }
-            return;
-          }
-        }
-        const assistantNotification = extractAssistantNotificationText(methodLower, notificationParams);
-        const assistantPreview = assistantNotification.text.trim();
-        if (assistantPreview && !sawAssistantOutput) {
-          sawAssistantOutput = true;
-          this.logger.debug(
-            `codex turn first assistant output run=${params.runId} thread=${threadId || "<pending>"} turn=${turnId || "<pending>"} method=${methodLower} chars=${assistantPreview.length} preview="${summarizeTextForLog(assistantPreview, 80)}"`,
-          );
-        }
-        if (
-          assistantNotification.itemId &&
-          assistantItemId &&
-          assistantNotification.itemId !== assistantItemId
-        ) {
-          assistantText = "";
-        }
-        if (assistantNotification.itemId) {
-          assistantItemId = assistantNotification.itemId;
-        }
-        if (assistantNotification.mode === "delta" && assistantNotification.text) {
-          assistantText =
-            assistantText && assistantNotification.text.startsWith(assistantText)
-              ? assistantNotification.text
-              : `${assistantText}${assistantNotification.text}`;
-          const currentAssistantText = assistantText.trim();
-          if (currentAssistantText) {
-            lastAssistantText = currentAssistantText;
-          }
-        } else if (assistantNotification.mode === "snapshot" && assistantNotification.text) {
-          const snapshotText = assistantNotification.text.trim();
-          if (snapshotText) {
-            assistantText = snapshotText;
-            lastAssistantText = snapshotText;
-          }
-        }
-        const liveAssistantText = assistantText.trim() || lastAssistantText.trim();
-        if (liveAssistantText) {
-          assistantTextUpdateBatcher.update(liveAssistantText, {
-            immediate: assistantNotification.mode === "snapshot",
-          });
-        }
-        if (
-          methodLower === "turn/completed" ||
-          methodLower === "turn/failed" ||
-          methodLower === "turn/cancelled"
-        ) {
-          terminalNotificationSeen = true;
-          const terminalAssistantText = extractAssistantTextFromTerminalPayload(method, notificationParams).trim();
-          if (terminalAssistantText) {
-            assistantText = terminalAssistantText;
-            lastAssistantText = terminalAssistantText;
-          }
-          const terminalState = extractTurnTerminalState(method, notificationParams);
-          terminalStatus = terminalState?.status ?? terminalStatus;
-          terminalError = terminalState?.error ?? terminalError;
-          await fileEditNoticeBatcher.flush();
-          await assistantTextUpdateBatcher.flush();
-          this.logger.debug(
-            `codex turn terminal notification run=${params.runId} thread=${threadId || "<pending>"} turn=${turnId || "<pending>"} method=${methodLower}`,
-          );
-          settleCompletionSoon();
-          return;
-        }
-        if (terminalNotificationSeen) {
-          settleCompletionSoon();
-        }
-      });
-      notificationQueue = next.catch((error: unknown) => {
-        this.logger.debug(`codex turn notification handling failed: ${String(error)}`);
-      });
-      return next;
-    });
+    const shouldBufferPreStartRunEvent = (ids: ReturnType<typeof extractIds>): boolean =>
+      existingThreadAtStart &&
+      !turnId &&
+      Boolean(threadId) &&
+      ids.threadId === threadId &&
+      Boolean(ids.runId);
 
-    const removeRequestListener = this.addRequestListener(async (method, requestParams) => {
+    const drainBufferedRequests = (value: unknown) => {
+      const pending = bufferedRequests.splice(0);
+      for (const request of pending) {
+        request.resolve(value);
+      }
+    };
+
+    const handleTurnNotification = async (method: string, notificationParams: unknown) => {
+      const methodLower = method.trim().toLowerCase();
+      const ids = extractIds(notificationParams);
+      if (ids.threadId && threadId && ids.threadId !== threadId) {
+        return;
+      }
+      if (ids.runId && turnId && ids.runId !== turnId) {
+        this.logger.debug(
+          `codex turn ignored notification from stale run run=${params.runId} thread=${threadId || "<pending>"} expectedTurn=${turnId} actualTurn=${ids.runId} method=${methodLower}`,
+        );
+        return;
+      }
+      if (shouldBufferPreStartRunEvent(ids)) {
+        bufferedNotifications.push({ method, notificationParams, ids });
+        return;
+      }
+      threadId ||= ids.threadId ?? "";
+      turnId ||= ids.runId ?? "";
+      const tokenUsage = extractThreadTokenUsageSnapshot(notificationParams);
+      if (tokenUsage) {
+        latestContextUsage = tokenUsage;
+      }
+      if (methodLower === "item/started") {
+        const fileEditSummaries = extractFileEditSummariesFromNotification(
+          notificationParams,
+          params.workspaceDir,
+        );
+        if (fileEditSummaries.length > 0) {
+          fileEditNoticeBatcher.add(fileEditSummaries);
+          return;
+        }
+      }
+      if (methodLower === "serverrequest/resolved") {
+        await pendingInputCoordinator.clearCurrent();
+        return;
+      }
+      if (methodLower === "turn/plan/updated") {
+        const planUpdate = extractTurnPlanUpdate(notificationParams);
+        planExplanation = planUpdate.explanation?.trim() ?? planExplanation;
+        if (planUpdate.steps.length > 0) {
+          planSteps = planUpdate.steps;
+        }
+      }
+      if (methodLower === "item/plan/delta") {
+        const planDelta = extractPlanDeltaNotification(notificationParams);
+        if (planDelta.itemId && planDelta.delta) {
+          const existing = planDraftByItemId.get(planDelta.itemId) ?? "";
+          planDraftByItemId.set(planDelta.itemId, `${existing}${planDelta.delta}`);
+        }
+        return;
+      }
+      if (methodLower === "item/completed") {
+        const completedPlan = extractCompletedPlanText(notificationParams);
+        if (completedPlan.text?.trim()) {
+          finalPlanMarkdown = completedPlan.text.trim();
+          if (completedPlan.itemId) {
+            planDraftByItemId.set(completedPlan.itemId, finalPlanMarkdown);
+          }
+          return;
+        }
+      }
+      const assistantNotification = extractAssistantNotificationText(methodLower, notificationParams);
+      const assistantPreview = assistantNotification.text.trim();
+      if (assistantPreview && !sawAssistantOutput) {
+        sawAssistantOutput = true;
+        this.logger.debug(
+          `codex turn first assistant output run=${params.runId} thread=${threadId || "<pending>"} turn=${turnId || "<pending>"} method=${methodLower} chars=${assistantPreview.length} preview="${summarizeTextForLog(assistantPreview, 80)}"`,
+        );
+      }
+      if (
+        assistantNotification.itemId &&
+        assistantItemId &&
+        assistantNotification.itemId !== assistantItemId
+      ) {
+        assistantText = "";
+      }
+      if (assistantNotification.itemId) {
+        assistantItemId = assistantNotification.itemId;
+      }
+      if (assistantNotification.mode === "delta" && assistantNotification.text) {
+        assistantText =
+          assistantText && assistantNotification.text.startsWith(assistantText)
+            ? assistantNotification.text
+            : `${assistantText}${assistantNotification.text}`;
+        const currentAssistantText = assistantText.trim();
+        if (currentAssistantText) {
+          lastAssistantText = currentAssistantText;
+        }
+      } else if (assistantNotification.mode === "snapshot" && assistantNotification.text) {
+        const snapshotText = assistantNotification.text.trim();
+        if (snapshotText) {
+          assistantText = snapshotText;
+          lastAssistantText = snapshotText;
+        }
+      }
+      const liveAssistantText = assistantText.trim() || lastAssistantText.trim();
+      if (liveAssistantText) {
+        assistantTextUpdateBatcher.update(liveAssistantText, {
+          immediate: assistantNotification.mode === "snapshot",
+        });
+      }
+      if (
+        methodLower === "turn/completed" ||
+        methodLower === "turn/failed" ||
+        methodLower === "turn/cancelled"
+      ) {
+        terminalNotificationSeen = true;
+        const terminalAssistantText = extractAssistantTextFromTerminalPayload(method, notificationParams).trim();
+        if (terminalAssistantText) {
+          assistantText = terminalAssistantText;
+          lastAssistantText = terminalAssistantText;
+        }
+        const terminalState = extractTurnTerminalState(method, notificationParams);
+        terminalStatus = terminalState?.status ?? terminalStatus;
+        terminalError = terminalState?.error ?? terminalError;
+        await fileEditNoticeBatcher.flush();
+        await assistantTextUpdateBatcher.flush();
+        this.logger.debug(
+          `codex turn terminal notification run=${params.runId} thread=${threadId || "<pending>"} turn=${turnId || "<pending>"} method=${methodLower}`,
+        );
+        settleCompletionSoon();
+        return;
+      }
+      if (terminalNotificationSeen) {
+        settleCompletionSoon();
+      }
+    };
+
+    const handleTurnRequest = async (method: string, requestParams: unknown) => {
       const methodLower = method.trim().toLowerCase();
       if (!isInteractiveServerRequest(method)) {
         return UNHANDLED_REQUEST;
@@ -3683,6 +3759,17 @@ export class CodexAppServerClient {
       const ids = extractIds(requestParams);
       if (ids.threadId && threadId && ids.threadId !== threadId) {
         return UNHANDLED_REQUEST;
+      }
+      if (ids.runId && turnId && ids.runId !== turnId) {
+        this.logger.debug(
+          `codex turn ignored interactive request from stale run run=${params.runId} thread=${threadId || "<pending>"} expectedTurn=${turnId} actualTurn=${ids.runId} method=${methodLower}`,
+        );
+        return UNHANDLED_REQUEST;
+      }
+      if (shouldBufferPreStartRunEvent(ids)) {
+        return await new Promise((resolve, reject) => {
+          bufferedRequests.push({ method, requestParams, ids, resolve, reject });
+        });
       }
       threadId ||= ids.threadId ?? "";
       turnId ||= ids.runId ?? "";
@@ -3753,6 +3840,52 @@ export class CodexAppServerClient {
         );
       }
       return mappedResponse;
+    };
+
+    const flushBufferedRunEvents = async () => {
+      if (!turnId) {
+        drainBufferedRequests(UNHANDLED_REQUEST);
+        bufferedNotifications.length = 0;
+        return;
+      }
+      const pendingNotifications = bufferedNotifications.splice(0);
+      for (const pending of pendingNotifications) {
+        if (pending.ids.runId && pending.ids.runId !== turnId) {
+          this.logger.debug(
+            `codex turn dropped buffered notification from stale run run=${params.runId} thread=${threadId || "<pending>"} expectedTurn=${turnId} actualTurn=${pending.ids.runId} method=${pending.method.trim().toLowerCase()}`,
+          );
+          continue;
+        }
+        await handleTurnNotification(pending.method, pending.notificationParams);
+      }
+      const pendingRequests = bufferedRequests.splice(0);
+      for (const pending of pendingRequests) {
+        if (pending.ids.runId && pending.ids.runId !== turnId) {
+          this.logger.debug(
+            `codex turn dropped buffered interactive request from stale run run=${params.runId} thread=${threadId || "<pending>"} expectedTurn=${turnId} actualTurn=${pending.ids.runId} method=${pending.method.trim().toLowerCase()}`,
+          );
+          pending.resolve(UNHANDLED_REQUEST);
+          continue;
+        }
+        void handleTurnRequest(pending.method, pending.requestParams).then(
+          pending.resolve,
+          pending.reject,
+        );
+      }
+    };
+
+    const removeNotificationListener = this.addNotificationListener((method, notificationParams) => {
+      const next = notificationQueue.then(async () => {
+        await handleTurnNotification(method, notificationParams);
+      });
+      notificationQueue = next.catch((error: unknown) => {
+        this.logger.debug(`codex turn notification handling failed: ${String(error)}`);
+      });
+      return next;
+    });
+
+    const removeRequestListener = this.addRequestListener(async (method, requestParams) => {
+      return await handleTurnRequest(method, requestParams);
     });
 
     const handleResult = (async () => {
@@ -3858,6 +3991,7 @@ export class CodexAppServerClient {
         const startedIds = extractIds(started);
         threadId ||= startedIds.threadId ?? "";
         turnId ||= startedIds.runId ?? "";
+        await flushBufferedRunEvents();
         this.logger.debug(
           `codex turn started run=${params.runId} thread=${threadId || "<none>"} turn=${turnId || "<none>"}`,
         );
@@ -3868,6 +4002,7 @@ export class CodexAppServerClient {
         let resolvedAssistantText = assistantText.trim() || lastAssistantText.trim();
         if (!resolvedAssistantText && threadId && !interrupted) {
           let recoveredAssistantText = "";
+          const expectedPrompt = normalizeReplayMatchText(params.prompt);
           for (let attempt = 1; attempt <= 3 && !recoveredAssistantText; attempt += 1) {
             const replay = await readThreadReplayWithClient({
               client,
@@ -3879,6 +4014,20 @@ export class CodexAppServerClient {
               );
               return undefined;
             });
+            const replayUserText = normalizeReplayMatchText(replay?.lastUserMessage);
+            const replayMatchesCurrentTurn =
+              !existingThreadAtStart ||
+              !expectedPrompt ||
+              replayUserText === expectedPrompt;
+            if (!replayMatchesCurrentTurn) {
+              this.logger.debug(
+                `codex turn completion ignored thread/read assistant replay from older turn run=${params.runId} thread=${threadId} turn=${turnId || "<none>"} attempt=${attempt} expectedUser="${summarizeTextForLog(expectedPrompt, 80)}" actualUser="${summarizeTextForLog(replayUserText, 80)}"`,
+              );
+              if (attempt < 3) {
+                await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
+              }
+              continue;
+            }
             recoveredAssistantText = replay?.lastAssistantMessage?.trim() || "";
             if (!recoveredAssistantText && attempt < 3) {
               await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
@@ -3927,6 +4076,7 @@ export class CodexAppServerClient {
           usage: latestContextUsage,
         } satisfies TurnResult;
       } catch (error) {
+        drainBufferedRequests(UNHANDLED_REQUEST);
         if (isTransportClosedError(error)) {
           this.clearConnectionState();
         }
@@ -3939,6 +4089,7 @@ export class CodexAppServerClient {
 
     return {
       result: handleResult.finally(() => {
+        drainBufferedRequests(UNHANDLED_REQUEST);
         removeNotificationListener();
         removeRequestListener();
       }),
@@ -4097,6 +4248,11 @@ export class CodexAppServerModeClient {
     );
   }
 
+  async closeProfile(profile: PermissionsMode): Promise<void> {
+    const client = this.clients[profile];
+    await client?.close().catch(() => undefined);
+  }
+
   async listThreads(params: ProfiledParams<Parameters<CodexAppServerClient["listThreads"]>[0]>) {
     return await this.getClient(params.profile).listThreads(params);
   }
@@ -4190,6 +4346,7 @@ export const __testing = {
   buildThreadResumePayloads,
   buildTurnStartPayloads,
   buildTurnSteerPayloads,
+  buildCodexAppServerChildEnv,
   createFileEditNoticeBatcher,
   createPendingInputCoordinator,
   extractApprovalDecision,

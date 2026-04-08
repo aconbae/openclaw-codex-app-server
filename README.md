@@ -30,6 +30,7 @@ Buttons are presented for project and thread selection, model switching, and ski
 ## Install In OpenClaw
 
 These are the intended install commands for OpenClaw `2026.3.22` and newer.
+The current wrapper/runtime audit in this repo was last re-verified against OpenClaw `2026.4.8` on 2026-04-08.
 
 Compatibility:
 

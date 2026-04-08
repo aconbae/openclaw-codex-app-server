@@ -8,7 +8,6 @@ import type {
   ConversationTarget,
   ConversationPreferences,
   PermissionsMode,
-  RecentDetachedThread,
   StoreSnapshot,
   StoredBinding,
   StoredPendingBind,
@@ -192,20 +191,85 @@ type PutCallbackInput =
     };
 
 function toConversationKey(target: ConversationTarget): string {
-  const channel = target.channel.trim().toLowerCase();
+  const normalized = normalizeConversationTarget(target);
+  const channel = normalized.channel.trim().toLowerCase();
   return [
     channel,
-    target.accountId.trim(),
-    target.conversationId.trim(),
-    channel === "telegram" ? (target.parentConversationId?.trim() ?? "") : "",
+    normalized.accountId.trim(),
+    normalized.conversationId.trim(),
+    channel === "telegram" ? "" : normalized.parentConversationId?.trim() ?? "",
   ].join("::");
+}
+
+function normalizeConversationTarget<T extends ConversationTarget>(target: T): T {
+  const channel = target.channel.trim().toLowerCase();
+  if (channel !== "telegram") {
+    return {
+      ...target,
+      channel,
+      accountId: target.accountId.trim(),
+      conversationId: target.conversationId.trim(),
+      parentConversationId: target.parentConversationId?.trim() || undefined,
+    };
+  }
+  const conversationId = target.conversationId.trim();
+  const topicMarker = ":topic:";
+  const topicIndex = conversationId.indexOf(topicMarker);
+  if (topicIndex === -1) {
+    return {
+      ...target,
+      channel: "telegram",
+      accountId: target.accountId.trim(),
+      conversationId,
+      parentConversationId: undefined,
+    };
+  }
+  const baseConversationId = conversationId.slice(0, topicIndex);
+  return {
+    ...target,
+    channel: "telegram",
+    accountId: target.accountId.trim(),
+    conversationId,
+    parentConversationId: target.parentConversationId?.trim() || baseConversationId,
+  };
+}
+
+function pickLatestByUpdatedAt<T extends { updatedAt?: number }>(left: T, right: T): T {
+  return (right.updatedAt ?? 0) >= (left.updatedAt ?? 0) ? right : left;
+}
+
+function normalizeBinding(binding: StoredBinding): StoredBinding {
+  return {
+    ...binding,
+    conversation: normalizeConversationTarget(binding.conversation),
+  };
+}
+
+function normalizePendingBind(entry: StoredPendingBind): StoredPendingBind {
+  return {
+    ...entry,
+    conversation: normalizeConversationTarget(entry.conversation),
+  };
+}
+
+function normalizePendingRequest(entry: StoredPendingRequest): StoredPendingRequest {
+  return {
+    ...entry,
+    conversation: normalizeConversationTarget(entry.conversation),
+  };
+}
+
+function normalizeCallbackAction(entry: CallbackAction): CallbackAction {
+  return {
+    ...entry,
+    conversation: normalizeConversationTarget(entry.conversation),
+  };
 }
 
 function cloneSnapshot(value?: Partial<StoreSnapshot>): StoreSnapshot {
   return {
     version: STORE_VERSION,
     bindings: value?.bindings ?? [],
-    recentDetachedThreads: value?.recentDetachedThreads ?? [],
     pendingBinds: value?.pendingBinds ?? [],
     pendingRequests: value?.pendingRequests ?? [],
     callbacks: value?.callbacks ?? [],
@@ -256,17 +320,19 @@ function normalizeConversationPreferences(
 function normalizeSnapshot(value?: Partial<StoreSnapshot>): StoreSnapshot {
   const snapshot = cloneSnapshot(value);
   snapshot.version = STORE_VERSION;
-  snapshot.bindings = snapshot.bindings.map((binding) => {
+  const bindingByKey = new Map<string, StoredBinding>();
+  snapshot.bindings = snapshot.bindings
+    .map((binding) => {
     const legacyPreferences = binding.preferences as
       | (ConversationPreferences & {
           preferredApprovalPolicy?: string;
           preferredSandbox?: string;
         })
       | undefined;
-    return {
-      ...binding,
-      permissionsMode: inferPermissionsModeFromLegacyFields({
-        permissionsMode: (binding as StoredBinding & { permissionsMode?: string }).permissionsMode,
+      return normalizeBinding({
+        ...binding,
+        permissionsMode: inferPermissionsModeFromLegacyFields({
+          permissionsMode: (binding as StoredBinding & { permissionsMode?: string }).permissionsMode,
         appServerProfile: (binding as StoredBinding & { appServerProfile?: string }).appServerProfile,
         preferredApprovalPolicy: legacyPreferences?.preferredApprovalPolicy,
         preferredSandbox: legacyPreferences?.preferredSandbox,
@@ -278,27 +344,61 @@ function normalizeSnapshot(value?: Partial<StoreSnapshot>): StoreSnapshot {
         normalizePermissionsMode(
           (binding as StoredBinding & { pendingAppServerProfile?: string }).pendingAppServerProfile,
         ),
-      preferences: normalizeConversationPreferences(legacyPreferences),
-    };
-  });
-  snapshot.pendingBinds = snapshot.pendingBinds.map((entry) => {
+        preferences: normalizeConversationPreferences(legacyPreferences),
+      });
+    })
+    .filter((binding) => {
+      const key = toConversationKey(binding.conversation);
+      const current = bindingByKey.get(key);
+      bindingByKey.set(
+        key,
+        current && current.threadId === binding.threadId && current.sessionKey === binding.sessionKey
+          ? {
+              ...pickLatestByUpdatedAt(current, binding),
+              contextUsage: binding.contextUsage ?? current.contextUsage,
+              pinnedBindingMessage: binding.pinnedBindingMessage ?? current.pinnedBindingMessage,
+              preferences: binding.preferences ?? current.preferences,
+              threadTitle: binding.threadTitle ?? current.threadTitle,
+              permissionsMode: binding.permissionsMode ?? current.permissionsMode,
+              pendingPermissionsMode:
+                binding.pendingPermissionsMode ?? current.pendingPermissionsMode,
+            }
+          : current
+            ? pickLatestByUpdatedAt(current, binding)
+            : binding,
+      );
+      return false;
+    });
+  snapshot.bindings = [...bindingByKey.values()];
+  const pendingBindByKey = new Map<string, StoredPendingBind>();
+  snapshot.pendingBinds = snapshot.pendingBinds
+    .map((entry) => {
     const legacyPreferences = entry.preferences as
       | (ConversationPreferences & {
           preferredApprovalPolicy?: string;
           preferredSandbox?: string;
         })
       | undefined;
-    return {
-      ...entry,
-      permissionsMode: inferPermissionsModeFromLegacyFields({
-        permissionsMode: (entry as StoredPendingBind & { permissionsMode?: string }).permissionsMode,
+      return normalizePendingBind({
+        ...entry,
+        permissionsMode: inferPermissionsModeFromLegacyFields({
+          permissionsMode: (entry as StoredPendingBind & { permissionsMode?: string }).permissionsMode,
         appServerProfile: (entry as StoredPendingBind & { appServerProfile?: string }).appServerProfile,
         preferredApprovalPolicy: legacyPreferences?.preferredApprovalPolicy,
-        preferredSandbox: legacyPreferences?.preferredSandbox,
+          preferredSandbox: legacyPreferences?.preferredSandbox,
       }),
       preferences: normalizeConversationPreferences(legacyPreferences),
-    };
-  });
+      });
+    })
+    .filter((entry) => {
+      const key = toConversationKey(entry.conversation);
+      const current = pendingBindByKey.get(key);
+      pendingBindByKey.set(key, current ? pickLatestByUpdatedAt(current, entry) : entry);
+      return false;
+    });
+  snapshot.pendingBinds = [...pendingBindByKey.values()];
+  snapshot.pendingRequests = snapshot.pendingRequests.map(normalizePendingRequest);
+  snapshot.callbacks = snapshot.callbacks.map(normalizeCallbackAction);
   return snapshot;
 }
 
@@ -356,58 +456,16 @@ export class PluginStateStore {
     return this.snapshot.bindings.find((entry) => toConversationKey(entry.conversation) === key) ?? null;
   }
 
-  getRecentDetachedThread(target: ConversationTarget): RecentDetachedThread | null {
-    const key = toConversationKey(target);
-    return (
-      this.snapshot.recentDetachedThreads.find(
-        (entry) => toConversationKey(entry.conversation) === key,
-      ) ?? null
-    );
-  }
-
-  async rememberDetachedThread(binding: StoredBinding): Promise<void> {
-    const key = toConversationKey(binding.conversation);
-    const now = Date.now();
-    const entry: RecentDetachedThread = {
-      conversation: binding.conversation,
-      sessionKey: binding.sessionKey,
-      threadId: binding.threadId,
-      workspaceDir: binding.workspaceDir,
-      permissionsMode: binding.permissionsMode,
-      pendingPermissionsMode: binding.pendingPermissionsMode,
-      threadTitle: binding.threadTitle,
-      pinnedBindingMessage: binding.pinnedBindingMessage,
-      contextUsage: binding.contextUsage,
-      preferences: binding.preferences,
-      detachedAt: now,
-      updatedAt: now,
-    };
-    this.snapshot.recentDetachedThreads = [
-      entry,
-      ...this.snapshot.recentDetachedThreads.filter(
-        (current) =>
-          !(toConversationKey(current.conversation) === key && current.threadId === entry.threadId),
-      ),
-    ].slice(0, 50);
-    await this.save();
-  }
-
   async upsertBinding(binding: StoredBinding): Promise<void> {
-    const key = toConversationKey(binding.conversation);
+    const normalizedBinding = normalizeBinding(binding);
+    const key = toConversationKey(normalizedBinding.conversation);
     this.snapshot.bindings = this.snapshot.bindings.filter(
       (entry) => toConversationKey(entry.conversation) !== key,
     );
     this.snapshot.pendingBinds = this.snapshot.pendingBinds.filter(
       (entry) => toConversationKey(entry.conversation) !== key,
     );
-    this.snapshot.recentDetachedThreads = this.snapshot.recentDetachedThreads.filter(
-      (entry) =>
-        !(
-          toConversationKey(entry.conversation) === key &&
-          entry.threadId === binding.threadId
-        ),
-    );
-    this.snapshot.bindings.push(binding);
+    this.snapshot.bindings.push(normalizedBinding);
     await this.save();
   }
 
@@ -445,11 +503,12 @@ export class PluginStateStore {
   }
 
   async upsertPendingBind(entry: StoredPendingBind): Promise<void> {
-    const key = toConversationKey(entry.conversation);
+    const normalizedEntry = normalizePendingBind(entry);
+    const key = toConversationKey(normalizedEntry.conversation);
     this.snapshot.pendingBinds = this.snapshot.pendingBinds.filter(
       (current) => toConversationKey(current.conversation) !== key,
     );
-    this.snapshot.pendingBinds.push(entry);
+    this.snapshot.pendingBinds.push(normalizedEntry);
     await this.save();
   }
 
@@ -466,10 +525,11 @@ export class PluginStateStore {
   }
 
   async upsertPendingRequest(entry: StoredPendingRequest): Promise<void> {
+    const normalizedEntry = normalizePendingRequest(entry);
     this.snapshot.pendingRequests = this.snapshot.pendingRequests.filter(
-      (current) => current.requestId !== entry.requestId,
+      (current) => current.requestId !== normalizedEntry.requestId,
     );
-    this.snapshot.pendingRequests.push(entry);
+    this.snapshot.pendingRequests.push(normalizedEntry);
     await this.save();
   }
 
@@ -492,11 +552,12 @@ export class PluginStateStore {
 
   async putCallback(callback: PutCallbackInput): Promise<CallbackAction> {
     const now = Date.now();
+    const normalizedConversation = normalizeConversationTarget(callback.conversation);
     const entry: CallbackAction =
       callback.kind === "start-new-thread"
         ? {
             kind: "start-new-thread",
-            conversation: callback.conversation,
+            conversation: normalizedConversation,
             workspaceDir: callback.workspaceDir,
             syncTopic: callback.syncTopic,
             requestedModel: callback.requestedModel,
@@ -509,7 +570,7 @@ export class PluginStateStore {
       : callback.kind === "resume-thread"
         ? {
             kind: "resume-thread",
-            conversation: callback.conversation,
+            conversation: normalizedConversation,
             threadId: callback.threadId,
             threadTitle: callback.threadTitle,
             workspaceDir: callback.workspaceDir,
@@ -524,7 +585,7 @@ export class PluginStateStore {
         : callback.kind === "pending-input"
           ? {
               kind: "pending-input",
-              conversation: callback.conversation,
+              conversation: normalizedConversation,
               requestId: callback.requestId,
               actionIndex: callback.actionIndex,
               token: callback.token ?? this.createCallbackToken(),
@@ -534,7 +595,7 @@ export class PluginStateStore {
           : callback.kind === "pending-questionnaire"
             ? {
                 kind: "pending-questionnaire",
-                conversation: callback.conversation,
+                conversation: normalizedConversation,
                 requestId: callback.requestId,
                 questionIndex: callback.questionIndex,
                 action: callback.action,
@@ -546,7 +607,7 @@ export class PluginStateStore {
           : callback.kind === "picker-view"
             ? {
               kind: "picker-view",
-              conversation: callback.conversation,
+              conversation: normalizedConversation,
               view: callback.view,
               token: callback.token ?? this.createCallbackToken(),
               createdAt: now,
@@ -555,7 +616,7 @@ export class PluginStateStore {
               : callback.kind === "run-prompt"
                 ? {
                     kind: "run-prompt",
-                    conversation: callback.conversation,
+                    conversation: normalizedConversation,
                     prompt: callback.prompt,
                   workspaceDir: callback.workspaceDir,
                   collaborationMode: callback.collaborationMode,
@@ -566,7 +627,7 @@ export class PluginStateStore {
               : callback.kind === "rename-thread"
                 ? {
                     kind: "rename-thread",
-                    conversation: callback.conversation,
+                    conversation: normalizedConversation,
                     style: callback.style,
                     syncTopic: callback.syncTopic,
                     token: callback.token ?? this.createCallbackToken(),
@@ -576,7 +637,7 @@ export class PluginStateStore {
               : callback.kind === "set-model"
                 ? {
                     kind: "set-model",
-                    conversation: callback.conversation,
+                    conversation: normalizedConversation,
                     model: callback.model,
                     returnToStatus: callback.returnToStatus,
                     statusMessage: callback.statusMessage,
@@ -587,7 +648,7 @@ export class PluginStateStore {
                 : callback.kind === "toggle-fast"
                   ? {
                       kind: "toggle-fast",
-                      conversation: callback.conversation,
+                      conversation: normalizedConversation,
                       token: callback.token ?? this.createCallbackToken(),
                       createdAt: now,
                       expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
@@ -595,7 +656,7 @@ export class PluginStateStore {
                 : callback.kind === "show-reasoning-picker"
                   ? {
                       kind: "show-reasoning-picker",
-                      conversation: callback.conversation,
+                      conversation: normalizedConversation,
                       token: callback.token ?? this.createCallbackToken(),
                       createdAt: now,
                       expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
@@ -603,7 +664,7 @@ export class PluginStateStore {
               : callback.kind === "set-reasoning"
                 ? {
                     kind: "set-reasoning",
-                    conversation: callback.conversation,
+                    conversation: normalizedConversation,
                     reasoningEffort: callback.reasoningEffort,
                     returnToStatus: callback.returnToStatus,
                     token: callback.token ?? this.createCallbackToken(),
@@ -613,7 +674,7 @@ export class PluginStateStore {
                   : callback.kind === "toggle-permissions"
                     ? {
                         kind: "toggle-permissions",
-                        conversation: callback.conversation,
+                        conversation: normalizedConversation,
                         token: callback.token ?? this.createCallbackToken(),
                         createdAt: now,
                         expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
@@ -621,7 +682,7 @@ export class PluginStateStore {
                     : callback.kind === "compact-thread"
                       ? {
                           kind: "compact-thread",
-                          conversation: callback.conversation,
+                          conversation: normalizedConversation,
                           token: callback.token ?? this.createCallbackToken(),
                           createdAt: now,
                           expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
@@ -629,7 +690,7 @@ export class PluginStateStore {
                     : callback.kind === "stop-run"
                       ? {
                           kind: "stop-run",
-                          conversation: callback.conversation,
+                          conversation: normalizedConversation,
                           token: callback.token ?? this.createCallbackToken(),
                           createdAt: now,
                           expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
@@ -637,7 +698,7 @@ export class PluginStateStore {
                     : callback.kind === "refresh-status"
                       ? {
                           kind: "refresh-status",
-                          conversation: callback.conversation,
+                          conversation: normalizedConversation,
                           token: callback.token ?? this.createCallbackToken(),
                           createdAt: now,
                           expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
@@ -645,7 +706,7 @@ export class PluginStateStore {
                     : callback.kind === "detach-thread"
                       ? {
                           kind: "detach-thread",
-                          conversation: callback.conversation,
+                          conversation: normalizedConversation,
                           token: callback.token ?? this.createCallbackToken(),
                           createdAt: now,
                           expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
@@ -653,7 +714,7 @@ export class PluginStateStore {
                     : callback.kind === "show-skills"
                       ? {
                           kind: "show-skills",
-                          conversation: callback.conversation,
+                          conversation: normalizedConversation,
                           token: callback.token ?? this.createCallbackToken(),
                           createdAt: now,
                           expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
@@ -661,7 +722,7 @@ export class PluginStateStore {
                     : callback.kind === "show-mcp"
                       ? {
                           kind: "show-mcp",
-                          conversation: callback.conversation,
+                          conversation: normalizedConversation,
                           token: callback.token ?? this.createCallbackToken(),
                           createdAt: now,
                           expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
@@ -669,7 +730,7 @@ export class PluginStateStore {
                     : callback.kind === "run-skill"
                       ? {
                           kind: "run-skill",
-                          conversation: callback.conversation,
+                          conversation: normalizedConversation,
                           skillName: callback.skillName,
                           workspaceDir: callback.workspaceDir,
                           token: callback.token ?? this.createCallbackToken(),
@@ -679,7 +740,7 @@ export class PluginStateStore {
                     : callback.kind === "show-skill-help"
                       ? {
                           kind: "show-skill-help",
-                          conversation: callback.conversation,
+                          conversation: normalizedConversation,
                           skillName: callback.skillName,
                           description: callback.description,
                           cwd: callback.cwd,
@@ -691,7 +752,7 @@ export class PluginStateStore {
                     : callback.kind === "show-model-picker"
                       ? {
                           kind: "show-model-picker",
-                          conversation: callback.conversation,
+                          conversation: normalizedConversation,
                           token: callback.token ?? this.createCallbackToken(),
                           createdAt: now,
                           expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
@@ -699,7 +760,7 @@ export class PluginStateStore {
                 : callback.kind === "reply-text"
                   ? {
                       kind: "reply-text",
-                      conversation: callback.conversation,
+                      conversation: normalizedConversation,
                       text: callback.text,
                       token: callback.token ?? this.createCallbackToken(),
                       createdAt: now,
@@ -707,7 +768,7 @@ export class PluginStateStore {
                     }
                   : {
                       kind: "cancel-picker",
-                      conversation: callback.conversation,
+                      conversation: normalizedConversation,
                       token: callback.token ?? this.createCallbackToken(),
                       createdAt: now,
                       expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),

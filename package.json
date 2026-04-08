@@ -15,12 +15,13 @@
       "minGatewayVersion": "2026.3.22"
     },
     "build": {
-      "openclawVersion": "2026.3.22",
-      "pluginSdkVersion": "2026.3.22"
+      "openclawVersion": "2026.4.8",
+      "pluginSdkVersion": "2026.4.8"
     }
   },
   "scripts": {
     "project:sync": "node ./.agents/skills/project-manager/scripts/sync-work-items.mjs",
+    "sync:openclaw-host": "node ./scripts/sync-openclaw-host.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "smoke:app-server-permissions": "node ./scripts/app-server-permissions-smoke.mjs",

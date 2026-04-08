@@ -6,6 +6,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import type {
   PluginConversationBindingResolvedEvent,
+  PluginConversationBinding,
+  PluginConversationBindingRequestResult,
   OpenClawPluginApi,
   OpenClawPluginService,
   PluginCommandContext,
@@ -15,12 +17,18 @@ import type {
   PluginInteractiveTelegramHandlerContext,
   ReplyPayload,
   ConversationRef,
-} from "openclaw/plugin-sdk";
+} from "./openclaw-types.js";
 import {
-  getCurrentPluginConversationBinding,
   getSessionBindingService,
+  type SessionBindingRecord,
 } from "openclaw/plugin-sdk/conversation-runtime";
-import type { DiscordComponentMessageSpec } from "openclaw/plugin-sdk/discord";
+import {
+  createTypingCallbacks,
+  type CreateTypingCallbacksParams,
+} from "openclaw/plugin-sdk/channel-reply-pipeline";
+import type { OpenClawConfig as HostOpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/core";
+import type { TopLevelComponents as DiscordTopLevelComponent } from "../node_modules/openclaw/dist/extensions/discord/node_modules/@buape/carbon/dist/src/types/index.js";
 import { resolvePluginSettings, resolveWorkspaceDir } from "./config.js";
 import { CodexAppServerModeClient, type ActiveCodexRun, isMissingThreadError } from "./client.js";
 import { getThreadDisplayTitle } from "./thread-display.js";
@@ -106,14 +114,191 @@ import {
   resolveCompatFallbackPath,
 } from "./openclaw-sdk-compat.js";
 
-type DiscordSdkModule = typeof import("openclaw/plugin-sdk/discord");
-type TelegramAccountSdkModule = typeof import("openclaw/plugin-sdk/telegram-account");
-type DiscordComponentBuildResult = ReturnType<DiscordSdkModule["buildDiscordComponentMessage"]>;
-type DiscordExtensionApiModule = {
-  resolveDiscordAccount?: (params: { cfg: unknown; accountId?: string }) => {
-    token?: string;
+// OpenClaw does not publish `.d.ts` declarations for the Discord component helper
+// bundle behind `dist/extensions/discord/{api,runtime-api}.js`. These shapes are
+// derived from the installed host's current JS implementation so this repo stays
+// aligned with the real helper contract without pretending the bundle is public.
+type DiscordComponentEmoji = {
+  name: string;
+  id?: string;
+  animated?: boolean;
+};
+
+type DiscordComponentButtonStyle = "primary" | "secondary" | "success" | "danger" | "link";
+
+type DiscordComponentSelectOption = {
+  label: string;
+  value: string;
+  description?: string;
+  emoji?: DiscordComponentEmoji;
+  default?: boolean;
+};
+
+type DiscordComponentButtonSpec = {
+  label: string;
+  style?: DiscordComponentButtonStyle;
+  url?: string;
+  callbackData?: string;
+  emoji?: DiscordComponentEmoji;
+  disabled?: boolean;
+  allowedUsers?: string[];
+  internalCustomId?: string;
+};
+
+type DiscordComponentSelectType = "string" | "user" | "role" | "mentionable" | "channel";
+
+type DiscordComponentSelectSpec = {
+  type?: DiscordComponentSelectType;
+  callbackData?: string;
+  placeholder?: string;
+  minValues?: number;
+  maxValues?: number;
+  options?: DiscordComponentSelectOption[];
+  allowedUsers?: string[];
+};
+
+type DiscordComponentBlock =
+  | {
+      type: "text";
+      text: string;
+    }
+  | {
+      type: "section";
+      text?: string;
+      texts?: string[];
+      accessory?:
+        | { type: "thumbnail"; url: string }
+        | { type: "button"; button: DiscordComponentButtonSpec };
+    }
+  | {
+      type: "separator";
+      spacing?: "small" | "large" | 1 | 2;
+      divider?: boolean;
+    }
+  | {
+      type: "actions";
+      buttons?: DiscordComponentButtonSpec[];
+      select?: DiscordComponentSelectSpec;
+    }
+  | {
+      type: "media-gallery";
+      items: Array<{
+        url: string;
+        description?: string;
+        spoiler?: boolean;
+      }>;
+    }
+  | {
+      type: "file";
+      file: `attachment://${string}`;
+      spoiler?: boolean;
+    };
+
+type DiscordComponentModalFieldType =
+  | "text"
+  | "checkbox"
+  | "radio"
+  | "select"
+  | "role-select"
+  | "user-select";
+
+type DiscordComponentModalField = {
+  type: DiscordComponentModalFieldType;
+  name?: string;
+  label: string;
+  description?: string;
+  placeholder?: string;
+  required?: boolean;
+  options?: DiscordComponentSelectOption[];
+  minValues?: number;
+  maxValues?: number;
+  minLength?: number;
+  maxLength?: number;
+  style?: string;
+};
+
+type DiscordComponentMessageSpec = {
+  text?: string;
+  reusable?: boolean;
+  container?: {
+    accentColor?: unknown;
+    spoiler?: boolean;
+  };
+  blocks?: DiscordComponentBlock[];
+  modal?: {
+    title: string;
+    callbackData?: string;
+    triggerLabel?: string;
+    triggerStyle?: DiscordComponentButtonStyle;
+    allowedUsers?: string[];
+    fields: DiscordComponentModalField[];
   };
 };
+
+type DiscordComponentEntry = {
+  id: string;
+  kind: "button" | "modal-trigger" | "select";
+  label: string;
+  callbackData?: string;
+  modalId?: string;
+  allowedUsers?: string[];
+  selectType?: DiscordComponentSelectType;
+  options?: Array<Pick<DiscordComponentSelectOption, "value" | "label">>;
+  sessionKey?: string;
+  agentId?: string;
+  accountId?: string;
+  reusable?: boolean;
+};
+
+type DiscordComponentModalRegistration = {
+  id: string;
+  title: string;
+  callbackData?: string;
+  fields: Array<DiscordComponentModalField & { name: string; id: string }>;
+  sessionKey?: string;
+  agentId?: string;
+  accountId?: string;
+  reusable?: boolean;
+  allowedUsers?: string[];
+};
+
+type DiscordComponentBuildResult = {
+  components: DiscordTopLevelComponent[];
+  entries: DiscordComponentEntry[];
+  modals: DiscordComponentModalRegistration[];
+};
+type DiscordHostAccountsModule = typeof import("../node_modules/openclaw/dist/plugin-sdk/extensions/discord/src/accounts.js");
+type DiscordHostSendModule = typeof import("../node_modules/openclaw/dist/plugin-sdk/extensions/discord/src/send.js");
+type TelegramHostAccountsModule = typeof import("../node_modules/openclaw/dist/plugin-sdk/extensions/telegram/src/accounts.js");
+type TelegramHostSendModule = typeof import("../node_modules/openclaw/dist/plugin-sdk/extensions/telegram/src/send.js");
+type TelegramHostTokenModule = typeof import("../node_modules/openclaw/dist/plugin-sdk/extensions/telegram/src/token.js");
+type DiscordComponentMessageSendResult = Awaited<
+  ReturnType<DiscordHostSendModule["sendMessageDiscord"]>
+>;
+type DiscordChannelEditResult = Awaited<ReturnType<DiscordHostSendModule["editChannelDiscord"]>>;
+
+type DiscordSdkModule = {
+  resolveDiscordAccount: DiscordHostAccountsModule["resolveDiscordAccount"];
+  buildDiscordComponentMessage: (params: {
+    spec: DiscordComponentMessageSpec;
+    fallbackText?: string;
+    sessionKey?: string;
+    agentId?: string;
+    accountId?: string;
+  }) => DiscordComponentBuildResult;
+  editDiscordComponentMessage?: (
+    to: string,
+    messageId: string,
+    spec: DiscordComponentMessageSpec,
+    opts?: { accountId?: string },
+  ) => Promise<DiscordComponentMessageSendResult>;
+  registerBuiltDiscordComponentMessage?: (params: {
+    buildResult: DiscordComponentBuildResult;
+    messageId: string;
+  }) => void;
+};
+type TelegramAccountSdkModule = Pick<TelegramHostAccountsModule, "resolveTelegramAccount">;
+type DiscordExtensionApiModule = Partial<Pick<DiscordHostAccountsModule, "resolveDiscordAccount">>;
 type DiscordRuntimeApiModule = {
   editDiscordComponentMessage?: (
     to: string,
@@ -123,7 +308,7 @@ type DiscordRuntimeApiModule = {
       cfg?: unknown;
       accountId?: string;
     },
-  ) => Promise<{ messageId: string; channelId: string }>;
+  ) => Promise<DiscordComponentMessageSendResult>;
   registerBuiltDiscordComponentMessage?: (params: {
     buildResult: DiscordComponentBuildResult;
     messageId: string;
@@ -137,32 +322,24 @@ type DiscordRuntimeApiModule = {
       mediaUrl?: string;
       mediaLocalRoots?: readonly string[];
     },
-  ) => Promise<{ messageId: string; channelId: string }>;
-  sendMessageDiscord?: (
-    to: string,
-    text: string,
-    opts?: {
-      cfg?: unknown;
-      accountId?: string;
-      mediaUrl?: string;
-      mediaLocalRoots?: readonly string[];
-    },
-  ) => Promise<{ messageId: string; channelId: string }>;
-  sendTypingDiscord?: (
-    channelId: string,
-    opts?: {
-      cfg?: unknown;
-      accountId?: string;
-    },
-  ) => Promise<unknown>;
-  editChannelDiscord?: (
-    payload: { channelId: string; name?: string },
-    opts?: {
-      cfg?: unknown;
-      accountId?: string;
-    },
-  ) => Promise<unknown>;
+  ) => Promise<DiscordComponentMessageSendResult>;
+  sendMessageDiscord?: DiscordHostSendModule["sendMessageDiscord"];
+  sendTypingDiscord?: DiscordHostSendModule["sendTypingDiscord"];
+  pinMessageDiscord?: DiscordHostSendModule["pinMessageDiscord"];
+  unpinMessageDiscord?: DiscordHostSendModule["unpinMessageDiscord"];
+  editChannelDiscord?: DiscordHostSendModule["editChannelDiscord"];
 };
+
+type TelegramRuntimeApiModule = {
+  sendMessageTelegram?: TelegramHostSendModule["sendMessageTelegram"];
+  sendTypingTelegram?: TelegramHostSendModule["sendTypingTelegram"];
+  pinMessageTelegram?: TelegramHostSendModule["pinMessageTelegram"];
+  unpinMessageTelegram?: TelegramHostSendModule["unpinMessageTelegram"];
+  editMessageTelegram?: TelegramHostSendModule["editMessageTelegram"];
+  renameForumTopicTelegram?: TelegramHostSendModule["renameForumTopicTelegram"];
+};
+
+type ProviderOutboundAdapter = Pick<ChannelOutboundAdapter, "sendMedia" | "sendPayload" | "sendText">;
 
 type ActiveRunRecord = {
   conversation: ConversationTarget;
@@ -205,59 +382,6 @@ const DISCORD_LIVE_ASSISTANT_PREVIEW_THROTTLE_MS = 1_200;
 const DISCORD_LIVE_ASSISTANT_PREVIEW_MIN_CHARS = 30;
 const DISCORD_LIVE_ASSISTANT_PREVIEW_MAX_CHARS = 2_000;
 
-type TelegramOutboundAdapter = {
-  sendText?: (ctx: {
-    cfg: unknown;
-    to: string;
-    text: string;
-    accountId?: string;
-    threadId?: string | number;
-  }) => Promise<{ messageId: string; chatId?: string }>;
-  sendMedia?: (ctx: {
-    cfg: unknown;
-    to: string;
-    text: string;
-    mediaUrl: string;
-    accountId?: string;
-    threadId?: string | number;
-    mediaLocalRoots?: readonly string[];
-  }) => Promise<{ messageId: string; chatId?: string }>;
-  sendPayload?: (ctx: {
-    cfg: unknown;
-    to: string;
-    payload: ReplyPayload;
-    accountId?: string;
-    threadId?: string | number;
-    mediaLocalRoots?: readonly string[];
-  }) => Promise<{ messageId: string; chatId?: string }>;
-};
-
-type DiscordOutboundAdapter = {
-  sendText?: (ctx: {
-    cfg: unknown;
-    to: string;
-    text: string;
-    accountId?: string;
-    threadId?: string | number;
-  }) => Promise<{ messageId: string; channelId?: string }>;
-  sendMedia?: (ctx: {
-    cfg: unknown;
-    to: string;
-    text: string;
-    mediaUrl: string;
-    accountId?: string;
-    threadId?: string | number;
-    mediaLocalRoots?: readonly string[];
-  }) => Promise<{ messageId: string; channelId?: string }>;
-  sendPayload?: (ctx: {
-    cfg: unknown;
-    to: string;
-    payload: ReplyPayload;
-    accountId?: string;
-    threadId?: string | number;
-    mediaLocalRoots?: readonly string[];
-  }) => Promise<{ messageId: string; channelId?: string }>;
-};
 const MAX_TEXT_ATTACHMENT_CHARS = 16_000;
 const PLUGIN_VERSION = (() => {
   try {
@@ -316,11 +440,7 @@ type PickerResponders = {
   editPicker: (picker: PickerRender) => Promise<void>;
   requestConversationBinding?: (
     params?: { summary?: string },
-  ) => Promise<
-    | { status: "bound" }
-    | { status: "pending"; reply: ReplyPayload }
-    | { status: "error"; message: string }
-  >;
+  ) => Promise<PluginConversationBindingRequestResult>;
   detachConversationBinding?: () => Promise<{ removed: boolean }>;
 };
 
@@ -342,13 +462,9 @@ function formatElapsedDuration(elapsedMs: number): string {
 type ScopedBindingApi = {
   requestConversationBinding?: (
     params?: { summary?: string },
-  ) => Promise<
-    | { status: "bound" }
-    | { status: "pending"; reply: ReplyPayload }
-    | { status: "error"; message: string }
-  >;
+  ) => Promise<PluginConversationBindingRequestResult>;
   detachConversationBinding?: () => Promise<{ removed: boolean }>;
-  getCurrentConversationBinding?: () => Promise<unknown>;
+  getCurrentConversationBinding?: () => Promise<PluginConversationBinding | null>;
 };
 
 type HydratedBindingResult = {
@@ -369,6 +485,53 @@ type RuntimeSessionBindingRecord = {
   metadata?: Record<string, unknown>;
 };
 
+type LegacyTelegramTypingLease = {
+  refresh: () => Promise<void>;
+  stop: () => void;
+};
+
+type LegacyTelegramRuntime = {
+  sendMessageTelegram?: TelegramHostSendModule["sendMessageTelegram"];
+  resolveTelegramToken?: TelegramHostTokenModule["resolveTelegramToken"];
+  typing?: {
+    start?: (params: {
+      to: string;
+      accountId?: string;
+      messageThreadId?: number;
+    }) => Promise<LegacyTelegramTypingLease>;
+  };
+  conversationActions?: {
+    renameTopic?: TelegramHostSendModule["renameForumTopicTelegram"];
+  };
+};
+
+type LegacyDiscordTypingLease = {
+  refresh: () => Promise<void>;
+  stop: () => void;
+};
+
+type LegacyDiscordRuntime = {
+  sendMessageDiscord?: DiscordHostSendModule["sendMessageDiscord"];
+  sendComponentMessage?: (
+    to: string,
+    spec: DiscordComponentMessageSpec,
+    opts?: { accountId?: string },
+  ) => Promise<DiscordComponentMessageSendResult>;
+  typing?: {
+    start?: (params: {
+      channelId: string;
+      accountId?: string;
+    }) => Promise<LegacyDiscordTypingLease>;
+  };
+  conversationActions?: {
+    editChannel?: (
+      channelId: string,
+      params: { name?: string },
+      opts?: { accountId?: string },
+    ) => Promise<DiscordChannelEditResult>;
+  };
+};
+
 type PlanDelivery = {
   summaryText: string;
   attachmentPath?: string;
@@ -385,6 +548,14 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function asScopedBindingApi(value: object): ScopedBindingApi {
   return value as ScopedBindingApi;
+}
+
+function getLegacyTelegramRuntime(api: OpenClawPluginApi): LegacyTelegramRuntime | undefined {
+  return (api.runtime.channel as { telegram?: LegacyTelegramRuntime }).telegram;
+}
+
+function getLegacyDiscordRuntime(api: OpenClawPluginApi): LegacyDiscordRuntime | undefined {
+  return (api.runtime.channel as { discord?: LegacyDiscordRuntime }).discord;
 }
 
 function isTelegramChannel(channel: string): boolean {
@@ -505,7 +676,7 @@ function toConversationTargetFromCommand(ctx: PluginCommandContext): Conversatio
       conversationId:
         typeof ctx.messageThreadId === "number" ? `${chatId}:topic:${ctx.messageThreadId}` : chatId,
       parentConversationId: typeof ctx.messageThreadId === "number" ? chatId : undefined,
-      threadId: ctx.messageThreadId,
+      threadId: typeof ctx.messageThreadId === "number" ? ctx.messageThreadId : undefined,
     };
   }
   if (isDiscordChannel(ctx.channel)) {
@@ -615,63 +786,6 @@ function parseThreadIdFromSessionKey(sessionKey: string | undefined): string | u
   return threadId || undefined;
 }
 
-const BINDING_RECOVERY_PREFIX = "[oc-cas-recovery:";
-
-function encodeBindingRecoveryPayload(params: {
-  threadId: string;
-  workspaceDir: string;
-  threadTitle?: string;
-}): string {
-  const payload = Buffer.from(
-    JSON.stringify({
-      threadId: params.threadId,
-      workspaceDir: params.workspaceDir,
-      threadTitle: params.threadTitle,
-    }),
-    "utf8",
-  ).toString("base64url");
-  return `${BINDING_RECOVERY_PREFIX}${payload}]`;
-}
-
-function parseBindingRecoveryPayload(
-  text: string | undefined,
-): { threadId: string; workspaceDir: string; threadTitle?: string } | null {
-  if (!text) {
-    return null;
-  }
-  const start = text.indexOf(BINDING_RECOVERY_PREFIX);
-  if (start < 0) {
-    return null;
-  }
-  const end = text.indexOf("]", start + BINDING_RECOVERY_PREFIX.length);
-  if (end < 0) {
-    return null;
-  }
-  const encoded = text.slice(start + BINDING_RECOVERY_PREFIX.length, end).trim();
-  if (!encoded) {
-    return null;
-  }
-  try {
-    const decoded = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as {
-      threadId?: unknown;
-      workspaceDir?: unknown;
-      threadTitle?: unknown;
-    };
-    const threadId =
-      typeof decoded.threadId === "string" ? decoded.threadId.trim() : "";
-    const workspaceDir =
-      typeof decoded.workspaceDir === "string" ? decoded.workspaceDir.trim() : "";
-    const threadTitle =
-      typeof decoded.threadTitle === "string" ? decoded.threadTitle.trim() : undefined;
-    if (!threadId || !workspaceDir) {
-      return null;
-    }
-    return { threadId, workspaceDir, threadTitle };
-  } catch {
-    return null;
-  }
-}
-
 function asStringArray(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value
@@ -757,17 +871,13 @@ function extractInboundMetadataMedia(metadata?: Record<string, unknown>): Plugin
     }
     const normalizedPath = normalizeInboundMediaPath(mediaPath);
     results.push({
-      kind:
-        isImageMimeType(mimeType) || isImagePathLike(normalizedPath)
-          ? "image"
-          : "document",
+      index: results.length,
       ...(isUrlLike(normalizedPath)
         ? { url: normalizedPath }
         : normalizedPath
           ? { path: normalizedPath }
           : {}),
-      ...(mimeType ? { mimeType } : {}),
-      source: "metadata",
+      ...(mimeType ? { mime: mimeType } : {}),
     });
   }
   return results;
@@ -775,8 +885,7 @@ function extractInboundMetadataMedia(metadata?: Record<string, unknown>): Plugin
 
 function toCodexImageInputItem(media: PluginInboundMedia): CodexTurnInputItem | null {
   if (
-    media.kind !== "image" &&
-    !isImageMimeType(media.mimeType) &&
+    !isImageMimeType(media.mime) &&
     !isImagePathLike(media.path) &&
     !isImagePathLike(media.url)
   ) {
@@ -797,9 +906,11 @@ async function toCodexTextAttachmentInputItem(
   media: PluginInboundMedia,
 ): Promise<CodexTurnInputItem | null> {
   if (
-    media.kind === "image" ||
+    isImageMimeType(media.mime) ||
+    isImagePathLike(media.path) ||
+    isImagePathLike(media.url) ||
     !(
-      isTextAttachmentMimeType(media.mimeType) ||
+      isTextAttachmentMimeType(media.mime) ||
       isTextAttachmentPathLike(media.path) ||
       isTextAttachmentPathLike(media.url)
     )
@@ -834,9 +945,8 @@ async function toCodexTextAttachmentInputItem(
     truncatedByChars
       ? normalizedContent.slice(0, MAX_TEXT_ATTACHMENT_CHARS)
       : normalizedContent;
-  const displayName =
-    media.fileName?.trim() || path.basename(normalizedPath) || "attached-file.txt";
-  const mimeType = normalizeMimeType(media.mimeType);
+  const displayName = path.basename(normalizedPath) || "attached-file.txt";
+  const mimeType = normalizeMimeType(media.mime);
   const lines = [`Attached file: ${displayName}`];
   if (mimeType) {
     lines.push(`Content-Type: ${mimeType}`);
@@ -1439,7 +1549,7 @@ export class CodexPluginController {
   private readonly threadChangesCache = new Map<string, Promise<boolean | undefined>>();
   private readonly store;
   private serviceWorkspaceDir?: string;
-  private lastRuntimeConfig?: unknown;
+  private lastRuntimeConfig?: HostOpenClawConfig;
   private started = false;
 
   constructor(private readonly api: OpenClawPluginApi) {
@@ -1504,22 +1614,11 @@ export class CodexPluginController {
     };
     const pending = this.store.getPendingBind(conversation);
     if (!pending) {
-      const recovered = parseBindingRecoveryPayload(
-        typeof event.request.summary === "string" ? event.request.summary : undefined,
-      );
-      if (!recovered) {
-        this.api.logger.debug?.(
-          `codex binding approved without pending local bind conversation=${conversation.conversationId}`,
-        );
-        return;
-      }
-      await this.bindConversation(conversation, {
-        threadId: recovered.threadId,
-        workspaceDir: recovered.workspaceDir,
-        threadTitle: recovered.threadTitle,
-      });
-      this.api.logger.info?.(
-        `codex binding approval recovered from summary ${this.formatConversationForLog(conversation)} threadId=${recovered.threadId} workspace=${recovered.workspaceDir}`,
+      const recovered = await this.resolveRuntimeBackedBinding(conversation);
+      this.api.logger[recovered && "binding" in recovered ? "info" : "warn"]?.(
+        recovered && "binding" in recovered
+          ? `codex binding approval recovered from runtime ${this.formatConversationForLog(conversation)} threadId=${recovered.binding.threadId} workspace=${recovered.binding.workspaceDir}`
+          : `codex binding approved without pending local bind and runtime recovery failed ${this.formatConversationForLog(conversation)} outcome=${recovered ? "desync" : "miss"}`,
       );
       return;
     }
@@ -1614,26 +1713,28 @@ export class CodexPluginController {
         }
       }
       const existingBinding = this.store.getBinding(conversation);
-      const hydratedBinding = existingBinding ? null : await this.hydrateApprovedBinding(conversation);
-      if (hydratedBinding && "desyncMessage" in hydratedBinding) {
-        await this.sendText(conversation, hydratedBinding.desyncMessage);
+      const bindingOutcome = existingBinding
+        ? await this.validateStoredBindingForInboundClaim(conversation, existingBinding)
+        : await this.hydrateApprovedBinding(conversation);
+      if (bindingOutcome && "desyncMessage" in bindingOutcome) {
+        await this.sendText(conversation, bindingOutcome.desyncMessage);
         return { handled: true };
       }
-      const resolvedBinding = existingBinding ?? hydratedBinding?.binding ?? null;
+      const resolvedBinding = bindingOutcome?.binding ?? null;
       this.api.logger.debug?.(
-        `codex inbound claim channel=${conversation.channel} account=${conversation.accountId} conversation=${conversation.conversationId} parent=${conversation.parentConversationId ?? "<none>"} local=${existingBinding ? "yes" : "no"} recovered=${hydratedBinding?.binding ? "yes" : "no"}`,
+        `codex inbound claim channel=${conversation.channel} account=${conversation.accountId} conversation=${conversation.conversationId} parent=${conversation.parentConversationId ?? "<none>"} local=${existingBinding ? "yes" : "no"} resolved=${resolvedBinding ? "yes" : "no"} refreshed=${existingBinding && resolvedBinding && (resolvedBinding.threadId !== existingBinding.threadId || resolvedBinding.sessionKey !== existingBinding.sessionKey) ? "yes" : "no"}`,
       );
       if (!resolvedBinding) {
         this.api.logger.warn?.(
-          `codex inbound claim rejected without recoverable binding ${this.formatConversationForLog(conversation)} local=${existingBinding ? "yes" : "no"} recovered=${hydratedBinding?.binding ? "yes" : "no"} outcome=${hydratedBinding ? ("desyncMessage" in hydratedBinding ? "desync" : "binding") : "none"}`,
+          `codex inbound claim rejected without recoverable binding ${this.formatConversationForLog(conversation)} local=${existingBinding ? "yes" : "no"} resolved=${resolvedBinding ? "yes" : "no"} outcome=${bindingOutcome ? ("desyncMessage" in bindingOutcome ? "desync" : "binding") : "none"}`,
         );
         return { handled: false };
       }
-      if (hydratedBinding?.pendingBind?.syncTopic) {
+      if (bindingOutcome?.pendingBind?.syncTopic) {
         const syncedName = buildResumeTopicName({
-          title: hydratedBinding.pendingBind.threadTitle,
-          projectKey: hydratedBinding.pendingBind.workspaceDir,
-          threadId: hydratedBinding.pendingBind.threadId,
+          title: bindingOutcome.pendingBind.threadTitle,
+          projectKey: bindingOutcome.pendingBind.workspaceDir,
+          threadId: bindingOutcome.pendingBind.threadId,
         });
         if (syncedName) {
           await this.renameConversationIfSupported(conversation, syncedName);
@@ -1666,7 +1767,7 @@ export class CodexPluginController {
     await this.start();
     const runtimeConfig = (ctx as { config?: unknown }).config;
     if (runtimeConfig !== undefined) {
-      this.lastRuntimeConfig = runtimeConfig;
+      this.lastRuntimeConfig = runtimeConfig as HostOpenClawConfig;
     }
     const bindingApi = asScopedBindingApi(ctx);
     const callback = this.store.getCallback(ctx.callback.payload);
@@ -1715,7 +1816,7 @@ export class CodexPluginController {
             text: result.reply.text ?? "Bind approval requested.",
             buttons,
           });
-          return { status: "pending", reply: result.reply } as const;
+          return result;
         }
         return result;
       },
@@ -1930,7 +2031,7 @@ export class CodexPluginController {
                 },
               ).catch(() => undefined);
             }
-            return { status: "pending", reply: result.reply } as const;
+            return result;
           }
           return result;
         },
@@ -2242,163 +2343,7 @@ export class CodexPluginController {
       await this.sendBoundConversationNotifications(conversation);
       return { text: "Bound this conversation to Codex." };
     }
-    const recentDetached = !binding && !parsed.listProjects
-      ? this.store.getRecentDetachedThread(conversation)
-      : null;
-    if (!binding && !parsed.listProjects && !parsed.query && recentDetached) {
-      const preferences = this.buildBindingPreferencesWithOverrides(
-        recentDetached.preferences,
-        overrides,
-        parsed.requestedModel,
-      );
-      const bindResult = await this.requestConversationBinding(
-        conversation,
-        {
-          threadId: recentDetached.threadId,
-          workspaceDir: recentDetached.workspaceDir,
-          permissionsMode: this.resolveRequestedPermissionsMode(
-            normalizePermissionsMode(recentDetached.permissionsMode),
-            parsed.requestedYolo,
-          ),
-          threadTitle: recentDetached.threadTitle,
-          syncTopic: parsed.syncTopic,
-          preferences,
-          notifyBound: true,
-        },
-        bindingApi.requestConversationBinding,
-      );
-      if (bindResult.status === "pending") {
-        return bindResult.reply;
-      }
-      if (bindResult.status === "error") {
-        return { text: bindResult.message };
-      }
-      await this.store.upsertBinding(bindResult.binding);
-      if (parsed.syncTopic) {
-        const syncedName = buildResumeTopicName({
-          title: recentDetached.threadTitle,
-          projectKey: recentDetached.workspaceDir,
-          threadId: recentDetached.threadId,
-        });
-        if (syncedName) {
-          await this.renameConversationIfSupported(conversation, syncedName);
-        }
-      }
-      await this.sendBoundConversationNotifications(conversation);
-      return { text: "Bound this conversation to Codex." };
-    }
-    if (!binding && !parsed.listProjects && parsed.query && recentDetached) {
-      const normalizedQuery = parsed.query.trim().toLowerCase();
-      const normalizedThreadId = recentDetached.threadId.trim().toLowerCase();
-      const normalizedTitle = recentDetached.threadTitle?.trim().toLowerCase() ?? "";
-      if (
-        normalizedQuery === normalizedThreadId ||
-        (normalizedTitle && normalizedTitle.includes(normalizedQuery))
-      ) {
-        const preferences = this.buildBindingPreferencesWithOverrides(
-          recentDetached.preferences,
-          overrides,
-          parsed.requestedModel,
-        );
-        const bindResult = await this.requestConversationBinding(
-          conversation,
-          {
-            threadId: recentDetached.threadId,
-            workspaceDir: recentDetached.workspaceDir,
-            permissionsMode: this.resolveRequestedPermissionsMode(
-              normalizePermissionsMode(recentDetached.permissionsMode),
-              parsed.requestedYolo,
-            ),
-            threadTitle: recentDetached.threadTitle,
-            syncTopic: parsed.syncTopic,
-            preferences,
-            notifyBound: true,
-          },
-          bindingApi.requestConversationBinding,
-        );
-        if (bindResult.status === "pending") {
-          return bindResult.reply;
-        }
-        if (bindResult.status === "error") {
-          return { text: bindResult.message };
-        }
-        await this.store.upsertBinding(bindResult.binding);
-        await this.sendBoundConversationNotifications(conversation);
-        return { text: "Bound this conversation to Codex." };
-      }
-    }
-    if (parsed.listProjects || !parsed.query) {
-      const passthroughArgs = formatThreadSelectionFlags(parsed);
-      return await this.handleListCommand(conversation, binding, passthroughArgs, channel);
-    }
-    const workspaceDir = this.resolveThreadWorkspaceDir(parsed, binding, false);
-    const selection = await this.resolveSingleThread(
-      binding?.sessionKey,
-      workspaceDir,
-      parsed.query,
-    );
-    if (selection.kind === "none") {
-      return { text: `No Codex thread matched "${parsed.query}".` };
-    }
-    if (selection.kind === "ambiguous") {
-      const picker = await this.renderThreadPicker(conversation, binding, parsed, 0);
-      if (isDiscordChannel(channel) && picker.buttons) {
-        try {
-          await this.sendDiscordPicker(conversation, picker);
-          return {
-            text: `Multiple Codex threads matched "${parsed.query}". Sent a picker to this Discord conversation.`,
-          };
-        } catch (error) {
-          this.api.logger.warn(`codex discord picker send failed: ${String(error)}`);
-          return { text: picker.text };
-        }
-      }
-      return buildReplyWithButtons(picker.text, picker.buttons);
-    }
-    const targetPermissionsMode = this.resolveRequestedPermissionsMode(
-      this.getPermissionsMode(binding),
-      parsed.requestedYolo,
-    );
-    const preferences = this.buildBindingPreferencesWithOverrides(
-      binding?.preferences,
-      overrides,
-      parsed.requestedModel,
-    );
-    const bindResult = await this.requestConversationBinding(conversation, {
-      threadId: selection.thread.threadId,
-      workspaceDir:
-        selection.thread.projectKey ||
-        workspaceDir ||
-        resolveWorkspaceDir({
-          bindingWorkspaceDir: binding?.workspaceDir,
-          configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
-          serviceWorkspaceDir: this.serviceWorkspaceDir,
-      }),
-      permissionsMode: targetPermissionsMode,
-      threadTitle: getThreadDisplayTitle(selection.thread),
-      syncTopic: parsed.syncTopic,
-      preferences,
-      notifyBound: true,
-    }, bindingApi.requestConversationBinding);
-    if (bindResult.status === "pending") {
-      return bindResult.reply;
-    }
-    if (bindResult.status === "error") {
-      return { text: bindResult.message };
-    }
-    await this.store.upsertBinding(bindResult.binding);
-    if (parsed.syncTopic) {
-      const syncedName = buildResumeTopicName({
-        title: getThreadDisplayTitle(selection.thread),
-        projectKey: selection.thread.projectKey,
-        threadId: selection.thread.threadId,
-      });
-      if (syncedName) {
-        await this.renameConversationIfSupported(conversation, syncedName);
-      }
-    }
-    await this.sendBoundConversationNotifications(conversation);
-    return { text: "Bound this conversation to Codex." };
+    return await this.handleListCommand(conversation, binding, args, channel);
   }
 
   private async handleStatusCommand(
@@ -2821,15 +2766,9 @@ export class CodexPluginController {
   ): Promise<boolean> {
     try {
       if (message.provider === "telegram") {
-        const token = await this.resolveTelegramBotToken(conversation.accountId);
-        if (!token) {
-          return false;
-        }
-        await this.callTelegramEditMessageApi(token, {
-          chat_id: message.chatId,
-          message_id: Number(message.messageId),
-          text: statusCard.text,
-          reply_markup: buildTelegramReplyMarkup(statusCard.buttons) ?? { inline_keyboard: [] },
+        await this.editTelegramMessage(message.chatId, message.messageId, statusCard.text, {
+          accountId: conversation.accountId,
+          buttons: statusCard.buttons ?? [],
         });
         return true;
       }
@@ -2872,14 +2811,8 @@ export class CodexPluginController {
     }
     try {
       if (message.provider === "telegram") {
-        const token = await this.resolveTelegramBotToken(conversation.accountId);
-        if (!token) {
-          return false;
-        }
-        await this.callTelegramEditMessageApi(token, {
-          chat_id: message.chatId,
-          message_id: Number(message.messageId),
-          text: trimmed,
+        await this.editTelegramMessage(message.chatId, message.messageId, trimmed, {
+          accountId: conversation.accountId,
         });
         return true;
       }
@@ -3537,6 +3470,12 @@ export class CodexPluginController {
     let latestUsage = startingUsage;
     let lastEmittedUsageText = binding.contextUsage ? formatContextUsageText(binding.contextUsage) : undefined;
     try {
+      if (!this.hasActiveRunForProfile(profile)) {
+        this.api.logger.debug?.(
+          `codex compact resetting cached app-server profile before compaction ${this.formatConversationForLog(conversation)} profile=${profile}`,
+        );
+        await this.client.closeProfile(profile);
+      }
       let keepaliveInterval: NodeJS.Timeout | undefined;
       const progressTimer = setTimeout(() => {
         void (async () => {
@@ -3600,6 +3539,15 @@ export class CodexPluginController {
     } finally {
       typing?.stop();
     }
+  }
+
+  private hasActiveRunForProfile(profile: PermissionsMode): boolean {
+    for (const active of this.activeRuns.values()) {
+      if (active.profile === profile) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private async handleSkillsCommand(
@@ -4015,6 +3963,7 @@ export class CodexPluginController {
       collaborationMode: params.collaborationMode,
       onAssistantMessage: async (text) => {
         await liveAssistantReply.update(text);
+        await typing?.refresh().catch(() => undefined);
       },
       onPendingInput: async (state) => {
         this.api.logger.debug?.(
@@ -4024,6 +3973,7 @@ export class CodexPluginController {
       },
       onFileEdits: async (text) => {
         await this.sendText(params.conversation, text);
+        await typing?.refresh().catch(() => undefined);
       },
       onInterrupted: async () => {
         this.api.logger.debug?.(
@@ -5470,11 +5420,13 @@ export class CodexPluginController {
       `codex discord picker send conversation=${conversation.conversationId} rows=${picker.buttons?.length ?? 0}`,
     );
     const outbound = await this.loadDiscordOutboundAdapter();
-    if (outbound?.sendPayload) {
+    const cfg = this.getOpenClawConfig();
+    if (cfg && outbound?.sendPayload) {
       await outbound.sendPayload({
-        cfg: this.getOpenClawConfig(),
+        cfg,
         to: conversation.conversationId,
         accountId: conversation.accountId,
+        text: picker.text,
         payload: {
           text: picker.text,
           channelData: {
@@ -5486,15 +5438,7 @@ export class CodexPluginController {
       });
       return;
     }
-    const legacySend = (this.api.runtime.channel as {
-      discord?: {
-        sendComponentMessage?: (
-          to: string,
-          spec: DiscordComponentMessageSpec,
-          opts?: { accountId?: string },
-        ) => Promise<unknown>;
-      };
-    }).discord?.sendComponentMessage;
+    const legacySend = getLegacyDiscordRuntime(this.api)?.sendComponentMessage;
     if (typeof legacySend === "function") {
       await legacySend(
         conversation.conversationId,
@@ -5523,16 +5467,8 @@ export class CodexPluginController {
   private async sendDiscordPickerMessageLegacy(
     conversation: ConversationTarget,
     picker: PickerRender,
-  ): Promise<unknown> {
-    const legacySend = (this.api.runtime.channel as {
-      discord?: {
-        sendComponentMessage?: (
-          to: string,
-          spec: DiscordComponentMessageSpec,
-          opts?: { accountId?: string },
-        ) => Promise<unknown>;
-      };
-    }).discord?.sendComponentMessage;
+  ): Promise<DiscordComponentMessageSendResult | null> {
+    const legacySend = getLegacyDiscordRuntime(this.api)?.sendComponentMessage;
     if (typeof legacySend === "function") {
       return await legacySend(
         conversation.conversationId,
@@ -5553,7 +5489,7 @@ export class CodexPluginController {
         },
       );
     }
-    throw new Error("Discord component messaging is unavailable.");
+    return null;
   }
 
   private buildDiscordPickerSpec(picker: PickerRender): DiscordComponentMessageSpec {
@@ -5595,7 +5531,7 @@ export class CodexPluginController {
   private async loadDiscordSdk(): Promise<DiscordSdkModule> {
     return await loadOpenClawCompatModule<DiscordSdkModule>({
       specifier: "openclaw/plugin-sdk/discord",
-      fallbackRelativePath: "dist/plugin-sdk/discord.js",
+      fallbackRelativePath: "dist/extensions/discord/api.js",
       label: "discord",
       logger: this.api.logger,
     });
@@ -5604,7 +5540,7 @@ export class CodexPluginController {
   private async loadTelegramAccountSdk(): Promise<TelegramAccountSdkModule> {
     return await loadOpenClawCompatModule<TelegramAccountSdkModule>({
       specifier: "openclaw/plugin-sdk/telegram-account",
-      fallbackRelativePath: "dist/plugin-sdk/telegram-account.js",
+      fallbackRelativePath: "dist/extensions/telegram/api.js",
       label: "telegram account",
       logger: this.api.logger,
     });
@@ -5623,6 +5559,23 @@ export class CodexPluginController {
       return (await import(pathToFileURL(runtimeApiPath).href)) as DiscordRuntimeApiModule;
     } catch (error) {
       this.api.logger.debug?.(`codex discord runtime api unavailable: ${String(error)}`);
+      return undefined;
+    }
+  }
+
+  private async loadTelegramRuntimeApi(): Promise<TelegramRuntimeApiModule | undefined> {
+    try {
+      const openClawEntrypointPath = resolveOpenClawEntrypointPath();
+      const runtimeApiPath = resolveCompatFallbackPath(
+        openClawEntrypointPath,
+        "dist/extensions/telegram/runtime-api.js",
+      );
+      if (!existsSync(runtimeApiPath)) {
+        return undefined;
+      }
+      return (await import(pathToFileURL(runtimeApiPath).href)) as TelegramRuntimeApiModule;
+    } catch (error) {
+      this.api.logger.debug?.(`codex telegram runtime api unavailable: ${String(error)}`);
       return undefined;
     }
   }
@@ -5652,17 +5605,20 @@ export class CodexPluginController {
   ): Promise<{ messageId: string; channelId: string }> {
     try {
       const discordSdk = await this.loadDiscordSdk();
-      return await discordSdk.editDiscordComponentMessage(to, messageId, spec, opts);
-    } catch (error) {
-      const runtimeApi = await this.loadDiscordRuntimeApi();
-      if (typeof runtimeApi?.editDiscordComponentMessage === "function") {
-        return await runtimeApi.editDiscordComponentMessage(to, messageId, spec, {
-          cfg: this.getOpenClawConfig(),
-          accountId: opts?.accountId,
-        });
+      if (typeof discordSdk.editDiscordComponentMessage === "function") {
+        return await discordSdk.editDiscordComponentMessage(to, messageId, spec, opts);
       }
-      throw error;
+    } catch (error) {
+      this.api.logger.debug?.(`codex discord component edit sdk unavailable: ${String(error)}`);
     }
+    const runtimeApi = await this.loadDiscordRuntimeApi();
+    if (typeof runtimeApi?.editDiscordComponentMessage === "function") {
+      return await runtimeApi.editDiscordComponentMessage(to, messageId, spec, {
+        cfg: this.getOpenClawConfig(),
+        accountId: opts?.accountId,
+      });
+    }
+    throw new Error("Discord component message editing is unavailable.");
   }
 
   private async registerBuiltDiscordComponentMessage(params: {
@@ -5671,16 +5627,19 @@ export class CodexPluginController {
   }): Promise<void> {
     try {
       const discordSdk = await this.loadDiscordSdk();
-      discordSdk.registerBuiltDiscordComponentMessage(params);
-      return;
-    } catch (error) {
-      const runtimeApi = await this.loadDiscordRuntimeApi();
-      if (typeof runtimeApi?.registerBuiltDiscordComponentMessage === "function") {
-        runtimeApi.registerBuiltDiscordComponentMessage(params);
+      if (typeof discordSdk.registerBuiltDiscordComponentMessage === "function") {
+        discordSdk.registerBuiltDiscordComponentMessage(params);
         return;
       }
-      throw error;
+    } catch (error) {
+      this.api.logger.debug?.(`codex discord component register sdk unavailable: ${String(error)}`);
     }
+    const runtimeApi = await this.loadDiscordRuntimeApi();
+    if (typeof runtimeApi?.registerBuiltDiscordComponentMessage === "function") {
+      runtimeApi.registerBuiltDiscordComponentMessage(params);
+      return;
+    }
+    throw new Error("Discord component message registration is unavailable.");
   }
 
   private async dispatchCallbackAction(
@@ -6807,23 +6766,19 @@ export class CodexPluginController {
   private async resolveRuntimeBackedBinding(
     conversation: ConversationTarget,
   ): Promise<HydratedBindingOutcome | null> {
-    const bindingsApi = this.api.runtime.channel.bindings;
-    const legacyResolveByConversation = bindingsApi?.resolveByConversation;
     const bindingService = getSessionBindingService();
-    const resolveByConversation =
-      typeof legacyResolveByConversation === "function"
-        ? legacyResolveByConversation.bind(bindingsApi)
-        : bindingService.resolveByConversation.bind(bindingService);
-    if (typeof resolveByConversation !== "function") {
-      const bindingKeys =
-        bindingsApi && typeof bindingsApi === "object" ? Object.keys(bindingsApi).join(",") : "<none>";
+    const publicResolveByConversation = bindingService?.resolveByConversation;
+    if (typeof publicResolveByConversation !== "function") {
       this.api.logger.warn?.(
-        `codex runtime binding recovery unavailable ${this.formatConversationForLog(conversation)} bindingsApiKeys=${bindingKeys}`,
+        `codex runtime binding recovery unavailable ${this.formatConversationForLog(conversation)} reason=no-session-binding-service`,
       );
       return null;
     }
     const runtimeConversation = toRuntimeBindingConversationRef(conversation);
-    const runtimeBinding = resolveByConversation(runtimeConversation) as RuntimeSessionBindingRecord | null;
+    const runtimeBinding = publicResolveByConversation.call(
+      bindingService,
+      runtimeConversation,
+    ) as RuntimeSessionBindingRecord | SessionBindingRecord | null;
     const metadata =
       runtimeBinding?.metadata && typeof runtimeBinding.metadata === "object"
         ? runtimeBinding.metadata
@@ -6847,22 +6802,6 @@ export class CodexPluginController {
       return null;
     }
     if (!threadId || !sessionKey) {
-      const pluginBinding = await getCurrentPluginConversationBinding({
-        pluginRoot: PLUGIN_ROOT,
-        conversation: runtimeConversation,
-      });
-      const recovered = parseBindingRecoveryPayload(pluginBinding?.summary);
-      if (recovered) {
-        this.api.logger.info?.(
-          `codex runtime binding recovery restored from plugin binding summary ${this.formatConversationForLog(conversation)} threadId=${recovered.threadId} workspace=${recovered.workspaceDir}`,
-        );
-        const binding = await this.bindConversation(conversation, {
-          threadId: recovered.threadId,
-          workspaceDir: recovered.workspaceDir,
-          threadTitle: recovered.threadTitle,
-        });
-        return { binding };
-      }
       this.api.logger.warn?.(
         `codex runtime binding recovery missing runtime identifiers ${this.formatConversationForLog(conversation)} threadId=${threadId || "<none>"} sessionKey=${sessionKey || "<none>"}`,
       );
@@ -6902,6 +6841,78 @@ export class CodexPluginController {
     return { binding };
   }
 
+  private async pruneStaleStoredBinding(
+    conversation: ConversationTarget,
+    binding: StoredBinding,
+    reason: string,
+  ): Promise<void> {
+    this.api.logger.warn?.(
+      `codex pruning stale local binding ${this.formatConversationForLog(conversation)} reason=${reason} threadId=${binding.threadId} session=${binding.sessionKey}`,
+    );
+    await this.unpinStoredBindingMessage(binding).catch(() => undefined);
+    await this.store.removeBinding(conversation);
+  }
+
+  private async validateStoredBindingForInboundClaim(
+    conversation: ConversationTarget,
+    binding: StoredBinding,
+  ): Promise<HydratedBindingOutcome | null> {
+    const bindingService = getSessionBindingService();
+    const publicResolveByConversation = bindingService?.resolveByConversation;
+    if (typeof publicResolveByConversation !== "function") {
+      return { binding };
+    }
+    const runtimeConversation = toRuntimeBindingConversationRef(conversation);
+    const runtimeBinding = publicResolveByConversation.call(
+      bindingService,
+      runtimeConversation,
+    ) as RuntimeSessionBindingRecord | SessionBindingRecord | null;
+    if (!runtimeBinding) {
+      await this.pruneStaleStoredBinding(conversation, binding, "public-session-binding-miss");
+      return null;
+    }
+    const metadata =
+      runtimeBinding.metadata && typeof runtimeBinding.metadata === "object"
+        ? runtimeBinding.metadata
+        : undefined;
+    const sessionKey = runtimeBinding.targetSessionKey?.trim() || "";
+    const metadataPluginId = typeof metadata?.pluginId === "string" ? metadata.pluginId.trim() : "";
+    const threadIdFromMetadata =
+      typeof metadata?.threadId === "string" ? metadata.threadId.trim() : "";
+    const threadId = threadIdFromMetadata || parseThreadIdFromSessionKey(sessionKey) || "";
+    const isOwnedBinding =
+      metadataPluginId === PLUGIN_ID || Boolean(parseThreadIdFromSessionKey(sessionKey));
+    if (!isOwnedBinding) {
+      await this.pruneStaleStoredBinding(
+        conversation,
+        binding,
+        `foreign-runtime-binding:${metadataPluginId || "unknown"}`,
+      );
+      return null;
+    }
+    if (!threadId) {
+      this.api.logger.debug?.(
+        `codex retaining local binding from plugin-owned runtime placeholder ${this.formatConversationForLog(conversation)} localThread=${binding.threadId} runtimeSession=${sessionKey || "<none>"}`,
+      );
+      return { binding };
+    }
+    if (threadId && threadId === binding.threadId && (!sessionKey || sessionKey === binding.sessionKey)) {
+      return { binding };
+    }
+    this.api.logger.info?.(
+      `codex refreshing local binding from runtime ${this.formatConversationForLog(conversation)} localThread=${binding.threadId} runtimeThread=${threadId || "<none>"} localSession=${binding.sessionKey} runtimeSession=${sessionKey || "<none>"}`,
+    );
+    return (
+      (await this.resolveRuntimeBackedBinding(conversation)) ?? {
+        desyncMessage: this.buildBindingDesyncMessage({
+          threadId: threadId || binding.threadId,
+        }),
+        threadId: threadId || binding.threadId,
+        sessionKey: sessionKey || binding.sessionKey,
+      }
+    );
+  }
+
   private async hydrateApprovedBinding(
     conversation: ConversationTarget,
   ): Promise<HydratedBindingOutcome | null> {
@@ -6936,11 +6947,7 @@ export class CodexPluginController {
     },
     requestBinding?: (
       params?: { summary?: string },
-    ) => Promise<
-      | { status: "bound" }
-      | { status: "pending"; reply: ReplyPayload }
-      | { status: "error"; message: string }
-    >,
+    ) => Promise<PluginConversationBindingRequestResult>,
   ): Promise<
     | { status: "bound"; binding: StoredBinding }
     | { status: "pending"; reply: ReplyPayload }
@@ -6959,11 +6966,7 @@ export class CodexPluginController {
       };
     }
     const approval = await requestBinding({
-      summary: `Bind this conversation to Codex thread ${params.threadTitle?.trim() || params.threadId}. ${encodeBindingRecoveryPayload({
-        threadId: params.threadId,
-        workspaceDir: params.workspaceDir,
-        threadTitle: params.threadTitle,
-      })}`,
+      summary: `Bind this conversation to Codex thread ${params.threadTitle?.trim() || params.threadId}.`,
     });
     if (approval.status !== "bound") {
       if (approval.status === "pending") {
@@ -6983,8 +6986,9 @@ export class CodexPluginController {
           preferences: params.preferences,
           updatedAt: Date.now(),
         });
+        return { status: "pending", reply: approval.reply };
       }
-      return approval;
+      return { status: "error", message: approval.message };
     }
     const binding = await this.bindConversation(conversation, params);
     return { status: "bound", binding };
@@ -7338,6 +7342,7 @@ export class CodexPluginController {
     );
     if (isTelegramChannel(conversation.channel)) {
       const outbound = await this.loadTelegramOutboundAdapter();
+      const outboundCfg = this.getOpenClawConfig();
       const mediaLocalRoots = this.resolveReplyMediaLocalRoots(payload.mediaUrl);
       const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
         undefined,
@@ -7351,13 +7356,14 @@ export class CodexPluginController {
       let delivered: DeliveredMessageRef | null = null;
       if (hasMedia) {
         const result =
-          chunks.length <= 1 && payload.buttons && outbound?.sendPayload
+          chunks.length <= 1 && payload.buttons && outboundCfg && outbound?.sendPayload
             ? await outbound.sendPayload({
-                cfg: this.getOpenClawConfig(),
+                cfg: outboundCfg,
                 to: conversation.parentConversationId ?? conversation.conversationId,
                 accountId: conversation.accountId,
                 threadId: conversation.threadId,
                 mediaLocalRoots,
+                text: chunks[0] ?? text,
                 payload: {
                   text: chunks[0] ?? text,
                   mediaUrl: payload.mediaUrl,
@@ -7387,12 +7393,13 @@ export class CodexPluginController {
             continue;
           }
           const result =
-            index === chunks.length - 1 && payload.buttons && outbound?.sendPayload
+            index === chunks.length - 1 && payload.buttons && outboundCfg && outbound?.sendPayload
               ? await outbound.sendPayload({
-                  cfg: this.getOpenClawConfig(),
+                  cfg: outboundCfg,
                   to: conversation.parentConversationId ?? conversation.conversationId,
                   accountId: conversation.accountId,
                   threadId: conversation.threadId,
+                  text: chunk,
                   payload: {
                     text: chunk,
                     channelData: {
@@ -7428,12 +7435,13 @@ export class CodexPluginController {
           continue;
         }
         const result =
-          index === textChunks.length - 1 && payload.buttons && outbound?.sendPayload
+          index === textChunks.length - 1 && payload.buttons && outboundCfg && outbound?.sendPayload
             ? await outbound.sendPayload({
-                cfg: this.getOpenClawConfig(),
+                cfg: outboundCfg,
                 to: conversation.parentConversationId ?? conversation.conversationId,
                 accountId: conversation.accountId,
                 threadId: conversation.threadId,
+                text: chunk,
                 payload: {
                   text: chunk,
                   channelData: {
@@ -7464,6 +7472,7 @@ export class CodexPluginController {
     }
     if (isDiscordChannel(conversation.channel)) {
       const outbound = await this.loadDiscordOutboundAdapter();
+      const outboundCfg = this.getOpenClawConfig();
       const mediaLocalRoots = this.resolveReplyMediaLocalRoots(payload.mediaUrl);
       const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
         undefined,
@@ -7512,10 +7521,11 @@ export class CodexPluginController {
           text: finalChunk,
           buttons: payload.buttons,
         };
-        if (outbound?.sendPayload) {
+        if (outboundCfg && outbound?.sendPayload) {
           const result = await outbound.sendPayload({
-            cfg: this.getOpenClawConfig(),
+            cfg: outboundCfg,
             to: conversation.conversationId,
+            text: finalChunk,
             payload: {
               text: finalChunk,
               channelData: {
@@ -7537,17 +7547,13 @@ export class CodexPluginController {
           };
         } else {
           const result = await this.sendDiscordPickerMessageLegacy(conversation, picker);
-          if (
-            result &&
-            typeof result === "object" &&
-            typeof (result as { messageId?: unknown }).messageId === "string"
-          ) {
+          if (result) {
             delivered = {
               provider: "discord",
-              messageId: (result as { messageId: string }).messageId,
+              messageId: result.messageId,
               channelId:
-                typeof (result as { channelId?: unknown }).channelId === "string"
-                  ? (result as { channelId: string }).channelId
+                typeof result.channelId === "string"
+                  ? result.channelId
                   : conversation.conversationId,
             };
           }
@@ -7597,38 +7603,43 @@ export class CodexPluginController {
     return null;
   }
 
-  private getOpenClawConfig(): unknown {
-    return this.lastRuntimeConfig ?? (this.api as OpenClawPluginApi & { config?: unknown }).config;
+  private getOpenClawConfig(): HostOpenClawConfig | undefined {
+    return (
+      this.lastRuntimeConfig ??
+      ((this.api as OpenClawPluginApi & { config?: HostOpenClawConfig }).config)
+    );
   }
 
-  private async loadTelegramOutboundAdapter(): Promise<TelegramOutboundAdapter | undefined> {
+  private async loadTelegramOutboundAdapter(): Promise<ProviderOutboundAdapter | undefined> {
     const loadAdapter = this.api.runtime.channel.outbound?.loadAdapter;
     if (typeof loadAdapter !== "function") {
       return undefined;
     }
-    return (await loadAdapter("telegram")) as TelegramOutboundAdapter | undefined;
+    return (await loadAdapter("telegram")) as ProviderOutboundAdapter | undefined;
   }
 
-  private async loadDiscordOutboundAdapter(): Promise<DiscordOutboundAdapter | undefined> {
+  private async loadDiscordOutboundAdapter(): Promise<ProviderOutboundAdapter | undefined> {
     const loadAdapter = this.api.runtime.channel.outbound?.loadAdapter;
     if (typeof loadAdapter !== "function") {
       return undefined;
     }
-    return (await loadAdapter("discord")) as DiscordOutboundAdapter | undefined;
+    return (await loadAdapter("discord")) as ProviderOutboundAdapter | undefined;
   }
 
   private async sendTelegramTextChunk(
-    outbound: TelegramOutboundAdapter | undefined,
+    outbound: ProviderOutboundAdapter | undefined,
     conversation: ConversationTarget,
     text: string,
     opts?: { buttons?: PluginInteractiveButtons },
   ): Promise<{ messageId: string; chatId?: string }> {
     const target = conversation.parentConversationId ?? conversation.conversationId;
     const buttons = opts?.buttons;
-    if (buttons && outbound?.sendPayload) {
+    const cfg = this.getOpenClawConfig();
+    if (buttons && cfg && outbound?.sendPayload) {
       return await outbound.sendPayload({
-        cfg: this.getOpenClawConfig(),
+        cfg,
         to: target,
+        text,
         payload: {
           text,
           channelData: {
@@ -7641,7 +7652,7 @@ export class CodexPluginController {
         threadId: conversation.threadId,
       });
     }
-    const legacySend = this.api.runtime.channel.telegram?.sendMessageTelegram;
+    const legacySend = getLegacyTelegramRuntime(this.api)?.sendMessageTelegram;
     if (buttons && typeof legacySend === "function") {
       return await legacySend(target, text, {
         accountId: conversation.accountId,
@@ -7649,27 +7660,36 @@ export class CodexPluginController {
         buttons,
       });
     }
-    if (outbound?.sendText) {
+    if (!buttons && cfg && outbound?.sendText) {
       return await outbound.sendText({
-        cfg: this.getOpenClawConfig(),
+        cfg,
         to: target,
         text,
         accountId: conversation.accountId,
         threadId: conversation.threadId,
       });
     }
-    if (typeof legacySend !== "function") {
-      throw new Error("Telegram send runtime unavailable");
+    if (typeof legacySend === "function") {
+      return await legacySend(target, text, {
+        accountId: conversation.accountId,
+        messageThreadId: typeof conversation.threadId === "number" ? conversation.threadId : undefined,
+        buttons,
+      });
     }
-    return await legacySend(target, text, {
-      accountId: conversation.accountId,
-      messageThreadId: typeof conversation.threadId === "number" ? conversation.threadId : undefined,
-      buttons,
-    });
+    const runtimeApi = await this.loadTelegramRuntimeApi();
+    if (typeof runtimeApi?.sendMessageTelegram === "function") {
+      return await runtimeApi.sendMessageTelegram(target, text, {
+        cfg: this.getOpenClawConfig(),
+        accountId: conversation.accountId,
+        messageThreadId: typeof conversation.threadId === "number" ? conversation.threadId : undefined,
+        ...(buttons ? { buttons } : {}),
+      });
+    }
+    throw new Error("Telegram send runtime unavailable");
   }
 
   private async sendTelegramMediaChunk(
-    outbound: TelegramOutboundAdapter | undefined,
+    outbound: ProviderOutboundAdapter | undefined,
     conversation: ConversationTarget,
     text: string,
     opts: {
@@ -7682,10 +7702,12 @@ export class CodexPluginController {
       throw new Error("Telegram media send requires mediaUrl");
     }
     const target = conversation.parentConversationId ?? conversation.conversationId;
-    if (opts.buttons && outbound?.sendPayload) {
+    const cfg = this.getOpenClawConfig();
+    if (opts.buttons && cfg && outbound?.sendPayload) {
       return await outbound.sendPayload({
-        cfg: this.getOpenClawConfig(),
+        cfg,
         to: target,
+        text,
         payload: {
           text,
           mediaUrl: opts.mediaUrl,
@@ -7700,7 +7722,7 @@ export class CodexPluginController {
         threadId: conversation.threadId,
       });
     }
-    const legacySend = this.api.runtime.channel.telegram?.sendMessageTelegram;
+    const legacySend = getLegacyTelegramRuntime(this.api)?.sendMessageTelegram;
     if (opts.buttons && typeof legacySend === "function") {
       return await legacySend(target, text, {
         accountId: conversation.accountId,
@@ -7710,9 +7732,9 @@ export class CodexPluginController {
         buttons: opts.buttons,
       });
     }
-    if (outbound?.sendMedia) {
+    if (!opts.buttons && cfg && outbound?.sendMedia) {
       return await outbound.sendMedia({
-        cfg: this.getOpenClawConfig(),
+        cfg,
         to: target,
         text,
         mediaUrl: opts.mediaUrl,
@@ -7721,29 +7743,41 @@ export class CodexPluginController {
         threadId: conversation.threadId,
       });
     }
-    if (typeof legacySend !== "function") {
-      throw new Error("Telegram media send runtime unavailable");
+    if (typeof legacySend === "function") {
+      return await legacySend(target, text, {
+        accountId: conversation.accountId,
+        messageThreadId: typeof conversation.threadId === "number" ? conversation.threadId : undefined,
+        mediaUrl: opts.mediaUrl,
+        mediaLocalRoots: opts.mediaLocalRoots,
+        buttons: opts.buttons,
+      });
     }
-    return await legacySend(target, text, {
-      accountId: conversation.accountId,
-      messageThreadId: typeof conversation.threadId === "number" ? conversation.threadId : undefined,
-      mediaUrl: opts.mediaUrl,
-      mediaLocalRoots: opts.mediaLocalRoots,
-      buttons: opts.buttons,
-    });
+    const runtimeApi = await this.loadTelegramRuntimeApi();
+    if (typeof runtimeApi?.sendMessageTelegram === "function") {
+      return await runtimeApi.sendMessageTelegram(target, text, {
+        cfg: this.getOpenClawConfig(),
+        accountId: conversation.accountId,
+        messageThreadId: typeof conversation.threadId === "number" ? conversation.threadId : undefined,
+        mediaUrl: opts.mediaUrl,
+        mediaLocalRoots: opts.mediaLocalRoots,
+        ...(opts.buttons ? { buttons: opts.buttons } : {}),
+      });
+    }
+    throw new Error("Telegram media send runtime unavailable");
   }
 
   private async sendDiscordTextChunk(
-    outbound: DiscordOutboundAdapter | undefined,
+    outbound: ProviderOutboundAdapter | undefined,
     conversation: ConversationTarget,
     text: string,
     opts?: { mediaUrl?: string; mediaLocalRoots?: readonly string[] },
   ): Promise<{ messageId: string; channelId?: string }> {
     const mediaUrl = opts?.mediaUrl;
     const mediaLocalRoots = opts?.mediaLocalRoots;
-    if (mediaUrl && outbound?.sendMedia) {
+    const cfg = this.getOpenClawConfig();
+    if (mediaUrl && cfg && outbound?.sendMedia) {
       return await outbound.sendMedia({
-        cfg: this.getOpenClawConfig(),
+        cfg,
         to: conversation.conversationId,
         text,
         mediaUrl,
@@ -7751,27 +7785,15 @@ export class CodexPluginController {
         mediaLocalRoots,
       });
     }
-    if (!mediaUrl && outbound?.sendText) {
+    if (!mediaUrl && cfg && outbound?.sendText) {
       return await outbound.sendText({
-        cfg: this.getOpenClawConfig(),
+        cfg,
         to: conversation.conversationId,
         text,
         accountId: conversation.accountId,
       });
     }
-    const legacySend = (this.api.runtime.channel as {
-      discord?: {
-        sendMessageDiscord?: (
-          to: string,
-          text: string,
-          opts?: {
-            accountId?: string;
-            mediaUrl?: string;
-            mediaLocalRoots?: readonly string[];
-          },
-        ) => Promise<{ messageId: string; channelId: string }>;
-      };
-    }).discord?.sendMessageDiscord;
+    const legacySend = getLegacyDiscordRuntime(this.api)?.sendMessageDiscord;
     if (typeof legacySend === "function") {
       return await legacySend(conversation.conversationId, text, {
         accountId: conversation.accountId,
@@ -7835,9 +7857,6 @@ export class CodexPluginController {
 
   private async unbindConversation(conversation: ConversationTarget): Promise<void> {
     const binding = this.store.getBinding(conversation);
-    if (binding) {
-      await this.store.rememberDetachedThread(binding);
-    }
     if (binding?.pinnedBindingMessage) {
       await this.unpinStoredBindingMessage(binding);
     }
@@ -7849,18 +7868,38 @@ export class CodexPluginController {
   }
 
   private async startTypingLease(conversation: ConversationTarget): Promise<{
+    refresh: () => Promise<void>;
     stop: () => void;
   } | null> {
     if (isTelegramChannel(conversation.channel)) {
-      const legacyTyping = this.api.runtime.channel.telegram?.typing?.start;
+      const runtimeTyping = await this.startTelegramRuntimeTypingLease(conversation).catch(
+        (error) => {
+          this.api.logger.debug?.(`codex telegram runtime typing failed: ${String(error)}`);
+          return null;
+        },
+      );
+      if (runtimeTyping) {
+        return runtimeTyping;
+      }
+      const directTyping = await this.startTelegramDirectTypingLease(conversation).catch((error) => {
+        this.api.logger.debug?.(`codex telegram direct typing lease failed: ${String(error)}`);
+        return null;
+      });
+      if (directTyping) {
+        return directTyping;
+      }
+      const legacyTyping = getLegacyTelegramRuntime(this.api)?.typing?.start;
       if (typeof legacyTyping === "function") {
         return await legacyTyping({
           to: conversation.parentConversationId ?? conversation.conversationId,
           accountId: conversation.accountId,
           messageThreadId: conversation.threadId,
+        }).catch((error) => {
+          this.api.logger.debug?.(`codex telegram legacy typing skipped: ${String(error)}`);
+          return null;
         });
       }
-      return await this.startTelegramTypingLease(conversation);
+      return null;
     }
     if (isDiscordChannel(conversation.channel)) {
       if (conversation.conversationId.startsWith("user:")) {
@@ -7868,39 +7907,23 @@ export class CodexPluginController {
       }
       const channelId =
         denormalizeDiscordConversationId(conversation.conversationId) ?? conversation.conversationId;
-      const legacyTyping = (this.api.runtime.channel as {
-        discord?: {
-          typing?: {
-            start?: (params: {
-              channelId: string;
-              accountId?: string;
-            }) => Promise<{ refresh: () => Promise<void>; stop: () => void }>;
-          };
-        };
-      }).discord?.typing?.start;
+      const legacyTyping = getLegacyDiscordRuntime(this.api)?.typing?.start;
       if (typeof legacyTyping !== "function") {
         const runtimeApi = await this.loadDiscordRuntimeApi();
         if (typeof runtimeApi?.sendTypingDiscord !== "function") {
           return null;
         }
-        const sendTyping = async () => {
-          await runtimeApi.sendTypingDiscord?.(channelId, {
-            cfg: this.getOpenClawConfig(),
-            accountId: conversation.accountId,
-          });
-        };
-        await sendTyping().catch((error) => {
-          this.api.logger.debug?.(`codex discord typing skipped: ${String(error)}`);
+        return await this.startManagedTypingLease({
+          start: async () => {
+            await runtimeApi.sendTypingDiscord?.(channelId, {
+              cfg: this.getOpenClawConfig(),
+              accountId: conversation.accountId,
+            });
+          },
+          onStartError: (error) => {
+            this.api.logger.debug?.(`codex discord typing helper failed: ${String(error)}`);
+          },
         });
-        const timer = setInterval(() => {
-          void sendTyping().catch((error) => {
-            this.api.logger.debug?.(`codex discord typing refresh failed: ${String(error)}`);
-          });
-        }, 4_000);
-        return {
-          refresh: sendTyping,
-          stop: () => clearInterval(timer),
-        };
       }
       return await legacyTyping({
         channelId,
@@ -8037,27 +8060,14 @@ export class CodexPluginController {
     }
     try {
       if (delivered.provider === "telegram") {
-        const token = await this.resolveTelegramBotToken(conversation.accountId);
-        if (!token) {
-          this.api.logger.debug?.(
-            `codex telegram pin skipped ${this.formatConversationForLog(conversation)} reason=no-token`,
-          );
-          return;
-        }
-        await this.callTelegramPinApi("pinChatMessage", token, {
-          chat_id: delivered.chatId,
-          message_id: Number(delivered.messageId),
-          disable_notification: true,
+        await this.pinTelegramMessage(delivered.chatId, delivered.messageId, {
+          accountId: conversation.accountId,
+          disableNotification: true,
         });
       } else {
-        const token = await this.resolveDiscordBotToken(conversation.accountId);
-        if (!token) {
-          this.api.logger.debug?.(
-            `codex discord pin skipped ${this.formatConversationForLog(conversation)} reason=no-token`,
-          );
-          return;
-        }
-        await this.callDiscordPinApi("pin", token, delivered.channelId, delivered.messageId);
+        await this.pinDiscordMessage(delivered.channelId, delivered.messageId, {
+          accountId: conversation.accountId,
+        });
       }
       await this.store.upsertBinding({
         ...binding,
@@ -8076,26 +8086,13 @@ export class CodexPluginController {
     }
     try {
       if (pinned.provider === "telegram") {
-        const token = await this.resolveTelegramBotToken(binding.conversation.accountId);
-        if (!token) {
-          this.api.logger.debug?.(
-            `codex telegram unpin skipped conversation=${binding.conversation.conversationId} reason=no-token`,
-          );
-          return;
-        }
-        await this.callTelegramPinApi("unpinChatMessage", token, {
-          chat_id: pinned.chatId,
-          message_id: Number(pinned.messageId),
+        await this.unpinTelegramMessage(pinned.chatId, pinned.messageId, {
+          accountId: binding.conversation.accountId,
         });
       } else {
-        const token = await this.resolveDiscordBotToken(binding.conversation.accountId);
-        if (!token) {
-          this.api.logger.debug?.(
-            `codex discord unpin skipped conversation=${binding.conversation.conversationId} reason=no-token`,
-          );
-          return;
-        }
-        await this.callDiscordPinApi("unpin", token, pinned.channelId, pinned.messageId);
+        await this.unpinDiscordMessage(pinned.channelId, pinned.messageId, {
+          accountId: binding.conversation.accountId,
+        });
       }
     } catch (error) {
       this.api.logger.warn(`codex binding message unpin failed: ${String(error)}`);
@@ -8103,7 +8100,7 @@ export class CodexPluginController {
   }
 
   private async resolveTelegramBotToken(accountId?: string): Promise<string | undefined> {
-    const legacyResolution = this.api.runtime.channel.telegram?.resolveTelegramToken?.(
+    const legacyResolution = getLegacyTelegramRuntime(this.api)?.resolveTelegramToken?.(
       this.getOpenClawConfig(),
       { accountId },
     );
@@ -8156,7 +8153,77 @@ export class CodexPluginController {
     return token || undefined;
   }
 
-  private async startTelegramTypingLease(conversation: ConversationTarget): Promise<{
+  private async startManagedTypingLease(params: {
+    start: CreateTypingCallbacksParams["start"];
+    onStartError: CreateTypingCallbacksParams["onStartError"];
+    onStopError?: CreateTypingCallbacksParams["onStopError"];
+    keepaliveIntervalMs?: number;
+    maxConsecutiveFailures?: number;
+    maxDurationMs?: number;
+    requireInitialSuccess?: boolean;
+  }): Promise<{
+    refresh: () => Promise<void>;
+    stop: () => void;
+  } | null> {
+    let skipManagedStart = false;
+    if (params.requireInitialSuccess) {
+      try {
+        await params.start();
+        skipManagedStart = true;
+      } catch (error) {
+        params.onStartError(error);
+        return null;
+      }
+    }
+    const callbacks = createTypingCallbacks({
+      start: async () => {
+        if (skipManagedStart) {
+          skipManagedStart = false;
+          return;
+        }
+        await params.start();
+      },
+      onStartError: params.onStartError,
+      onStopError: params.onStopError,
+      keepaliveIntervalMs: params.keepaliveIntervalMs ?? 4_000,
+      maxConsecutiveFailures: params.maxConsecutiveFailures,
+      // Codex runs can stay alive for hours without a terminal reply. The plugin owns
+      // lease cleanup explicitly, so do not inherit the host helper's 60s safety TTL
+      // unless a caller opts into one.
+      maxDurationMs: params.maxDurationMs ?? 0,
+    });
+    await callbacks.onReplyStart();
+    return {
+      refresh: callbacks.onReplyStart,
+      stop: () => callbacks.onCleanup?.(),
+    };
+  }
+
+  private async startTelegramRuntimeTypingLease(conversation: ConversationTarget): Promise<{
+    refresh: () => Promise<void>;
+    stop: () => void;
+  } | null> {
+    const runtimeApi = await this.loadTelegramRuntimeApi();
+    if (typeof runtimeApi?.sendTypingTelegram !== "function") {
+      return null;
+    }
+    const target = conversation.parentConversationId ?? conversation.conversationId;
+    return await this.startManagedTypingLease({
+      start: async () => {
+        await runtimeApi.sendTypingTelegram?.(target, {
+          cfg: this.getOpenClawConfig(),
+          accountId: conversation.accountId,
+          ...(conversation.threadId != null ? { messageThreadId: conversation.threadId } : {}),
+        });
+      },
+      onStartError: (error) => {
+        this.api.logger.debug?.(`codex telegram runtime typing failed: ${String(error)}`);
+      },
+      requireInitialSuccess: true,
+    });
+  }
+
+  private async startTelegramDirectTypingLease(conversation: ConversationTarget): Promise<{
     refresh: () => Promise<void>;
     stop: () => void;
   } | null> {
@@ -8169,32 +8236,171 @@ export class CodexPluginController {
       action: "typing",
       ...(conversation.threadId != null ? { message_thread_id: conversation.threadId } : {}),
     };
-    const sendTyping = async () => {
-      const response = await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(body),
-      });
-      if (!response.ok) {
-        throw new Error(
-          `Telegram sendChatAction failed status=${response.status} body=${await response.text()}`,
-        );
-      }
-    };
-    await sendTyping().catch((error) => {
-      this.api.logger.debug?.(`codex telegram typing skipped: ${String(error)}`);
-    });
-    const timer = setInterval(() => {
-      void sendTyping().catch((error) => {
+    return await this.startManagedTypingLease({
+      start: async () => {
+        const response = await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
+        if (!response.ok) {
+          throw new Error(
+            `Telegram sendChatAction failed status=${response.status} body=${await response.text()}`,
+          );
+        }
+      },
+      onStartError: (error) => {
         this.api.logger.debug?.(`codex telegram typing refresh failed: ${String(error)}`);
+      },
+      requireInitialSuccess: true,
+    });
+  }
+
+  private async pinTelegramMessage(
+    chatId: string,
+    messageId: string,
+    opts?: { accountId?: string; disableNotification?: boolean },
+  ): Promise<void> {
+    const runtimeApi = await this.loadTelegramRuntimeApi();
+    if (typeof runtimeApi?.pinMessageTelegram === "function") {
+      await runtimeApi.pinMessageTelegram(chatId, messageId, {
+        cfg: this.getOpenClawConfig(),
+        accountId: opts?.accountId,
       });
-    }, 4_000);
-    return {
-      refresh: sendTyping,
-      stop: () => clearInterval(timer),
-    };
+      return;
+    }
+    const token = await this.resolveTelegramBotToken(opts?.accountId);
+    if (!token) {
+      this.api.logger.debug?.(`codex telegram pin skipped chat=${chatId} reason=no-token`);
+      return;
+    }
+    await this.callTelegramPinApi("pinChatMessage", token, {
+      chat_id: chatId,
+      message_id: Number(messageId),
+      disable_notification: opts?.disableNotification ?? false,
+    });
+  }
+
+  private async unpinTelegramMessage(
+    chatId: string,
+    messageId: string,
+    opts?: { accountId?: string },
+  ): Promise<void> {
+    const runtimeApi = await this.loadTelegramRuntimeApi();
+    if (typeof runtimeApi?.unpinMessageTelegram === "function") {
+      await runtimeApi.unpinMessageTelegram(chatId, messageId, {
+        cfg: this.getOpenClawConfig(),
+        accountId: opts?.accountId,
+      });
+      return;
+    }
+    const token = await this.resolveTelegramBotToken(opts?.accountId);
+    if (!token) {
+      this.api.logger.debug?.(`codex telegram unpin skipped chat=${chatId} reason=no-token`);
+      return;
+    }
+    await this.callTelegramPinApi("unpinChatMessage", token, {
+      chat_id: chatId,
+      message_id: Number(messageId),
+    });
+  }
+
+  private async editTelegramMessage(
+    chatId: string,
+    messageId: string,
+    text: string,
+    opts?: { accountId?: string; buttons?: PluginInteractiveButtons },
+  ): Promise<void> {
+    const runtimeApi = await this.loadTelegramRuntimeApi();
+    if (typeof runtimeApi?.editMessageTelegram === "function") {
+      await runtimeApi.editMessageTelegram(chatId, messageId, text, {
+        cfg: this.getOpenClawConfig(),
+        accountId: opts?.accountId,
+        ...(opts?.buttons ? { buttons: opts.buttons } : {}),
+      });
+      return;
+    }
+    const token = await this.resolveTelegramBotToken(opts?.accountId);
+    if (!token) {
+      throw new Error("Telegram edit skipped because no bot token was available");
+    }
+    await this.callTelegramEditMessageApi(token, {
+      chat_id: chatId,
+      message_id: Number(messageId),
+      text,
+      ...(opts?.buttons
+        ? { reply_markup: buildTelegramReplyMarkup(opts.buttons) ?? { inline_keyboard: [] } }
+        : {}),
+    });
+  }
+
+  private async renameTelegramTopic(
+    chatId: string,
+    messageThreadId: number,
+    name: string,
+    opts?: { accountId?: string },
+  ): Promise<void> {
+    const runtimeApi = await this.loadTelegramRuntimeApi();
+    if (typeof runtimeApi?.renameForumTopicTelegram === "function") {
+      await runtimeApi.renameForumTopicTelegram(chatId, messageThreadId, name, {
+        cfg: this.getOpenClawConfig(),
+        accountId: opts?.accountId,
+      });
+      return;
+    }
+    const token = await this.resolveTelegramBotToken(opts?.accountId);
+    if (!token) {
+      return;
+    }
+    await this.callTelegramTopicEditApi(token, {
+      chat_id: chatId,
+      message_thread_id: messageThreadId,
+      name,
+    });
+  }
+
+  private async pinDiscordMessage(
+    channelId: string,
+    messageId: string,
+    opts?: { accountId?: string },
+  ): Promise<void> {
+    const runtimeApi = await this.loadDiscordRuntimeApi();
+    if (typeof runtimeApi?.pinMessageDiscord === "function") {
+      await runtimeApi.pinMessageDiscord(channelId, messageId, {
+        cfg: this.getOpenClawConfig(),
+        accountId: opts?.accountId,
+      });
+      return;
+    }
+    const token = await this.resolveDiscordBotToken(opts?.accountId);
+    if (!token) {
+      this.api.logger.debug?.(`codex discord pin skipped channel=${channelId} reason=no-token`);
+      return;
+    }
+    await this.callDiscordPinApi("pin", token, channelId, messageId);
+  }
+
+  private async unpinDiscordMessage(
+    channelId: string,
+    messageId: string,
+    opts?: { accountId?: string },
+  ): Promise<void> {
+    const runtimeApi = await this.loadDiscordRuntimeApi();
+    if (typeof runtimeApi?.unpinMessageDiscord === "function") {
+      await runtimeApi.unpinMessageDiscord(channelId, messageId, {
+        cfg: this.getOpenClawConfig(),
+        accountId: opts?.accountId,
+      });
+      return;
+    }
+    const token = await this.resolveDiscordBotToken(opts?.accountId);
+    if (!token) {
+      this.api.logger.debug?.(`codex discord unpin skipped channel=${channelId} reason=no-token`);
+      return;
+    }
+    await this.callDiscordPinApi("unpin", token, channelId, messageId);
   }
 
   private async callDiscordPinApi(
@@ -8285,7 +8491,7 @@ export class CodexPluginController {
     name: string,
   ): Promise<void> {
     if (isTelegramChannel(conversation.channel) && conversation.threadId != null) {
-      const legacyRename = this.api.runtime.channel.telegram?.conversationActions?.renameTopic;
+      const legacyRename = getLegacyTelegramRuntime(this.api)?.conversationActions?.renameTopic;
       if (typeof legacyRename === "function") {
         await legacyRename(
           conversation.parentConversationId ?? conversation.conversationId,
@@ -8299,31 +8505,20 @@ export class CodexPluginController {
         });
         return;
       }
-      const token = await this.resolveTelegramBotToken(conversation.accountId);
-      if (!token) {
-        return;
-      }
-      await this.callTelegramTopicEditApi(token, {
-        chat_id: conversation.parentConversationId ?? conversation.conversationId,
-        message_thread_id: conversation.threadId,
+      await this.renameTelegramTopic(
+        conversation.parentConversationId ?? conversation.conversationId,
+        conversation.threadId,
         name,
-      }).catch((error) => {
+        {
+          accountId: conversation.accountId,
+        },
+      ).catch((error) => {
         this.api.logger.warn(`codex telegram topic rename failed: ${String(error)}`);
       });
       return;
     }
     if (isDiscordChannel(conversation.channel)) {
-      const legacyEditChannel = (this.api.runtime.channel as {
-        discord?: {
-          conversationActions?: {
-            editChannel?: (
-              channelId: string,
-              params: { name?: string },
-              opts?: { accountId?: string },
-            ) => Promise<unknown>;
-          };
-        };
-      }).discord?.conversationActions?.editChannel;
+      const legacyEditChannel = getLegacyDiscordRuntime(this.api)?.conversationActions?.editChannel;
       if (typeof legacyEditChannel !== "function") {
         const runtimeApi = await this.loadDiscordRuntimeApi();
         if (typeof runtimeApi?.editChannelDiscord !== "function") {

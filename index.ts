@@ -1,4 +1,8 @@
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type {
+  OpenClawPluginApi,
+  PluginInteractiveDiscordHandlerContext,
+  PluginInteractiveTelegramHandlerContext,
+} from "./src/openclaw-types.js";
 import { CodexPluginController } from "./src/controller.js";
 import { COMMANDS } from "./src/commands.js";
 import { INTERACTIVE_NAMESPACE } from "./src/types.js";
@@ -30,7 +34,7 @@ const plugin = {
       channel: "telegram",
       namespace: INTERACTIVE_NAMESPACE,
       handler: async (ctx) => {
-        await controller.handleTelegramInteractive(ctx);
+        await controller.handleTelegramInteractive(ctx as PluginInteractiveTelegramHandlerContext);
         return { handled: true };
       },
     });
@@ -39,7 +43,7 @@ const plugin = {
       channel: "discord",
       namespace: INTERACTIVE_NAMESPACE,
       handler: async (ctx) => {
-        await controller.handleDiscordInteractive(ctx);
+        await controller.handleDiscordInteractive(ctx as PluginInteractiveDiscordHandlerContext);
         return { handled: true };
       },
     });

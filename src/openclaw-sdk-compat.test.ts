@@ -1,3 +1,7 @@
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   isMissingPluginSdkSubpathError,
@@ -5,6 +9,8 @@ import {
   resolveCompatFallbackPath,
   resolveOpenClawEntrypointPath,
 } from "./openclaw-sdk-compat.js";
+
+const require = createRequire(import.meta.url);
 
 describe("openclaw sdk compat", () => {
   it("detects removed plugin sdk subpath exports", () => {
@@ -54,7 +60,7 @@ describe("openclaw sdk compat", () => {
 
     const result = await loadOpenClawCompatModule<{ ok: boolean; specifier: string }>({
       specifier: "openclaw/plugin-sdk/discord",
-      fallbackRelativePath: "dist/plugin-sdk/discord.js",
+      fallbackRelativePath: "dist/extensions/discord/api.js",
       label: "discord",
       importer,
       resolver: () => "/tmp/node_modules/openclaw/dist/index.js",
@@ -64,7 +70,7 @@ describe("openclaw sdk compat", () => {
 
     expect(result).toEqual({
       ok: true,
-      specifier: "file:///tmp/node_modules/openclaw/dist/plugin-sdk/discord.js",
+      specifier: "file:///tmp/node_modules/openclaw/dist/extensions/discord/api.js",
     });
     expect(importer).toHaveBeenCalledTimes(2);
   });
@@ -111,7 +117,7 @@ describe("openclaw sdk compat", () => {
     await expect(
       loadOpenClawCompatModule({
         specifier: "openclaw/plugin-sdk/discord",
-        fallbackRelativePath: "dist/plugin-sdk/discord.js",
+        fallbackRelativePath: "dist/extensions/discord/api.js",
         label: "discord",
         importer,
         resolver: () => "/tmp/node_modules/openclaw/dist/index.js",
@@ -119,5 +125,142 @@ describe("openclaw sdk compat", () => {
         cache: new Map(),
       }),
     ).rejects.toThrow("boom");
+  });
+
+  it("resolves the published host entry points used by this repo", () => {
+    expect(require.resolve("openclaw/plugin-sdk/core")).toContain("/openclaw/");
+    expect(require.resolve("openclaw/plugin-sdk/channel-contract")).toContain("/openclaw/");
+    expect(require.resolve("openclaw/plugin-sdk/conversation-runtime")).toContain("/openclaw/");
+    expect(require.resolve("openclaw/plugin-sdk/plugin-runtime")).toContain("/openclaw/");
+  });
+
+  it("keeps the required compat fallback files on the installed host", () => {
+    const entrypointPath = resolveOpenClawEntrypointPath();
+    const requiredFallbacks = [
+      "dist/extensions/discord/api.js",
+      "dist/extensions/discord/runtime-api.js",
+      "dist/extensions/telegram/api.js",
+      "dist/extensions/telegram/runtime-api.js",
+    ];
+
+    for (const fallbackRelativePath of requiredFallbacks) {
+      expect(fs.existsSync(resolveCompatFallbackPath(entrypointPath, fallbackRelativePath))).toBe(
+        true,
+      );
+    }
+  });
+
+  it("exposes the required compat fallback exports on the installed host", async () => {
+    const entrypointPath = resolveOpenClawEntrypointPath();
+    const requiredModules = [
+      {
+        fallbackRelativePath: "dist/extensions/discord/api.js",
+        requiredExports: ["buildDiscordComponentMessage", "resolveDiscordAccount"],
+      },
+      {
+        fallbackRelativePath: "dist/extensions/discord/runtime-api.js",
+        requiredExports: [
+          "editChannelDiscord",
+          "editDiscordComponentMessage",
+          "pinMessageDiscord",
+          "registerBuiltDiscordComponentMessage",
+          "sendDiscordComponentMessage",
+          "sendMessageDiscord",
+          "sendTypingDiscord",
+          "unpinMessageDiscord",
+        ],
+      },
+      {
+        fallbackRelativePath: "dist/extensions/telegram/api.js",
+        requiredExports: ["resolveTelegramAccount"],
+      },
+      {
+        fallbackRelativePath: "dist/extensions/telegram/runtime-api.js",
+        requiredExports: [
+          "editMessageTelegram",
+          "pinMessageTelegram",
+          "renameForumTopicTelegram",
+          "sendMessageTelegram",
+          "sendTypingTelegram",
+          "unpinMessageTelegram",
+        ],
+      },
+    ];
+
+    for (const moduleSpec of requiredModules) {
+      const modulePath = resolveCompatFallbackPath(entrypointPath, moduleSpec.fallbackRelativePath);
+      const moduleUrl = pathToFileURL(path.resolve(modulePath)).href;
+      const loaded = (await import(moduleUrl)) as Record<string, unknown>;
+      for (const exportName of moduleSpec.requiredExports) {
+        expect(typeof loaded[exportName], `${moduleSpec.fallbackRelativePath} -> ${exportName}`).toBe(
+          "function",
+        );
+      }
+    }
+  });
+
+  it("parses the repo-supported Discord component helper spec on the installed host", async () => {
+    const entrypointPath = resolveOpenClawEntrypointPath();
+    const modulePath = resolveCompatFallbackPath(entrypointPath, "dist/extensions/discord/api.js");
+    const moduleUrl = pathToFileURL(path.resolve(modulePath)).href;
+    const loaded = (await import(moduleUrl)) as {
+      buildDiscordComponentMessage: (params: {
+        spec: Record<string, unknown>;
+        fallbackText?: string;
+      }) => {
+        components: unknown[];
+        entries: Array<{ kind?: string; label?: string; callbackData?: string; modalId?: string }>;
+        modals: Array<{ title?: string; callbackData?: string; fields?: unknown[] }>;
+      };
+    };
+
+    const buildResult = loaded.buildDiscordComponentMessage({
+      spec: {
+        text: "Hello",
+        blocks: [
+          {
+            type: "actions",
+            buttons: [{ label: "Pick", callbackData: "pick" }],
+          },
+        ],
+        modal: {
+          title: "Reason",
+          callbackData: "reason",
+          triggerLabel: "Open",
+          fields: [{ type: "text", label: "Why?", required: true }],
+        },
+      },
+      fallbackText: "Hello",
+    });
+
+    expect(Array.isArray(buildResult.components)).toBe(true);
+    expect(buildResult.components.length).toBeGreaterThan(0);
+    expect(buildResult.entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "button",
+          label: "Pick",
+          callbackData: "pick",
+        }),
+        expect.objectContaining({
+          kind: "modal-trigger",
+          label: "Open",
+        }),
+      ]),
+    );
+    expect(buildResult.modals).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          title: "Reason",
+          callbackData: "reason",
+          fields: expect.arrayContaining([
+            expect.objectContaining({
+              label: "Why?",
+              type: "text",
+            }),
+          ]),
+        }),
+      ]),
+    );
   });
 });

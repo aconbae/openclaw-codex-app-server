@@ -163,6 +163,36 @@ describe("buildTurnSteerPayloads", () => {
   });
 });
 
+describe("buildCodexAppServerChildEnv", () => {
+  it("strips OPENAI_API_KEY before spawning the Codex child", () => {
+    expect(
+      __testing.buildCodexAppServerChildEnv({
+        PATH: "/usr/bin",
+        HOME: "/Users/lain",
+        OPENAI_API_KEY: "sk-host-secret",
+        OPENCLAW_API_KEY: "gateway-secret",
+      }),
+    ).toEqual({
+      PATH: "/usr/bin",
+      HOME: "/Users/lain",
+      OPENCLAW_API_KEY: "gateway-secret",
+    });
+  });
+
+  it("removes denied env vars case-insensitively", () => {
+    expect(
+      __testing.buildCodexAppServerChildEnv({
+        Path: "/usr/bin",
+        openai_api_key: "sk-host-secret",
+        CUSTOM_FLAG: "1",
+      }),
+    ).toEqual({
+      Path: "/usr/bin",
+      CUSTOM_FLAG: "1",
+    });
+  });
+});
+
 describe("buildThreadResumePayloads", () => {
   it("uses the canonical camelCase resume payload", () => {
     expect(
@@ -465,6 +495,104 @@ describe("CodexAppServerClient.startTurn", () => {
     }
   });
 
+  it("ignores stale same-thread notifications until the fresh run id is known", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new CodexAppServerClient(
+        {
+          enabled: true,
+          transport: "stdio",
+          command: "codex",
+          args: [],
+          requestTimeoutMs: 1_000,
+        },
+        {
+          debug: vi.fn(),
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+        },
+      );
+      const updates: string[] = [];
+      const request = vi.fn((method: string) => {
+        if (method === "thread/resume") {
+          return Promise.resolve({ threadId: "thread-123", model: "gpt-5.4" });
+        }
+        if (method === "turn/start") {
+          return new Promise((resolve) => {
+            queueMicrotask(async () => {
+              await (client as any).dispatchNotification("item/completed", {
+                threadId: "thread-123",
+                turnId: "turn-old",
+                item: {
+                  type: "agentMessage",
+                  id: "msg-old",
+                  text: "Stale reply.",
+                },
+              });
+              await (client as any).dispatchNotification("turn/completed", {
+                threadId: "thread-123",
+                turn: {
+                  id: "turn-old",
+                  status: "completed",
+                },
+              });
+              resolve({ threadId: "thread-123", runId: "turn-new" });
+              await (client as any).dispatchNotification("item/completed", {
+                threadId: "thread-123",
+                turnId: "turn-new",
+                item: {
+                  type: "agentMessage",
+                  id: "msg-new",
+                  text: "Fresh reply.",
+                },
+              });
+              await (client as any).dispatchNotification("turn/completed", {
+                threadId: "thread-123",
+                turn: {
+                  id: "turn-new",
+                  status: "completed",
+                },
+              });
+            });
+          });
+        }
+        return Promise.resolve({});
+      });
+      (client as any).ensureConnected = vi.fn(async () => ({
+        client: {
+          connect: vi.fn(),
+          close: vi.fn(),
+          notify: vi.fn(),
+          request,
+          setNotificationHandler: vi.fn(),
+          setRequestHandler: vi.fn(),
+        },
+        initializeResult: {},
+      }));
+
+      const run = client.startTurn({
+        sessionKey: "session-123",
+        workspaceDir: "/repo/openclaw",
+        runId: "run-123",
+        existingThreadId: "thread-123",
+        prompt: "Ship it",
+        model: "gpt-5.4",
+        onAssistantMessage: async (text) => {
+          updates.push(text);
+        },
+      });
+      const resultPromise = run.result;
+      await vi.advanceTimersByTimeAsync(1_500);
+      const result = await resultPromise;
+
+      expect(updates).toEqual(["Fresh reply."]);
+      expect("text" in result ? result.text : undefined).toBe("Fresh reply.");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("recovers final assistant text from thread/read when completion arrives without text", async () => {
     const client = new CodexAppServerClient(
       {
@@ -549,6 +677,94 @@ describe("CodexAppServerClient.startTurn", () => {
       },
       1_000,
     );
+  });
+
+  it("does not recover stale thread/read assistant text on existing threads when the latest user turn does not match", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new CodexAppServerClient(
+        {
+          enabled: true,
+          transport: "stdio",
+          command: "codex",
+          args: [],
+          requestTimeoutMs: 1_000,
+        },
+        {
+          debug: vi.fn(),
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+        },
+      );
+      const request = vi.fn(async (method: string) => {
+        if (method === "thread/resume") {
+          return { threadId: "thread-123", model: "gpt-5.4" };
+        }
+        if (method === "turn/start") {
+          queueMicrotask(async () => {
+            await (client as any).dispatchNotification("turn/completed", {
+              threadId: "thread-123",
+              turn: {
+                id: "turn-123",
+                status: "completed",
+              },
+            });
+          });
+          return { threadId: "thread-123", runId: "turn-123" };
+        }
+        if (method === "thread/read") {
+          return {
+            thread: {
+              turns: [
+                {
+                  items: [
+                    {
+                      type: "message",
+                      role: "user",
+                      content: [{ type: "input_text", text: "Old prompt" }],
+                    },
+                    {
+                      type: "message",
+                      role: "assistant",
+                      content: [{ type: "output_text", text: "Old reply" }],
+                    },
+                  ],
+                },
+              ],
+            },
+          };
+        }
+        return {};
+      });
+      (client as any).ensureConnected = vi.fn(async () => ({
+        client: {
+          connect: vi.fn(),
+          close: vi.fn(),
+          notify: vi.fn(),
+          request,
+          setNotificationHandler: vi.fn(),
+          setRequestHandler: vi.fn(),
+        },
+        initializeResult: {},
+      }));
+
+      const run = client.startTurn({
+        sessionKey: "session-123",
+        workspaceDir: "/repo/openclaw",
+        runId: "run-123",
+        existingThreadId: "thread-123",
+        prompt: "New prompt",
+        model: "gpt-5.4",
+      });
+      const resultPromise = run.result;
+      await vi.advanceTimersByTimeAsync(2_000);
+      const result = await resultPromise;
+
+      expect("text" in result ? result.text : undefined).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -1081,6 +1297,39 @@ describe("thread replay extraction", () => {
     ).toEqual({
       lastUserMessage: "Do the thing",
       lastAssistantMessage: "Done from thread read.",
+    });
+  });
+
+  it("does not pair an older assistant reply with a newer user turn", () => {
+    expect(
+      __testing.extractThreadReplayFromReadResult({
+        thread: {
+          turns: [
+            {
+              items: [
+                {
+                  type: "message",
+                  role: "user",
+                  content: [{ type: "input_text", text: "First request" }],
+                },
+                {
+                  type: "message",
+                  role: "assistant",
+                  content: [{ type: "output_text", text: "First answer" }],
+                },
+                {
+                  type: "message",
+                  role: "user",
+                  content: [{ type: "input_text", text: "Second request" }],
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    ).toEqual({
+      lastUserMessage: "Second request",
+      lastAssistantMessage: undefined,
     });
   });
 });

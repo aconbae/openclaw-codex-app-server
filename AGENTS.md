@@ -40,8 +40,12 @@ Use the repo-local [`project-manager`](./.agents/skills/project-manager/SKILL.md
 Use `pnpm` for local work.
 
 - After committed `package.json` changes, run `pnpm install` so `pnpm-lock.yaml` stays in sync. If a peer range points past the newest npm release, do not commit that unresolved peer bump yet; keep registry-facing compatibility in `openclaw.compat` / `openclaw.build` until the matching package version exists.
+- Use the installed `openclaw` binary and its real package root as the only OpenClaw source of truth. Do not treat a copied `node_modules/openclaw` tree as authoritative for audits or runtime behavior.
+- This repo should not keep a copied OpenClaw package under `node_modules/openclaw`. If local module resolution needs the SDK package, link `node_modules/openclaw` to the installed host build with `pnpm sync:openclaw-host`.
+- Do not use `npm install` in this repo. Stick to `pnpm`, and keep peer auto-install disabled so `pnpm` does not silently pull a stale local OpenClaw tarball into `node_modules`.
 - `pnpm test`: run the Vitest suite once.
 - `pnpm typecheck`: run strict TypeScript checking with `tsc --noEmit`.
+- `pnpm sync:openclaw-host`: replace `node_modules/openclaw` with a symlink to the package behind the installed `openclaw` binary.
 - `pnpm openclaw plugins install --link /path/to/openclaw-codex-app-server`: link this package into a local OpenClaw checkout for manual integration testing.
 
 There is no separate build step in this repository; correctness is gated by tests and typechecking.

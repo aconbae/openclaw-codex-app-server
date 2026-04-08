@@ -1,4 +1,4 @@
-import type { ConversationRef, PluginInteractiveButtons } from "openclaw/plugin-sdk";
+import type { ConversationRef, PluginInteractiveButtons } from "./openclaw-types.js";
 
 export const PLUGIN_ID = "openclaw-codex-app-server";
 export const INTERACTIVE_NAMESPACE = "codexapp";
@@ -284,21 +284,6 @@ export type StoredBinding = {
   updatedAt: number;
 };
 
-export type RecentDetachedThread = {
-  conversation: ConversationRef;
-  sessionKey: string;
-  threadId: string;
-  workspaceDir: string;
-  permissionsMode?: PermissionsMode;
-  pendingPermissionsMode?: PermissionsMode;
-  threadTitle?: string;
-  pinnedBindingMessage?: InteractiveMessageRef;
-  contextUsage?: ContextUsageSnapshot;
-  preferences?: ConversationPreferences;
-  detachedAt: number;
-  updatedAt: number;
-};
-
 export type InteractiveMessageRef =
   | {
       provider: "telegram";
@@ -578,7 +563,6 @@ export type CallbackAction =
 export type StoreSnapshot = {
   version: number;
   bindings: StoredBinding[];
-  recentDetachedThreads: RecentDetachedThread[];
   pendingBinds: StoredPendingBind[];
   pendingRequests: StoredPendingRequest[];
   callbacks: CallbackAction[];
