@@ -30,7 +30,7 @@ Buttons are presented for project and thread selection, model switching, and ski
 ## Install In OpenClaw
 
 These are the intended install commands for OpenClaw `2026.3.22` and newer.
-The current wrapper/runtime audit in this repo was last re-verified against OpenClaw `2026.4.8` on 2026-04-08.
+The current wrapper/runtime audit in this repo was last re-verified against OpenClaw `2026.4.11` and Codex CLI `0.120.0` on 2026-04-12.
 
 Compatibility:
 
@@ -144,16 +144,12 @@ Pre-release packages are published on matching npm dist-tags instead of `latest`
 | `/cas_compact` | Compact the bound Codex thread. | The plugin posts progress and final context usage. |
 | `/cas_skills` | List available Codex skills for the workspace. | Adds buttons for up to eight skill shortcuts. |
 | `/cas_skills review` | Filter the skills list. | Matches skill name, description, or cwd. |
-| `/cas_experimental` | List experimental features reported by Codex. | Read-only. |
 | `/cas_mcp` | List configured MCP servers. | Shows auth state and counts for tools/resources/templates. |
 | `/cas_mcp github` | Filter MCP servers. | Matches name and auth status. |
 | `/cas_fast` | Toggle fast mode for the bound thread. | Convenience command for the same fast-mode control exposed on `/cas_status`. |
 | `/cas_fast on`, `/cas_fast off`, `/cas_fast status` | Set or inspect fast mode explicitly. | Example: `/cas_fast status` |
 | `/cas_model` | List models and show model-selection buttons when the conversation is bound. | Without a binding, it lists models only. |
 | `/cas_model gpt-5.4` | Set the model for the bound thread. | Also updates the saved preferred model for later turns. |
-| `/cas_permissions` | Show account, rate-limit, and current permission status. | To change permissions, use `/cas_status --yolo` or the status card. |
-| `/cas_init ...` | Forward `/init` to Codex. | Sends the alias straight through to the App Server. |
-| `/cas_diff ...` | Forward `/diff` to Codex. | Sends the alias straight through to the App Server. |
 | `/cas_rename <new name>` | Rename the bound Codex thread. | Example: `/cas_rename approval flow cleanup` |
 | `/cas_rename --sync <new name>` | Rename the thread and try to sync the conversation/topic name too. | Requires an existing binding. |
 | `/cas_rename --sync` | Show suggested naming styles and sync the chosen one to the conversation too. | Useful when you want the derived thread/project naming without typing it out. |

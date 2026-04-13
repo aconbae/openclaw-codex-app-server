@@ -8,13 +8,9 @@ export const COMMANDS = [
   ["cas_review", "Run Codex review on the current changes."],
   ["cas_compact", "Compact the current Codex thread."],
   ["cas_skills", "List Codex skills."],
-  ["cas_experimental", "List Codex experimental features."],
   ["cas_mcp", "List Codex MCP servers."],
   ["cas_fast", "Toggle or inspect fast mode for the current Codex binding."],
   ["cas_model", "List or switch the Codex model for the current binding."],
-  ["cas_permissions", "Show Codex permissions and account status."],
-  ["cas_init", "Forward /init to Codex."],
-  ["cas_diff", "Forward /diff to Codex."],
   ["cas_rename", "Rename the Codex thread and optionally sync the conversation name."],
 ] as const;
 

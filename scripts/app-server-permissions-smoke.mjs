@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import fs from "node:fs";
+import os from "node:os";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 import process from "node:process";
@@ -9,6 +11,87 @@ const DEFAULT_PROTOCOL_VERSION = "1.0";
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_PROMPT =
   "Run `npm view dive version` in the shell and reply with only the exact stdout from that command.";
+const PLUGIN_ID = "openclaw-codex-app-server";
+const RUNTIME_ROOT = path.join(os.tmpdir(), PLUGIN_ID, "codex-app-server-smoke");
+const LAUNCH_CWD = path.join(RUNTIME_ROOT, "launch-cwd");
+const SQLITE_HOME = path.join(RUNTIME_ROOT, "sqlite-home");
+const USER_SKILLS_ROOT = path.join(".agents", "skills");
+const STATIC_CONFIG_OVERRIDES = [
+  "analytics.enabled=false",
+  "project_doc_max_bytes=0",
+  "project_doc_fallback_filenames=[]",
+];
+
+function createDefaultWorkspaceDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), "codex-app-server-smoke-"));
+}
+
+function pathExists(filePath) {
+  try {
+    fs.accessSync(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function listSkillManifestPaths(rootDir) {
+  if (!rootDir.trim()) {
+    return [];
+  }
+  try {
+    return fs
+      .readdirSync(rootDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+      .map((entry) => path.join(rootDir, entry.name, "SKILL.md"))
+      .filter((manifestPath) => pathExists(manifestPath))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+function buildDisabledSkillConfigOverride(skillManifestPaths) {
+  if (skillManifestPaths.length === 0) {
+    return undefined;
+  }
+  const entries = skillManifestPaths.map(
+    (skillPath) => `{path=${JSON.stringify(skillPath)},enabled=false}`,
+  );
+  return `skills.config=[${entries.join(",")}]`;
+}
+
+function buildSpawnEnv(baseEnv = process.env) {
+  const env = { ...baseEnv };
+  for (const key of Object.keys(env)) {
+    const normalizedKey = key.toUpperCase();
+    if (normalizedKey === "OPENAI_API_KEY" || normalizedKey.startsWith("CODEX_")) {
+      delete env[key];
+    }
+  }
+  return env;
+}
+
+function prepareLaunchOptions(baseArgs) {
+  fs.mkdirSync(LAUNCH_CWD, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(SQLITE_HOME, { recursive: true, mode: 0o700 });
+  const skillManifestPaths = [
+    ...listSkillManifestPaths(path.join(os.homedir(), USER_SKILLS_ROOT)),
+    ...(process.platform === "win32" ? [] : listSkillManifestPaths("/etc/codex/skills")),
+  ];
+  const disabledSkillConfig = buildDisabledSkillConfigOverride(skillManifestPaths);
+  const overrideArgs = [
+    ...STATIC_CONFIG_OVERRIDES.flatMap((override) => ["-c", override]),
+    ...(disabledSkillConfig ? ["-c", disabledSkillConfig] : []),
+    "-c",
+    `sqlite_home=${JSON.stringify(SQLITE_HOME)}`,
+  ];
+  return {
+    args: [...baseArgs, ...overrideArgs],
+    cwd: LAUNCH_CWD,
+    env: buildSpawnEnv(),
+  };
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -162,12 +245,15 @@ class StdioJsonRpcHarness {
   }
 
   async start() {
-    this.child = spawn(this.command, this.args, {
-      cwd: this.cwd,
+    const launchOptions = prepareLaunchOptions(this.args);
+    this.child = spawn(this.command, launchOptions.args, {
+      cwd: launchOptions.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: launchOptions.env,
     });
-    this.log(`spawned pid=${this.child.pid ?? "<unknown>"} cmd=${this.command} args=${JSON.stringify(this.args)}`);
+    this.log(
+      `spawned pid=${this.child.pid ?? "<unknown>"} cmd=${this.command} args=${JSON.stringify(launchOptions.args)}`,
+    );
     this.child.stderr.setEncoding("utf8");
     this.child.stderr.on("data", (chunk) => {
       const text = String(chunk).trim();
@@ -430,7 +516,7 @@ async function runScenario({ label, args, cwd, prompt, timeoutMs }) {
 
 function parseArgs(argv) {
   const options = {
-    cwd: process.cwd(),
+    cwd: createDefaultWorkspaceDir(),
     timeoutMs: DEFAULT_TIMEOUT_MS,
     prompt: DEFAULT_PROMPT,
   };
@@ -457,7 +543,7 @@ function parseArgs(argv) {
           "Usage: node scripts/app-server-permissions-smoke.mjs [options]",
           "",
           "Options:",
-          "  --cwd <dir>         Working directory for new threads (default: current directory)",
+          "  --cwd <dir>         Working directory for new threads (default: temp workspace)",
           `  --timeout-ms <ms>   Per-scenario timeout (default: ${DEFAULT_TIMEOUT_MS})`,
           "  --prompt <text>     Prompt to send after starting each thread",
         ].join("\n"),

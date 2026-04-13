@@ -1,4 +1,6 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
 import * as path from "node:path";
 import readline from "node:readline";
 import { promisify } from "node:util";
@@ -9,6 +11,7 @@ import { createPendingInputState, parseCodexUserInput } from "./pending-input.js
 import {
   CALLBACK_TTL_MS,
   PENDING_INPUT_TTL_MS,
+  PLUGIN_ID,
   type AccountSummary,
   type CollaborationMode,
   type CompactProgress,
@@ -76,12 +79,22 @@ export type ActiveCodexRun = {
   getThreadId: () => string | undefined;
 };
 
-const DEFAULT_PROTOCOL_VERSION = "1.0";
 const ASSISTANT_UPDATE_BATCH_MS = 250;
 const TRAILING_NOTIFICATION_SETTLE_MS = 1000;
+const INTERRUPT_SETTLE_TIMEOUT_MS = 5000;
+const CODEX_APP_SERVER_RUNTIME_ROOT = path.join(os.tmpdir(), PLUGIN_ID, "codex-app-server");
+const CODEX_APP_SERVER_LAUNCH_CWD = path.join(CODEX_APP_SERVER_RUNTIME_ROOT, "launch-cwd");
+const CODEX_APP_SERVER_SQLITE_HOME = path.join(CODEX_APP_SERVER_RUNTIME_ROOT, "sqlite-home");
+const USER_SKILLS_ROOT = path.join(".agents", "skills");
 const TURN_STEER_METHODS = ["turn/steer"] as const;
 const TURN_INTERRUPT_METHODS = ["turn/interrupt"] as const;
 const CODEX_CHILD_ENV_DENYLIST = ["OPENAI_API_KEY"] as const;
+const CODEX_CHILD_ENV_PREFIX_DENYLIST = ["CODEX_"] as const;
+const CODEX_APP_SERVER_STATIC_CONFIG_OVERRIDES = [
+  "analytics.enabled=false",
+  "project_doc_max_bytes=0",
+  "project_doc_fallback_filenames=[]",
+] as const;
 const execFileAsync = promisify(execFile);
 
 type StartupProbeInfo = {
@@ -144,10 +157,112 @@ function omitEnvKeysCaseInsensitive(
   return env;
 }
 
+function omitEnvKeysByPrefixCaseInsensitive(
+  baseEnv: NodeJS.ProcessEnv,
+  prefixes: Iterable<string>,
+): NodeJS.ProcessEnv {
+  const env = { ...baseEnv };
+  const denied = [...prefixes]
+    .map((prefix) => prefix.trim().toUpperCase())
+    .filter(Boolean);
+  if (denied.length === 0) {
+    return env;
+  }
+  for (const actualKey of Object.keys(env)) {
+    const normalizedKey = actualKey.toUpperCase();
+    if (denied.some((prefix) => normalizedKey.startsWith(prefix))) {
+      delete env[actualKey];
+    }
+  }
+  return env;
+}
+
 function buildCodexAppServerChildEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   // The Codex child should use its own login state instead of inheriting the host's
-  // OpenAI provider key and silently switching to API-key billing.
-  return omitEnvKeysCaseInsensitive(baseEnv, CODEX_CHILD_ENV_DENYLIST);
+  // OpenAI provider key and silently switching to API-key billing. It should also
+  // avoid inheriting the parent Codex rollout/session environment.
+  return omitEnvKeysByPrefixCaseInsensitive(
+    omitEnvKeysCaseInsensitive(baseEnv, CODEX_CHILD_ENV_DENYLIST),
+    CODEX_CHILD_ENV_PREFIX_DENYLIST,
+  );
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function listSkillManifestPaths(rootDir: string): Promise<string[]> {
+  if (!rootDir.trim()) {
+    return [];
+  }
+  let entries: Array<import("node:fs").Dirent>;
+  try {
+    entries = await fs.readdir(rootDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const manifests: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) {
+      continue;
+    }
+    const manifestPath = path.join(rootDir, entry.name, "SKILL.md");
+    if (await pathExists(manifestPath)) {
+      manifests.push(manifestPath);
+    }
+  }
+  return manifests;
+}
+
+async function listAmbientSkillManifestPaths(homeDir = os.homedir()): Promise<string[]> {
+  const roots = [path.join(homeDir, USER_SKILLS_ROOT)];
+  if (process.platform !== "win32") {
+    roots.push("/etc/codex/skills");
+  }
+  const manifestGroups = await Promise.all(roots.map((root) => listSkillManifestPaths(root)));
+  return [...new Set(manifestGroups.flat())].sort();
+}
+
+function buildDisabledSkillConfigOverride(skillManifestPaths: readonly string[]): string | undefined {
+  if (skillManifestPaths.length === 0) {
+    return undefined;
+  }
+  const entries = skillManifestPaths.map(
+    (skillPath) => `{path=${JSON.stringify(skillPath)},enabled=false}`,
+  );
+  return `skills.config=[${entries.join(",")}]`;
+}
+
+async function prepareCodexAppServerLaunchOptions(baseEnv: NodeJS.ProcessEnv = process.env): Promise<{
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+}> {
+  await fs.mkdir(CODEX_APP_SERVER_LAUNCH_CWD, { recursive: true, mode: 0o700 }).catch(
+    () => undefined,
+  );
+  await fs.mkdir(CODEX_APP_SERVER_SQLITE_HOME, { recursive: true, mode: 0o700 }).catch(
+    () => undefined,
+  );
+  const disabledSkillConfig = buildDisabledSkillConfigOverride(
+    await listAmbientSkillManifestPaths(),
+  );
+  const args = [
+    ...CODEX_APP_SERVER_STATIC_CONFIG_OVERRIDES.flatMap((override) => ["-c", override]),
+    ...(disabledSkillConfig ? ["-c", disabledSkillConfig] : []),
+    "-c",
+    `sqlite_home=${JSON.stringify(CODEX_APP_SERVER_SQLITE_HOME)}`,
+  ];
+  return {
+    args,
+    cwd: CODEX_APP_SERVER_LAUNCH_CWD,
+    env: buildCodexAppServerChildEnv(baseEnv),
+  };
 }
 
 function pickString(
@@ -689,10 +804,12 @@ class StdioJsonRpcClient implements JsonRpcClient {
     if (this.process) {
       return;
     }
-    const childEnv = buildCodexAppServerChildEnv();
-    const child = spawn(this.command, ["app-server", ...this.args], {
+    const launchOptions = await prepareCodexAppServerLaunchOptions();
+    const launchArgs = ["app-server", ...this.args, ...launchOptions.args];
+    const child = spawn(this.command, launchArgs, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: childEnv,
+      cwd: launchOptions.cwd,
+      env: launchOptions.env,
     });
     if (!child.stdin || !child.stdout || !child.stderr) {
       throw new Error("codex app server stdio pipes unavailable");
@@ -702,7 +819,7 @@ class StdioJsonRpcClient implements JsonRpcClient {
       formatStdioProcessLog("spawned", {
         pid: child.pid,
         command: this.command,
-        args: ["app-server", ...this.args],
+        args: launchArgs,
       }),
     );
     const lineReader = readline.createInterface({ input: child.stdout });
@@ -874,14 +991,17 @@ function createJsonRpcClient(
   );
 }
 
+function buildInitializePayload() {
+  return {
+    clientInfo: { name: "openclaw-codex-app-server", version: "0.0.0" },
+    capabilities: { experimentalApi: true },
+  };
+}
+
 async function initializeClient(params: {
   client: JsonRpcClient;
 }): Promise<unknown> {
-  const initializeResult = await params.client.request("initialize", {
-    protocolVersion: DEFAULT_PROTOCOL_VERSION,
-    clientInfo: { name: "openclaw-codex-app-server", version: "0.0.0" },
-    capabilities: { experimentalApi: true },
-  });
+  const initializeResult = await params.client.request("initialize", buildInitializePayload());
   await params.client.notify("initialized", {});
   return initializeResult;
 }
@@ -929,10 +1049,15 @@ async function probeStdioVersion(settings: PluginSettings): Promise<{
   const resolvedCommandPath = await resolveCommandPath(settings.command);
   const commandPath = resolvedCommandPath ?? settings.command;
   try {
+    const launchOptions = await prepareCodexAppServerLaunchOptions();
     const { stdout, stderr } = await execFileAsync(
       commandPath,
-      [...settings.args, "--version"],
-      { timeout: Math.min(settings.requestTimeoutMs, 10_000) },
+      [...settings.args, ...launchOptions.args, "--version"],
+      {
+        timeout: Math.min(settings.requestTimeoutMs, 10_000),
+        cwd: launchOptions.cwd,
+        env: launchOptions.env,
+      },
     );
     const combined = `${stdout}\n${stderr}`
       .split(/\r?\n/)
@@ -1513,6 +1638,18 @@ function extractFileEditSummariesFromNotification(
     .filter((entry): entry is FileEditSummary => Boolean(entry?.path));
 }
 
+function extractAppliedFileEditSummariesFromNotification(
+  value: unknown,
+  workspaceDir?: string,
+): FileEditSummary[] {
+  const item = asRecord(asRecord(value)?.item);
+  const status = pickString(item ?? {}, ["status"])?.trim().toLowerCase();
+  if (status !== "completed") {
+    return [];
+  }
+  return extractFileEditSummariesFromNotification(value, workspaceDir);
+}
+
 function mergeFileEditSummary(
   current: FileEditSummary | undefined,
   incoming: FileEditSummary,
@@ -1635,6 +1772,10 @@ function createAssistantTextUpdateBatcher(params: {
       await enqueueFlush();
     },
   };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function extractFileChangePathsFromReadResult(
@@ -3233,6 +3374,8 @@ export class CodexAppServerClient {
       },
     });
     let completeTurn: (() => void) | null = null;
+    let interruptNoticeSent = false;
+    let interruptSignalSent = false;
     let terminalNotificationSeen = false;
     let completionSettleTimer: NodeJS.Timeout | undefined;
     const settleCompletionSoon = () => {
@@ -3263,8 +3406,63 @@ export class CodexAppServerClient {
 
     const connectionPromise = this.ensureConnected();
     const getClient = async () => (await connectionPromise).client;
+    let handleResult!: Promise<ReviewResult>;
 
-    const handleResult = (async () => {
+    const notifyInterrupted = async () => {
+      if (interruptNoticeSent) {
+        return;
+      }
+      interruptNoticeSent = true;
+      await params.onInterrupted?.();
+    };
+
+    const requestReviewInterruptIfPossible = async () => {
+      if (!interrupted || interruptSignalSent) {
+        return;
+      }
+      if (!reviewThreadId) {
+        this.logger.debug(`codex review interrupt waiting for thread assignment run=${params.runId}`);
+        return;
+      }
+      if (!turnId) {
+        this.logger.debug(
+          `codex review interrupt waiting for active turn id run=${params.runId} reviewThread=${reviewThreadId}`,
+        );
+        return;
+      }
+      interruptSignalSent = true;
+      const client = await getClient().catch(() => null);
+      if (!client) {
+        completeTurn?.();
+        return;
+      }
+      await requestWithFallbacks({
+        client,
+        methods: [...TURN_INTERRUPT_METHODS],
+        payloads: buildTurnInterruptPayloads({ threadId: reviewThreadId, turnId }),
+        timeoutMs: this.settings.requestTimeoutMs,
+      }).catch(() => undefined);
+    };
+
+    const waitForInterruptSettle = async () => {
+      const settled = await Promise.race([
+        handleResult.then(
+          () => true,
+          () => true,
+        ),
+        delay(INTERRUPT_SETTLE_TIMEOUT_MS).then(() => false),
+      ]);
+      if (settled) {
+        return;
+      }
+      this.logger.warn(
+        `codex review interrupt settle timed out run=${params.runId} thread=${reviewThreadId || "<pending>"} turn=${turnId || "<pending>"}`,
+      );
+      completeTurn?.();
+      await handleResult.catch(() => undefined);
+    };
+
+    handleResult = (async () => {
       try {
         const client = await getClient();
         await requestWithFallbacks({
@@ -3280,6 +3478,17 @@ export class CodexAppServerClient {
           }),
           timeoutMs: this.settings.requestTimeoutMs,
         }).catch(() => undefined);
+        if (interrupted) {
+          this.logger.debug(
+            `codex review interrupted before review/start run=${params.runId} reviewThread=${reviewThreadId || "<none>"}`,
+          );
+          return {
+            reviewText: "",
+            reviewThreadId: reviewThreadId || undefined,
+            turnId: turnId || undefined,
+            aborted: true,
+          } satisfies ReviewResult;
+        }
         const result = await requestWithFallbacks({
           client,
           methods: ["review/start"],
@@ -3290,6 +3499,9 @@ export class CodexAppServerClient {
         reviewThreadId =
           pickString(resultRecord ?? {}, ["reviewThreadId", "review_thread_id"]) ?? reviewThreadId;
         turnId ||= extractIds(result)?.runId ?? "";
+        if (interrupted) {
+          await requestReviewInterruptIfPossible();
+        }
         await completion;
         if (completed && !interrupted) {
           await notificationQueue;
@@ -3483,21 +3695,9 @@ export class CodexAppServerClient {
       },
       interrupt: async () => {
         interrupted = true;
-        await params.onInterrupted?.();
-        const client = await getClient().catch(() => null);
-        if (reviewThreadId && turnId && client) {
-          await requestWithFallbacks({
-            client,
-            methods: [...TURN_INTERRUPT_METHODS],
-            payloads: buildTurnInterruptPayloads({ threadId: reviewThreadId, turnId }),
-            timeoutMs: this.settings.requestTimeoutMs,
-          }).catch(() => undefined);
-        } else if (reviewThreadId) {
-          this.logger.debug(
-            `codex review interrupt ignored without active turn reviewThread=${reviewThreadId}`,
-          );
-        }
-        completeTurn?.();
+        await notifyInterrupted();
+        await requestReviewInterruptIfPossible();
+        await waitForInterruptSettle();
       },
       isAwaitingInput: () => awaitingInput,
       getThreadId: () => reviewThreadId || undefined,
@@ -3578,6 +3778,8 @@ export class CodexAppServerClient {
       },
     });
     let completeTurn: (() => void) | null = null;
+    let interruptNoticeSent = false;
+    let interruptSignalSent = false;
     let terminalNotificationSeen = false;
     let completionSettleTimer: NodeJS.Timeout | undefined;
     const settleCompletionSoon = () => {
@@ -3608,6 +3810,63 @@ export class CodexAppServerClient {
 
     const connectionPromise = this.ensureConnected();
     const getClient = async () => (await connectionPromise).client;
+    let handleResult!: Promise<TurnResult>;
+
+    const notifyInterrupted = async () => {
+      if (interruptNoticeSent) {
+        return;
+      }
+      interruptNoticeSent = true;
+      await params.onInterrupted?.();
+    };
+
+    const requestTurnInterruptIfPossible = async () => {
+      if (!interrupted || interruptSignalSent) {
+        return;
+      }
+      if (!threadId) {
+        this.logger.debug(
+          `codex turn interrupt waiting for thread assignment run=${params.runId}`,
+        );
+        return;
+      }
+      if (!turnId) {
+        this.logger.debug(
+          `codex turn interrupt waiting for active turn id run=${params.runId} thread=${threadId}`,
+        );
+        return;
+      }
+      interruptSignalSent = true;
+      const client = await getClient().catch(() => null);
+      if (!client) {
+        completeTurn?.();
+        return;
+      }
+      await requestWithFallbacks({
+        client,
+        methods: [...TURN_INTERRUPT_METHODS],
+        payloads: buildTurnInterruptPayloads({ threadId, turnId }),
+        timeoutMs: this.settings.requestTimeoutMs,
+      }).catch(() => undefined);
+    };
+
+    const waitForInterruptSettle = async () => {
+      const settled = await Promise.race([
+        handleResult.then(
+          () => true,
+          () => true,
+        ),
+        delay(INTERRUPT_SETTLE_TIMEOUT_MS).then(() => false),
+      ]);
+      if (settled) {
+        return;
+      }
+      this.logger.warn(
+        `codex turn interrupt settle timed out run=${params.runId} thread=${threadId || "<pending>"} turn=${turnId || "<pending>"}`,
+      );
+      completeTurn?.();
+      await handleResult.catch(() => undefined);
+    };
 
     const shouldBufferPreStartRunEvent = (ids: ReturnType<typeof extractIds>): boolean =>
       existingThreadAtStart &&
@@ -3645,16 +3904,6 @@ export class CodexAppServerClient {
       if (tokenUsage) {
         latestContextUsage = tokenUsage;
       }
-      if (methodLower === "item/started") {
-        const fileEditSummaries = extractFileEditSummariesFromNotification(
-          notificationParams,
-          params.workspaceDir,
-        );
-        if (fileEditSummaries.length > 0) {
-          fileEditNoticeBatcher.add(fileEditSummaries);
-          return;
-        }
-      }
       if (methodLower === "serverrequest/resolved") {
         await pendingInputCoordinator.clearCurrent();
         return;
@@ -3675,6 +3924,14 @@ export class CodexAppServerClient {
         return;
       }
       if (methodLower === "item/completed") {
+        const fileEditSummaries = extractAppliedFileEditSummariesFromNotification(
+          notificationParams,
+          params.workspaceDir,
+        );
+        if (fileEditSummaries.length > 0) {
+          fileEditNoticeBatcher.add(fileEditSummaries);
+          return;
+        }
         const completedPlan = extractCompletedPlanText(notificationParams);
         if (completedPlan.text?.trim()) {
           finalPlanMarkdown = completedPlan.text.trim();
@@ -3888,7 +4145,7 @@ export class CodexAppServerClient {
       return await handleTurnRequest(method, requestParams);
     });
 
-    const handleResult = (async () => {
+    handleResult = (async () => {
       try {
         this.logger.debug(
           `codex turn attaching to shared app-server connection run=${params.runId} existingThread=${threadId || "<none>"} workspace=${params.workspaceDir} mode=${params.collaborationMode?.mode ?? "default"} prompt="${summarizeTextForLog(params.prompt)}"`,
@@ -3957,6 +4214,21 @@ export class CodexAppServerClient {
             `codex turn thread resumed run=${params.runId} thread=${threadId} model=${threadModel || "<none>"} reasoningEffort=${threadReasoningEffort || "<none>"}`,
           );
         }
+        if (interrupted) {
+          this.logger.debug(
+            `codex turn interrupted before turn/start run=${params.runId} thread=${threadId || "<none>"}`,
+          );
+          return {
+            threadId,
+            text: undefined,
+            planArtifact: undefined,
+            aborted: true,
+            stoppedReason: "interrupt",
+            terminalStatus,
+            terminalError,
+            usage: latestContextUsage,
+          } satisfies TurnResult;
+        }
         const synthesizedDefaultMode = buildDefaultCollaborationMode({
           model: params.model?.trim() || threadModel,
           reasoningEffort: params.reasoningEffort?.trim() || threadReasoningEffort,
@@ -3992,6 +4264,9 @@ export class CodexAppServerClient {
         threadId ||= startedIds.threadId ?? "";
         turnId ||= startedIds.runId ?? "";
         await flushBufferedRunEvents();
+        if (interrupted) {
+          await requestTurnInterruptIfPossible();
+        }
         this.logger.debug(
           `codex turn started run=${params.runId} thread=${threadId || "<none>"} turn=${turnId || "<none>"}`,
         );
@@ -4170,33 +4445,13 @@ export class CodexAppServerClient {
         return true;
       },
       interrupt: async () => {
-        if (!threadId) {
-          this.logger.debug(`codex turn interrupt ignored before thread assignment run=${params.runId}`);
-          return;
-        }
         interrupted = true;
         this.logger.debug(
-          `codex turn interrupt requested run=${params.runId} thread=${threadId} turn=${turnId || "<none>"}`,
+          `codex turn interrupt requested run=${params.runId} thread=${threadId || "<pending>"} turn=${turnId || "<pending>"}`,
         );
-        await params.onInterrupted?.();
-        if (turnId) {
-          const client = await getClient().catch(() => null);
-          if (!client) {
-            completeTurn?.();
-            return;
-          }
-          await requestWithFallbacks({
-            client,
-            methods: [...TURN_INTERRUPT_METHODS],
-            payloads: buildTurnInterruptPayloads({ threadId, turnId }),
-            timeoutMs: this.settings.requestTimeoutMs,
-          }).catch(() => undefined);
-        } else {
-          this.logger.debug(
-            `codex turn interrupt ignored without active turn run=${params.runId} thread=${threadId}`,
-          );
-        }
-        completeTurn?.();
+        await notifyInterrupted();
+        await requestTurnInterruptIfPossible();
+        await waitForInterruptSettle();
       },
       isAwaitingInput: () => awaitingInput,
       getThreadId: () => threadId || undefined,
@@ -4343,13 +4598,17 @@ export class CodexAppServerModeClient {
 }
 
 export const __testing = {
+  buildInitializePayload,
+  buildDisabledSkillConfigOverride,
   buildThreadResumePayloads,
   buildTurnStartPayloads,
   buildTurnSteerPayloads,
   buildCodexAppServerChildEnv,
+  prepareCodexAppServerLaunchOptions,
   createFileEditNoticeBatcher,
   createPendingInputCoordinator,
   extractApprovalDecision,
+  extractAppliedFileEditSummariesFromNotification,
   extractAssistantNotificationText,
   extractAssistantTextFromItemPayload,
   extractAssistantTextFromTerminalPayload,

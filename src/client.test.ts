@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { __testing, CodexAppServerClient } from "./client.js";
 
@@ -163,6 +166,15 @@ describe("buildTurnSteerPayloads", () => {
   });
 });
 
+describe("buildInitializePayload", () => {
+  it("uses the current Codex initialize shape without a legacy protocolVersion", () => {
+    expect(__testing.buildInitializePayload()).toEqual({
+      clientInfo: { name: "openclaw-codex-app-server", version: "0.0.0" },
+      capabilities: { experimentalApi: true },
+    });
+  });
+});
+
 describe("buildCodexAppServerChildEnv", () => {
   it("strips OPENAI_API_KEY before spawning the Codex child", () => {
     expect(
@@ -170,6 +182,7 @@ describe("buildCodexAppServerChildEnv", () => {
         PATH: "/usr/bin",
         HOME: "/Users/lain",
         OPENAI_API_KEY: "sk-host-secret",
+        CODEX_THREAD_ID: "thread-123",
         OPENCLAW_API_KEY: "gateway-secret",
       }),
     ).toEqual({
@@ -179,17 +192,62 @@ describe("buildCodexAppServerChildEnv", () => {
     });
   });
 
-  it("removes denied env vars case-insensitively", () => {
+  it("removes denied env vars and CODEX-prefixed session state case-insensitively", () => {
     expect(
       __testing.buildCodexAppServerChildEnv({
         Path: "/usr/bin",
         openai_api_key: "sk-host-secret",
+        codex_internal_originator_override: "codex_vscode",
         CUSTOM_FLAG: "1",
       }),
     ).toEqual({
       Path: "/usr/bin",
       CUSTOM_FLAG: "1",
     });
+  });
+});
+
+describe("prepareCodexAppServerLaunchOptions", () => {
+  it("adds isolated runtime overrides and disables ambient user skills", async () => {
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "oc-codex-home-"));
+    const skillDir = path.join(fakeHome, ".agents", "skills", "using-superpowers");
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, "SKILL.md"), "---\nname: using-superpowers\n---\n");
+    const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(fakeHome);
+    try {
+      const launchOptions = await __testing.prepareCodexAppServerLaunchOptions({
+        PATH: "/usr/bin",
+        OPENAI_API_KEY: "sk-host-secret",
+        CODEX_THREAD_ID: "thread-123",
+      });
+      expect(launchOptions.env).toEqual({
+        PATH: "/usr/bin",
+      });
+      expect(launchOptions.cwd).toMatch(/openclaw-codex-app-server[\/\\]codex-app-server[\/\\]launch-cwd$/);
+      expect(launchOptions.args).toEqual(
+        expect.arrayContaining([
+          "-c",
+          "analytics.enabled=false",
+          "-c",
+          "project_doc_max_bytes=0",
+          "-c",
+          "project_doc_fallback_filenames=[]",
+          "-c",
+          expect.stringContaining('sqlite_home="'),
+          "-c",
+          expect.stringContaining(
+            `skills.config=[{path=${JSON.stringify(path.join(skillDir, "SKILL.md"))},enabled=false}]`,
+          ),
+        ]),
+      );
+    } finally {
+      homedirSpy.mockRestore();
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("omits the skills override when no ambient skills are present", () => {
+    expect(__testing.buildDisabledSkillConfigOverride([])).toBeUndefined();
   });
 });
 
@@ -766,6 +824,257 @@ describe("CodexAppServerClient.startTurn", () => {
       vi.useRealTimers();
     }
   });
+
+  it("emits file edit notices only for completed fileChange items", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new CodexAppServerClient(
+        {
+          enabled: true,
+          transport: "stdio",
+          command: "codex",
+          args: [],
+          requestTimeoutMs: 1_000,
+        },
+        {
+          debug: vi.fn(),
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+        },
+      );
+      const fileEditNotices: string[] = [];
+      const request = vi.fn(async (method: string) => {
+        if (method === "thread/start") {
+          return { threadId: "thread-123", model: "gpt-5.4" };
+        }
+        if (method === "turn/start") {
+          queueMicrotask(async () => {
+            await (client as any).dispatchNotification("item/started", {
+              threadId: "thread-123",
+              turnId: "turn-123",
+              item: {
+                type: "fileChange",
+                id: "file-1",
+                status: "inProgress",
+                changes: [
+                  {
+                    path: "/repo/openclaw/agents-general.md",
+                    kind: "update",
+                    diff: "@@ -1,2 +0,0 @@\n-line 1\n-line 2\n",
+                  },
+                ],
+              },
+            });
+            await (client as any).dispatchNotification("item/completed", {
+              threadId: "thread-123",
+              turnId: "turn-123",
+              item: {
+                type: "fileChange",
+                id: "file-1",
+                status: "completed",
+                changes: [
+                  {
+                    path: "/repo/openclaw/agents-general.md",
+                    kind: "add",
+                    diff: "line 1\nline 2\n",
+                  },
+                ],
+              },
+            });
+            await (client as any).dispatchNotification("turn/completed", {
+              threadId: "thread-123",
+              turn: {
+                id: "turn-123",
+                status: "completed",
+              },
+            });
+          });
+          return { threadId: "thread-123", runId: "turn-123" };
+        }
+        return {};
+      });
+      (client as any).ensureConnected = vi.fn(async () => ({
+        client: {
+          connect: vi.fn(),
+          close: vi.fn(),
+          notify: vi.fn(),
+          request,
+          setNotificationHandler: vi.fn(),
+          setRequestHandler: vi.fn(),
+        },
+        initializeResult: {},
+      }));
+
+      const run = client.startTurn({
+        sessionKey: "session-123",
+        workspaceDir: "/repo/openclaw",
+        runId: "run-123",
+        prompt: "Create the file",
+        onFileEdits: async (text) => {
+          fileEditNotices.push(text);
+        },
+      });
+      const resultPromise = run.result;
+      await vi.advanceTimersByTimeAsync(1_500);
+      await resultPromise;
+
+      expect(fileEditNotices).toEqual(["Added `agents-general.md` (+2 -0)"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for a started turn to settle before resolving interrupt", async () => {
+    vi.useFakeTimers();
+    try {
+      const client = new CodexAppServerClient(
+        {
+          enabled: true,
+          transport: "stdio",
+          command: "codex",
+          args: [],
+          requestTimeoutMs: 1_000,
+        },
+        {
+          debug: vi.fn(),
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+        },
+      );
+      let resolveTurnStarted: (() => void) | undefined;
+      const turnStarted = new Promise<void>((resolve) => {
+        resolveTurnStarted = resolve;
+      });
+      const request = vi.fn(async (method: string) => {
+        if (method === "thread/start") {
+          return { threadId: "thread-123", model: "gpt-5.4" };
+        }
+        if (method === "turn/start") {
+          resolveTurnStarted?.();
+          return { threadId: "thread-123", runId: "turn-123" };
+        }
+        return {};
+      });
+      (client as any).ensureConnected = vi.fn(async () => ({
+        client: {
+          connect: vi.fn(),
+          close: vi.fn(),
+          notify: vi.fn(),
+          request,
+          setNotificationHandler: vi.fn(),
+          setRequestHandler: vi.fn(),
+        },
+        initializeResult: {},
+      }));
+
+      const run = client.startTurn({
+        sessionKey: "session-123",
+        workspaceDir: "/repo/openclaw",
+        runId: "run-123",
+        prompt: "Stop after start",
+        onInterrupted: vi.fn(async () => {}),
+      });
+
+      await turnStarted;
+      const interruptPromise = run.interrupt();
+      let interruptSettled = false;
+      void interruptPromise.then(() => {
+        interruptSettled = true;
+      });
+      await Promise.resolve();
+      expect(interruptSettled).toBe(false);
+
+      await (client as any).dispatchNotification("turn/cancelled", {
+        threadId: "thread-123",
+        turn: {
+          id: "turn-123",
+          status: "interrupted",
+        },
+      });
+      await vi.advanceTimersByTimeAsync(1_500);
+
+      await interruptPromise;
+      const result = await run.result;
+
+      expect(request).toHaveBeenCalledWith(
+        "turn/interrupt",
+        {
+          threadId: "thread-123",
+          turnId: "turn-123",
+        },
+        1_000,
+      );
+      expect(result.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not start a new turn after interrupting before thread creation completes", async () => {
+    const client = new CodexAppServerClient(
+      {
+        enabled: true,
+        transport: "stdio",
+        command: "codex",
+        args: [],
+        requestTimeoutMs: 1_000,
+      },
+      {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      },
+    );
+    let resolveThreadStart: ((value: unknown) => void) | undefined;
+    let resolveThreadStartRequested: (() => void) | undefined;
+    const threadStartRequested = new Promise<void>((resolve) => {
+      resolveThreadStartRequested = resolve;
+    });
+    const request = vi.fn((method: string) => {
+      if (method === "thread/start") {
+        return new Promise((resolve) => {
+          resolveThreadStart = resolve;
+          resolveThreadStartRequested?.();
+        });
+      }
+      if (method === "turn/start") {
+        return Promise.resolve({ threadId: "thread-123", runId: "turn-123" });
+      }
+      return Promise.resolve({});
+    });
+    (client as any).ensureConnected = vi.fn(async () => ({
+      client: {
+        connect: vi.fn(),
+        close: vi.fn(),
+        notify: vi.fn(),
+        request,
+        setNotificationHandler: vi.fn(),
+        setRequestHandler: vi.fn(),
+      },
+      initializeResult: {},
+    }));
+
+    const run = client.startTurn({
+      sessionKey: "session-123",
+      workspaceDir: "/repo/openclaw",
+      runId: "run-123",
+      prompt: "Stop before the thread exists",
+      onInterrupted: vi.fn(async () => {}),
+    });
+
+    await threadStartRequested;
+    const interruptPromise = run.interrupt();
+    resolveThreadStart?.({ threadId: "thread-123", model: "gpt-5.4" });
+    await interruptPromise;
+    const result = await run.result;
+
+    expect(request).not.toHaveBeenCalledWith("turn/start", expect.anything(), expect.anything());
+    expect(result.aborted).toBe(true);
+    expect("stoppedReason" in result ? result.stoppedReason : undefined).toBe("interrupt");
+  });
 });
 
 describe("extractStartupProbeInfo", () => {
@@ -950,6 +1259,57 @@ describe("extractFileEditSummariesFromNotification", () => {
       { path: "README.md", verb: "Added", added: 2, removed: 0 },
       { path: "/tmp/outside.txt", verb: "Deleted", added: 0, removed: 1 },
     ]);
+  });
+});
+
+describe("extractAppliedFileEditSummariesFromNotification", () => {
+  it("only returns applied file edits from completed fileChange items", () => {
+    expect(
+      __testing.extractAppliedFileEditSummariesFromNotification(
+        {
+          item: {
+            type: "fileChange",
+            id: "item-1",
+            status: "completed",
+            changes: [
+              {
+                path: "/repo/openclaw/agents-general.md",
+                kind: "add",
+                diff: "line 1\nline 2\n",
+              },
+            ],
+          },
+        },
+        "/repo/openclaw",
+      ),
+    ).toEqual([{ path: "agents-general.md", verb: "Added", added: 2, removed: 0 }]);
+  });
+
+  it("ignores proposed, failed, or declined fileChange items", () => {
+    expect(
+      __testing.extractAppliedFileEditSummariesFromNotification(
+        {
+          item: {
+            type: "fileChange",
+            status: "inProgress",
+            changes: [{ path: "/repo/openclaw/agents-general.md", kind: "add", diff: "line 1\n" }],
+          },
+        },
+        "/repo/openclaw",
+      ),
+    ).toEqual([]);
+    expect(
+      __testing.extractAppliedFileEditSummariesFromNotification(
+        {
+          item: {
+            type: "fileChange",
+            status: "declined",
+            changes: [{ path: "/repo/openclaw/agents-general.md", kind: "add", diff: "line 1\n" }],
+          },
+        },
+        "/repo/openclaw",
+      ),
+    ).toEqual([]);
   });
 });
 

@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync, promises as fs } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type {
   PluginConversationBindingResolvedEvent,
@@ -27,8 +27,11 @@ import {
   type CreateTypingCallbacksParams,
 } from "openclaw/plugin-sdk/channel-reply-pipeline";
 import type { OpenClawConfig as HostOpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
-import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/core";
-import type { TopLevelComponents as DiscordTopLevelComponent } from "../node_modules/openclaw/dist/extensions/discord/node_modules/@buape/carbon/dist/src/types/index.js";
+import type {
+  DiscordComponentBuildResult,
+  DiscordComponentButtonSpec,
+  DiscordComponentMessageSpec,
+} from "./discord-component-types.js";
 import { resolvePluginSettings, resolveWorkspaceDir } from "./config.js";
 import { CodexAppServerModeClient, type ActiveCodexRun, isMissingThreadError } from "./client.js";
 import { getThreadDisplayTitle } from "./thread-display.js";
@@ -41,7 +44,6 @@ import {
   formatCodexPlanInlineText,
   formatCodexReviewFindingMessage,
   formatCodexStatusText,
-  formatExperimentalFeatures,
   formatSkillHelpText,
   formatSkillsPickerText,
   filterSkillsByQuery,
@@ -108,238 +110,25 @@ import {
   type StoredPendingRequest,
 } from "./types.js";
 import {
+  OpenClawChannelRuntimeAdapters,
+  getLegacyDiscordRuntime,
+  getLegacyTelegramRuntime,
+  type DiscordComponentMessageSendResult,
+  type DiscordExtensionApiModule,
+  type DiscordRuntimeApiModule,
+  type DiscordSdkModule,
+  type TelegramAccountSdkModule,
+  type TelegramRuntimeApiModule,
+} from "./channel-runtime-adapters.js";
+import {
+  OpenClawChannelMessageDelivery,
+  type ProviderOutboundAdapter,
+} from "./channel-message-delivery.js";
+import { OpenClawChannelLiveRendering } from "./channel-live-rendering.js";
+import { OpenClawChannelInteractiveOrchestration } from "./channel-interactive-orchestration.js";
+import {
   isMissingPluginSdkSubpathError,
-  loadOpenClawCompatModule,
-  resolveOpenClawEntrypointPath,
-  resolveCompatFallbackPath,
 } from "./openclaw-sdk-compat.js";
-
-// OpenClaw does not publish `.d.ts` declarations for the Discord component helper
-// bundle behind `dist/extensions/discord/{api,runtime-api}.js`. These shapes are
-// derived from the installed host's current JS implementation so this repo stays
-// aligned with the real helper contract without pretending the bundle is public.
-type DiscordComponentEmoji = {
-  name: string;
-  id?: string;
-  animated?: boolean;
-};
-
-type DiscordComponentButtonStyle = "primary" | "secondary" | "success" | "danger" | "link";
-
-type DiscordComponentSelectOption = {
-  label: string;
-  value: string;
-  description?: string;
-  emoji?: DiscordComponentEmoji;
-  default?: boolean;
-};
-
-type DiscordComponentButtonSpec = {
-  label: string;
-  style?: DiscordComponentButtonStyle;
-  url?: string;
-  callbackData?: string;
-  emoji?: DiscordComponentEmoji;
-  disabled?: boolean;
-  allowedUsers?: string[];
-  internalCustomId?: string;
-};
-
-type DiscordComponentSelectType = "string" | "user" | "role" | "mentionable" | "channel";
-
-type DiscordComponentSelectSpec = {
-  type?: DiscordComponentSelectType;
-  callbackData?: string;
-  placeholder?: string;
-  minValues?: number;
-  maxValues?: number;
-  options?: DiscordComponentSelectOption[];
-  allowedUsers?: string[];
-};
-
-type DiscordComponentBlock =
-  | {
-      type: "text";
-      text: string;
-    }
-  | {
-      type: "section";
-      text?: string;
-      texts?: string[];
-      accessory?:
-        | { type: "thumbnail"; url: string }
-        | { type: "button"; button: DiscordComponentButtonSpec };
-    }
-  | {
-      type: "separator";
-      spacing?: "small" | "large" | 1 | 2;
-      divider?: boolean;
-    }
-  | {
-      type: "actions";
-      buttons?: DiscordComponentButtonSpec[];
-      select?: DiscordComponentSelectSpec;
-    }
-  | {
-      type: "media-gallery";
-      items: Array<{
-        url: string;
-        description?: string;
-        spoiler?: boolean;
-      }>;
-    }
-  | {
-      type: "file";
-      file: `attachment://${string}`;
-      spoiler?: boolean;
-    };
-
-type DiscordComponentModalFieldType =
-  | "text"
-  | "checkbox"
-  | "radio"
-  | "select"
-  | "role-select"
-  | "user-select";
-
-type DiscordComponentModalField = {
-  type: DiscordComponentModalFieldType;
-  name?: string;
-  label: string;
-  description?: string;
-  placeholder?: string;
-  required?: boolean;
-  options?: DiscordComponentSelectOption[];
-  minValues?: number;
-  maxValues?: number;
-  minLength?: number;
-  maxLength?: number;
-  style?: string;
-};
-
-type DiscordComponentMessageSpec = {
-  text?: string;
-  reusable?: boolean;
-  container?: {
-    accentColor?: unknown;
-    spoiler?: boolean;
-  };
-  blocks?: DiscordComponentBlock[];
-  modal?: {
-    title: string;
-    callbackData?: string;
-    triggerLabel?: string;
-    triggerStyle?: DiscordComponentButtonStyle;
-    allowedUsers?: string[];
-    fields: DiscordComponentModalField[];
-  };
-};
-
-type DiscordComponentEntry = {
-  id: string;
-  kind: "button" | "modal-trigger" | "select";
-  label: string;
-  callbackData?: string;
-  modalId?: string;
-  allowedUsers?: string[];
-  selectType?: DiscordComponentSelectType;
-  options?: Array<Pick<DiscordComponentSelectOption, "value" | "label">>;
-  sessionKey?: string;
-  agentId?: string;
-  accountId?: string;
-  reusable?: boolean;
-};
-
-type DiscordComponentModalRegistration = {
-  id: string;
-  title: string;
-  callbackData?: string;
-  fields: Array<DiscordComponentModalField & { name: string; id: string }>;
-  sessionKey?: string;
-  agentId?: string;
-  accountId?: string;
-  reusable?: boolean;
-  allowedUsers?: string[];
-};
-
-type DiscordComponentBuildResult = {
-  components: DiscordTopLevelComponent[];
-  entries: DiscordComponentEntry[];
-  modals: DiscordComponentModalRegistration[];
-};
-type DiscordHostAccountsModule = typeof import("../node_modules/openclaw/dist/plugin-sdk/extensions/discord/src/accounts.js");
-type DiscordHostSendModule = typeof import("../node_modules/openclaw/dist/plugin-sdk/extensions/discord/src/send.js");
-type TelegramHostAccountsModule = typeof import("../node_modules/openclaw/dist/plugin-sdk/extensions/telegram/src/accounts.js");
-type TelegramHostSendModule = typeof import("../node_modules/openclaw/dist/plugin-sdk/extensions/telegram/src/send.js");
-type TelegramHostTokenModule = typeof import("../node_modules/openclaw/dist/plugin-sdk/extensions/telegram/src/token.js");
-type DiscordComponentMessageSendResult = Awaited<
-  ReturnType<DiscordHostSendModule["sendMessageDiscord"]>
->;
-type DiscordChannelEditResult = Awaited<ReturnType<DiscordHostSendModule["editChannelDiscord"]>>;
-
-type DiscordSdkModule = {
-  resolveDiscordAccount: DiscordHostAccountsModule["resolveDiscordAccount"];
-  buildDiscordComponentMessage: (params: {
-    spec: DiscordComponentMessageSpec;
-    fallbackText?: string;
-    sessionKey?: string;
-    agentId?: string;
-    accountId?: string;
-  }) => DiscordComponentBuildResult;
-  editDiscordComponentMessage?: (
-    to: string,
-    messageId: string,
-    spec: DiscordComponentMessageSpec,
-    opts?: { accountId?: string },
-  ) => Promise<DiscordComponentMessageSendResult>;
-  registerBuiltDiscordComponentMessage?: (params: {
-    buildResult: DiscordComponentBuildResult;
-    messageId: string;
-  }) => void;
-};
-type TelegramAccountSdkModule = Pick<TelegramHostAccountsModule, "resolveTelegramAccount">;
-type DiscordExtensionApiModule = Partial<Pick<DiscordHostAccountsModule, "resolveDiscordAccount">>;
-type DiscordRuntimeApiModule = {
-  editDiscordComponentMessage?: (
-    to: string,
-    messageId: string,
-    spec: DiscordComponentMessageSpec,
-    opts?: {
-      cfg?: unknown;
-      accountId?: string;
-    },
-  ) => Promise<DiscordComponentMessageSendResult>;
-  registerBuiltDiscordComponentMessage?: (params: {
-    buildResult: DiscordComponentBuildResult;
-    messageId: string;
-  }) => void;
-  sendDiscordComponentMessage?: (
-    to: string,
-    spec: DiscordComponentMessageSpec,
-    opts?: {
-      cfg?: unknown;
-      accountId?: string;
-      mediaUrl?: string;
-      mediaLocalRoots?: readonly string[];
-    },
-  ) => Promise<DiscordComponentMessageSendResult>;
-  sendMessageDiscord?: DiscordHostSendModule["sendMessageDiscord"];
-  sendTypingDiscord?: DiscordHostSendModule["sendTypingDiscord"];
-  pinMessageDiscord?: DiscordHostSendModule["pinMessageDiscord"];
-  unpinMessageDiscord?: DiscordHostSendModule["unpinMessageDiscord"];
-  editChannelDiscord?: DiscordHostSendModule["editChannelDiscord"];
-};
-
-type TelegramRuntimeApiModule = {
-  sendMessageTelegram?: TelegramHostSendModule["sendMessageTelegram"];
-  sendTypingTelegram?: TelegramHostSendModule["sendTypingTelegram"];
-  pinMessageTelegram?: TelegramHostSendModule["pinMessageTelegram"];
-  unpinMessageTelegram?: TelegramHostSendModule["unpinMessageTelegram"];
-  editMessageTelegram?: TelegramHostSendModule["editMessageTelegram"];
-  renameForumTopicTelegram?: TelegramHostSendModule["renameForumTopicTelegram"];
-};
-
-type ProviderOutboundAdapter = Pick<ChannelOutboundAdapter, "sendMedia" | "sendPayload" | "sendText">;
 
 type ActiveRunRecord = {
   conversation: ConversationTarget;
@@ -347,6 +136,11 @@ type ActiveRunRecord = {
   mode: "default" | "plan" | "review";
   profile: PermissionsMode;
   handle: ActiveCodexRun;
+  tracker?: {
+    id: string;
+    interruptedNoticeSent: boolean;
+    pendingRequestIds: Set<string>;
+  };
 };
 
 type LiveAssistantReplyWriter = {
@@ -378,10 +172,6 @@ const TEXT_ATTACHMENT_MIME_TYPES = new Set([
   "text/yaml",
 ]);
 const MAX_TEXT_ATTACHMENT_BYTES = 64 * 1024;
-const DISCORD_LIVE_ASSISTANT_PREVIEW_THROTTLE_MS = 1_200;
-const DISCORD_LIVE_ASSISTANT_PREVIEW_MIN_CHARS = 30;
-const DISCORD_LIVE_ASSISTANT_PREVIEW_MAX_CHARS = 2_000;
-
 const MAX_TEXT_ATTACHMENT_CHARS = 16_000;
 const PLUGIN_VERSION = (() => {
   try {
@@ -485,53 +275,6 @@ type RuntimeSessionBindingRecord = {
   metadata?: Record<string, unknown>;
 };
 
-type LegacyTelegramTypingLease = {
-  refresh: () => Promise<void>;
-  stop: () => void;
-};
-
-type LegacyTelegramRuntime = {
-  sendMessageTelegram?: TelegramHostSendModule["sendMessageTelegram"];
-  resolveTelegramToken?: TelegramHostTokenModule["resolveTelegramToken"];
-  typing?: {
-    start?: (params: {
-      to: string;
-      accountId?: string;
-      messageThreadId?: number;
-    }) => Promise<LegacyTelegramTypingLease>;
-  };
-  conversationActions?: {
-    renameTopic?: TelegramHostSendModule["renameForumTopicTelegram"];
-  };
-};
-
-type LegacyDiscordTypingLease = {
-  refresh: () => Promise<void>;
-  stop: () => void;
-};
-
-type LegacyDiscordRuntime = {
-  sendMessageDiscord?: DiscordHostSendModule["sendMessageDiscord"];
-  sendComponentMessage?: (
-    to: string,
-    spec: DiscordComponentMessageSpec,
-    opts?: { accountId?: string },
-  ) => Promise<DiscordComponentMessageSendResult>;
-  typing?: {
-    start?: (params: {
-      channelId: string;
-      accountId?: string;
-    }) => Promise<LegacyDiscordTypingLease>;
-  };
-  conversationActions?: {
-    editChannel?: (
-      channelId: string,
-      params: { name?: string },
-      opts?: { accountId?: string },
-    ) => Promise<DiscordChannelEditResult>;
-  };
-};
-
 type PlanDelivery = {
   summaryText: string;
   attachmentPath?: string;
@@ -548,14 +291,6 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function asScopedBindingApi(value: object): ScopedBindingApi {
   return value as ScopedBindingApi;
-}
-
-function getLegacyTelegramRuntime(api: OpenClawPluginApi): LegacyTelegramRuntime | undefined {
-  return (api.runtime.channel as { telegram?: LegacyTelegramRuntime }).telegram;
-}
-
-function getLegacyDiscordRuntime(api: OpenClawPluginApi): LegacyDiscordRuntime | undefined {
-  return (api.runtime.channel as { discord?: LegacyDiscordRuntime }).discord;
 }
 
 function isTelegramChannel(channel: string): boolean {
@@ -1057,19 +792,6 @@ function extractReplyButtons(reply: ReplyPayload): PluginInteractiveButtons | un
   return rows.length > 0 ? rows : undefined;
 }
 
-function buildTelegramReplyMarkup(buttons?: PluginInteractiveButtons): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } | undefined {
-  if (!buttons || buttons.length === 0) {
-    return undefined;
-  }
-  return {
-    inline_keyboard: buttons.map((row) =>
-      row.map((button) => ({
-        text: button.text,
-        callback_data: button.callback_data,
-      })),
-    ),
-  };
-}
 function parseFastAction(
   argsText: string,
 ): "toggle" | "on" | "off" | "status" | { error: string } {
@@ -1545,6 +1267,10 @@ function summarizeTextForLog(text: string, maxChars = 120): string {
 export class CodexPluginController {
   private readonly settings;
   private readonly client;
+  private readonly channelRuntime: OpenClawChannelRuntimeAdapters;
+  private readonly channelDelivery: OpenClawChannelMessageDelivery;
+  private readonly channelRendering: OpenClawChannelLiveRendering;
+  private readonly channelInteractive: OpenClawChannelInteractiveOrchestration;
   private readonly activeRuns = new Map<string, ActiveRunRecord>();
   private readonly threadChangesCache = new Map<string, Promise<boolean | undefined>>();
   private readonly store;
@@ -1555,6 +1281,67 @@ export class CodexPluginController {
   constructor(private readonly api: OpenClawPluginApi) {
     this.settings = resolvePluginSettings(this.api.pluginConfig);
     this.client = new CodexAppServerModeClient(this.settings, this.api.logger);
+    this.channelRuntime = new OpenClawChannelRuntimeAdapters({
+      api: this.api,
+      getConfig: () => this.getOpenClawConfig(),
+    });
+    this.channelDelivery = new OpenClawChannelMessageDelivery({
+      api: this.api,
+      getConfig: () => this.getOpenClawConfig(),
+      loadTelegramOutboundAdapter: () => this.loadTelegramOutboundAdapter(),
+      loadDiscordOutboundAdapter: () => this.loadDiscordOutboundAdapter(),
+      loadTelegramRuntimeApi: () => this.loadTelegramRuntimeApi(),
+      loadDiscordRuntimeApi: () => this.loadDiscordRuntimeApi(),
+      resolveTelegramBotToken: (accountId) => this.resolveTelegramBotToken(accountId),
+      resolveDiscordBotToken: (accountId) => this.resolveDiscordBotToken(accountId),
+      resolveReplyMediaLocalRoots: (mediaUrl) => this.resolveReplyMediaLocalRoots(mediaUrl),
+      formatConversationForLog: (conversation) => this.formatConversationForLog(conversation),
+      denormalizeDiscordConversationId,
+      buildDiscordPickerSpec: (picker) => this.buildDiscordPickerSpec(picker),
+      sendDiscordPickerMessageLegacy: (conversation, picker) =>
+        this.sendDiscordPickerMessageLegacy(conversation, picker),
+    });
+    this.channelRendering = new OpenClawChannelLiveRendering({
+      api: this.api,
+      formatConversationForLog: (conversation) => this.formatConversationForLog(conversation),
+      editTelegramMessage: (chatId, messageId, text, opts) =>
+        this.editTelegramMessage(chatId, messageId, text, opts),
+      editDiscordComponentMessage: (to, messageId, spec, opts) =>
+        this.editDiscordComponentMessage(to, messageId, spec, opts),
+      registerBuiltDiscordComponentMessage: (params) =>
+        this.registerBuiltDiscordComponentMessage(params),
+      buildDiscordPickerSpec: (picker) => this.buildDiscordPickerSpec(picker),
+      buildDiscordPickerMessage: (picker) => this.buildDiscordPickerMessage(picker),
+      buildDiscordTextMessage: async (params) => {
+        const discordSdk = await this.loadDiscordSdk();
+        return discordSdk.buildDiscordComponentMessage({
+          spec: {
+            text: params.text,
+          },
+          accountId: params.accountId,
+        });
+      },
+      sendTextWithDeliveryRef: (conversation, text) =>
+        this.sendTextWithDeliveryRef(conversation, text),
+      sendSingleTextWithDeliveryRef: (conversation, text) =>
+        this.sendSingleTextWithDeliveryRef(conversation, text),
+    });
+    this.channelInteractive = new OpenClawChannelInteractiveOrchestration({
+      api: this.api,
+      getCallback: (token) => this.store.getCallback(token) ?? undefined,
+      dispatchCallbackAction: (callback, responders) =>
+        this.dispatchCallbackAction(callback, responders),
+      normalizeDiscordConversationId,
+      normalizeDiscordInteractiveConversationId,
+      extractReplyButtons,
+      buildDiscordPickerSpec: (picker) => this.buildDiscordPickerSpec(picker),
+      tryBuildDiscordPickerMessage: (picker) => this.tryBuildDiscordPickerMessage(picker),
+      registerBuiltDiscordComponentMessage: (params) =>
+        this.registerBuiltDiscordComponentMessage(params),
+      editDiscordComponentMessage: (to, messageId, spec, opts) =>
+        this.editDiscordComponentMessage(to, messageId, spec, opts),
+      sendDiscordPicker: (conversation, picker) => this.sendDiscordPicker(conversation, picker),
+    });
     this.store = new PluginStateStore(this.api.runtime.state.resolveStateDir());
   }
 
@@ -1659,6 +1446,88 @@ export class CodexPluginController {
     ].join(" ");
   }
 
+  private createActiveRunTracker() {
+    return {
+      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      interruptedNoticeSent: false,
+      pendingRequestIds: new Set<string>(),
+    };
+  }
+
+  private markInterruptedNoticeSent(activeRun: ActiveRunRecord | undefined): boolean {
+    if (!activeRun?.tracker || activeRun.tracker.interruptedNoticeSent) {
+      return false;
+    }
+    activeRun.tracker.interruptedNoticeSent = true;
+    return true;
+  }
+
+  private async replaceTrackedPendingRequest(
+    conversation: ConversationTarget,
+    activeRun: ActiveRunRecord | undefined,
+    requestId: string,
+  ): Promise<void> {
+    if (!activeRun?.tracker) {
+      const existing = this.store.getPendingRequestByConversation(conversation);
+      if (existing && existing.requestId !== requestId) {
+        await this.store.removePendingRequest(existing.requestId);
+      }
+      return;
+    }
+    const existing = this.store.getPendingRequestByConversation(conversation);
+    if (existing && existing.requestId !== requestId) {
+      await this.store.removePendingRequest(existing.requestId);
+    }
+    for (const trackedRequestId of [...activeRun.tracker.pendingRequestIds]) {
+      if (trackedRequestId === requestId) {
+        continue;
+      }
+      activeRun.tracker.pendingRequestIds.delete(trackedRequestId);
+      if (this.store.getPendingRequestById(trackedRequestId)) {
+        await this.store.removePendingRequest(trackedRequestId);
+      }
+    }
+    activeRun.tracker.pendingRequestIds.add(requestId);
+  }
+
+  private async clearTrackedPendingRequests(
+    conversation: ConversationTarget,
+    activeRun: ActiveRunRecord | undefined,
+  ): Promise<void> {
+    if (!activeRun?.tracker) {
+      const existing = this.store.getPendingRequestByConversation(conversation);
+      if (existing) {
+        await this.store.removePendingRequest(existing.requestId);
+      }
+      return;
+    }
+    const trackedRequestIds = [...activeRun.tracker.pendingRequestIds];
+    activeRun.tracker.pendingRequestIds.clear();
+    for (const requestId of trackedRequestIds) {
+      if (this.store.getPendingRequestById(requestId)) {
+        await this.store.removePendingRequest(requestId);
+      }
+    }
+  }
+
+  private async cleanupActiveRun(
+    key: string,
+    activeRun: ActiveRunRecord,
+    conversation: ConversationTarget,
+    stopTyping?: { stop: () => void } | null,
+  ): Promise<void> {
+    const current = this.activeRuns.get(key) === activeRun;
+    stopTyping?.stop();
+    await this.clearTrackedPendingRequests(conversation, activeRun);
+    if (current) {
+      this.activeRuns.delete(key);
+      await this.applyPendingBindingPermissionsModeMigration(conversation);
+    }
+    this.api.logger.debug?.(
+      `codex run cleaned up ${this.formatConversationForLog(conversation)} run=${activeRun.tracker?.id ?? "<legacy>"} current=${current ? "yes" : "no"}`,
+    );
+  }
+
   async handleInboundClaim(event: {
     content: string;
     channel: string;
@@ -1688,7 +1557,6 @@ export class CodexPluginController {
           this.api.logger.debug?.(
             `codex inbound claim restarting active plan run conversation=${conversation.conversationId}`,
           );
-          this.activeRuns.delete(activeKey);
           await active.handle.interrupt().catch(() => undefined);
         } else {
           const pending = this.store.getPendingRequestByConversation(conversation);
@@ -1708,13 +1576,12 @@ export class CodexPluginController {
               ? `codex inbound claim restarting active run for structured input conversation=${conversation.conversationId}`
               : `codex inbound claim restarting active run for fresh inbound prompt conversation=${conversation.conversationId}`,
           );
-          this.activeRuns.delete(activeKey);
           await active.handle.interrupt().catch(() => undefined);
         }
       }
       const existingBinding = this.store.getBinding(conversation);
       const bindingOutcome = existingBinding
-        ? await this.validateStoredBindingForInboundClaim(conversation, existingBinding)
+        ? await this.validateStoredBindingAgainstRuntime(conversation, existingBinding)
         : await this.hydrateApprovedBinding(conversation);
       if (bindingOutcome && "desyncMessage" in bindingOutcome) {
         await this.sendText(conversation, bindingOutcome.desyncMessage);
@@ -1769,284 +1636,12 @@ export class CodexPluginController {
     if (runtimeConfig !== undefined) {
       this.lastRuntimeConfig = runtimeConfig as HostOpenClawConfig;
     }
-    const bindingApi = asScopedBindingApi(ctx);
-    const callback = this.store.getCallback(ctx.callback.payload);
-    if (!callback) {
-      await ctx.respond.reply({ text: "That Codex action expired. Please retry the command." });
-      return;
-    }
-    await this.dispatchCallbackAction(callback, {
-      conversation: {
-        channel: "telegram",
-        accountId: ctx.accountId,
-        conversationId: ctx.conversationId,
-        parentConversationId: ctx.parentConversationId,
-        threadId: ctx.threadId,
-      },
-      sourceMessage:
-        ctx.callback.messageId != null && ctx.callback.chatId?.trim()
-          ? {
-              provider: "telegram",
-              messageId: String(ctx.callback.messageId),
-              chatId: ctx.callback.chatId,
-            }
-          : undefined,
-      acknowledge: async () => {},
-      clear: async () => {
-        await ctx.respond.clearButtons().catch(() => undefined);
-      },
-      reply: async (text) => {
-        await ctx.respond.reply({ text });
-      },
-      editPicker: async (picker) => {
-        await ctx.respond.editMessage({
-          text: picker.text,
-          buttons: picker.buttons,
-        });
-      },
-      requestConversationBinding: async (params) => {
-        const requestConversationBinding = bindingApi.requestConversationBinding;
-        if (!requestConversationBinding) {
-          return { status: "error", message: "Conversation binding is unavailable." } as const;
-        }
-        const result = await requestConversationBinding(params);
-        if (result.status === "pending") {
-          const buttons = extractReplyButtons(result.reply);
-          await ctx.respond.reply({
-            text: result.reply.text ?? "Bind approval requested.",
-            buttons,
-          });
-          return result;
-        }
-        return result;
-      },
-      detachConversationBinding: bindingApi.detachConversationBinding,
-    });
+    await this.channelInteractive.handleTelegramInteractive(ctx);
   }
 
   async handleDiscordInteractive(ctx: PluginInteractiveDiscordHandlerContext): Promise<void> {
     await this.start();
-    const bindingApi = asScopedBindingApi(ctx);
-    const callback = this.store.getCallback(ctx.interaction.payload);
-    if (!callback) {
-      await ctx.respond.reply({ text: "That Codex action expired. Please retry the command.", ephemeral: true });
-      return;
-    }
-    const callbackConversationId =
-      callback.conversation.channel === "discord"
-        ? normalizeDiscordConversationId(callback.conversation.conversationId)
-        : undefined;
-    const conversationId =
-      callbackConversationId ??
-      normalizeDiscordInteractiveConversationId({
-        conversationId: ctx.conversationId,
-        guildId: ctx.guildId,
-      });
-    if (!conversationId) {
-      await ctx.respond.reply({
-        text: "I couldn’t determine the Discord conversation for that action. Please retry the command.",
-        ephemeral: true,
-      });
-      return;
-    }
-    const conversation: ConversationTarget = {
-      channel: "discord",
-      accountId: callback.conversation.accountId ?? ctx.accountId,
-      conversationId,
-      parentConversationId: callback.conversation.parentConversationId ?? ctx.parentConversationId,
-    };
-    let interactionSettled = false;
-    try {
-      if (callback.kind === "resume-thread") {
-        await ctx.respond
-          .acknowledge()
-          .then(() => {
-            interactionSettled = true;
-          })
-          .catch(() => undefined);
-      }
-      await this.dispatchCallbackAction(callback, {
-        conversation,
-        sourceMessage: ctx.interaction.messageId?.trim()
-          ? {
-              provider: "discord",
-              messageId: ctx.interaction.messageId.trim(),
-              channelId: conversation.conversationId,
-            }
-          : undefined,
-        acknowledge: async () => {
-          if (interactionSettled) {
-            return;
-          }
-          await ctx.respond
-            .acknowledge()
-            .then(() => {
-              interactionSettled = true;
-            })
-            .catch(() => undefined);
-        },
-        clear: async () => {
-          const messageId = ctx.interaction.messageId?.trim();
-          if ((callback.kind === "pending-input" || callback.kind === "pending-questionnaire") && messageId) {
-            await ctx.respond
-              .acknowledge()
-              .then(() => {
-                interactionSettled = true;
-              })
-              .catch(() => undefined);
-            const completionText =
-              callback.kind === "pending-questionnaire"
-                ? "Recorded your answers and sent them to Codex."
-                : "Sent to Codex.";
-            await this.editDiscordComponentMessage(
-              conversation.conversationId,
-              messageId,
-              {
-                text: completionText,
-              },
-              {
-                accountId: conversation.accountId,
-              },
-            ).catch((error) => {
-              this.api.logger.warn(
-                `codex discord ${callback.kind} clear failed conversation=${conversationId}: ${String(error)}`,
-              );
-            });
-            return;
-          }
-          try {
-            await ctx.respond.clearComponents();
-            interactionSettled = true;
-          } catch {
-            await ctx.respond
-              .acknowledge()
-              .then(() => {
-                interactionSettled = true;
-              })
-              .catch(() => undefined);
-          }
-        },
-        reply: async (text) => {
-          if (interactionSettled) {
-            await ctx.respond.followUp({ text, ephemeral: true });
-            return;
-          }
-          await ctx.respond.reply({ text, ephemeral: true });
-          interactionSettled = true;
-        },
-        editPicker: async (picker) => {
-          this.api.logger.debug(
-            `codex discord picker refresh conversation=${conversationId} rows=${picker.buttons?.length ?? 0}`,
-          );
-          const messageId = ctx.interaction.messageId?.trim();
-          const builtPicker = await this.tryBuildDiscordPickerMessage(picker);
-          let alreadyAcknowledged = false;
-          if (builtPicker) {
-            try {
-              await ctx.respond.editMessage({
-                components: builtPicker.components,
-              });
-              interactionSettled = true;
-              if (messageId) {
-                await this.registerBuiltDiscordComponentMessage({
-                  buildResult: builtPicker,
-                  messageId,
-                });
-              }
-              return;
-            } catch (error) {
-              const detail = String(error);
-              if (!messageId) {
-                this.api.logger.warn(
-                  `codex discord picker edit failed conversation=${conversationId}: ${detail}`,
-                );
-              } else if (!detail.includes("already been acknowledged")) {
-                await ctx.respond
-                  .acknowledge()
-                  .then(() => {
-                    interactionSettled = true;
-                  })
-                  .catch(() => undefined);
-              } else {
-                alreadyAcknowledged = true;
-              }
-            }
-          }
-          if (messageId) {
-            try {
-              if (!interactionSettled && !alreadyAcknowledged) {
-                await ctx.respond
-                  .acknowledge()
-                  .then(() => {
-                    interactionSettled = true;
-                  })
-                  .catch(() => undefined);
-              }
-              await this.editDiscordComponentMessage(
-                conversation.conversationId,
-                messageId,
-                this.buildDiscordPickerSpec(picker),
-                {
-                  accountId: conversation.accountId,
-                },
-              );
-              return;
-            } catch (error) {
-              this.api.logger.warn(
-                `codex discord picker edit failed conversation=${conversationId}: ${String(error)}`,
-              );
-            }
-          }
-          try {
-            await this.sendDiscordPicker(conversation, picker);
-          } catch (error) {
-            this.api.logger.warn(
-              `codex discord picker send failed conversation=${conversationId}: ${String(error)}`,
-            );
-            throw error;
-          }
-        },
-        requestConversationBinding: async (params) => {
-          const requestConversationBinding = bindingApi.requestConversationBinding;
-          if (!requestConversationBinding) {
-            return { status: "error", message: "Conversation binding is unavailable." } as const;
-          }
-          const result = await requestConversationBinding(params);
-          if (result.status === "pending") {
-            const buttons = extractReplyButtons(result.reply);
-            await this.sendDiscordPicker(conversation, {
-              text: result.reply.text ?? "Bind approval requested.",
-              buttons,
-            });
-            const originalMessageId = ctx.interaction.messageId?.trim();
-            if (callback.kind === "resume-thread" && originalMessageId) {
-              await this.editDiscordComponentMessage(
-                conversation.conversationId,
-                originalMessageId,
-                {
-                  text: "Binding approval requested below.",
-                },
-                {
-                  accountId: conversation.accountId,
-                },
-              ).catch(() => undefined);
-            }
-            return result;
-          }
-          return result;
-        },
-        detachConversationBinding: bindingApi.detachConversationBinding,
-      });
-    } catch (error) {
-      const detail = error instanceof Error ? error.stack ?? error.message : String(error);
-      this.api.logger.warn(`codex discord interactive failed conversation=${conversationId}: ${detail}`);
-      const errorReply = {
-        text: "Codex hit an error handling that action. Please retry the command.",
-        ephemeral: true,
-      } as const;
-      const sendError = interactionSettled ? ctx.respond.followUp(errorReply) : ctx.respond.reply(errorReply);
-      await sendError.catch(() => undefined);
-    }
+    await this.channelInteractive.handleDiscordInteractive(ctx);
   }
 
   async handleCommand(commandName: string, ctx: PluginCommandContext): Promise<ReplyPayload> {
@@ -2062,15 +1657,19 @@ export class CodexPluginController {
     const existingBinding =
       conversation && currentBinding ? this.store.getBinding(conversation) : null;
     const hydratedBinding =
-      conversation && currentBinding && !existingBinding
-        ? await this.hydrateApprovedBinding(conversation)
+      conversation && currentBinding
+        ? existingBinding
+          ? await this.validateStoredBindingAgainstRuntime(conversation, existingBinding)
+          : await this.hydrateApprovedBinding(conversation)
         : null;
     const hydratedPendingBind =
       hydratedBinding && "pendingBind" in hydratedBinding ? hydratedBinding.pendingBind : undefined;
     const binding =
       hydratedBinding && "desyncMessage" in hydratedBinding
         ? null
-        : existingBinding ?? hydratedBinding?.binding ?? null;
+        : currentBinding
+          ? hydratedBinding?.binding ?? null
+          : null;
     const args = ctx.args?.trim() ?? "";
     const normalizedArgs = normalizeOptionDashes(args).trim();
     if (normalizedArgs === "help" || normalizedArgs === "--help") {
@@ -2112,7 +1711,7 @@ export class CodexPluginController {
           conversation,
           binding,
           args,
-          Boolean(currentBinding || binding),
+          Boolean(binding),
         );
       case "cas_stop":
         return await this.handleStopCommand(conversation);
@@ -2126,24 +1725,12 @@ export class CodexPluginController {
         return await this.handleCompactCommand(conversation, binding);
       case "cas_skills":
         return await this.handleSkillsCommand(conversation, binding, args);
-      case "cas_experimental":
-        return await this.handleExperimentalCommand(binding);
       case "cas_mcp":
         return await this.handleMcpCommand(binding, args);
       case "cas_fast":
         return await this.handleFastCommand(binding, args);
       case "cas_model":
         return await this.handleModelCommand(conversation, binding, args);
-      case "cas_permissions":
-        return await this.handlePermissionsCommand(
-          conversation,
-          binding,
-          Boolean(currentBinding || binding),
-        );
-      case "cas_init":
-        return await this.handlePromptAlias(conversation, binding, args, "/init");
-      case "cas_diff":
-        return await this.handlePromptAlias(conversation, binding, args, "/diff");
       case "cas_rename":
         return await this.handleRenameCommand(conversation, binding, args);
       default:
@@ -2764,40 +2351,7 @@ export class CodexPluginController {
     message: InteractiveMessageRef,
     statusCard: StatusCardRender,
   ): Promise<boolean> {
-    try {
-      if (message.provider === "telegram") {
-        await this.editTelegramMessage(message.chatId, message.messageId, statusCard.text, {
-          accountId: conversation.accountId,
-          buttons: statusCard.buttons ?? [],
-        });
-        return true;
-      }
-      const builtPicker = await this.buildDiscordPickerMessage({
-        text: statusCard.text,
-        buttons: statusCard.buttons,
-      });
-      await this.editDiscordComponentMessage(
-        message.channelId,
-        message.messageId,
-        this.buildDiscordPickerSpec({
-          text: statusCard.text,
-          buttons: statusCard.buttons,
-        }),
-        {
-          accountId: conversation.accountId,
-        },
-      );
-      await this.registerBuiltDiscordComponentMessage({
-        buildResult: builtPicker,
-        messageId: message.messageId,
-      });
-      return true;
-    } catch (error) {
-      this.api.logger.warn(
-        `codex status card update failed ${this.formatConversationForLog(conversation)} provider=${message.provider}: ${String(error)}`,
-      );
-      return false;
-    }
+    return await this.channelRendering.updateStatusCardMessage(conversation, message, statusCard);
   }
 
   private async updateDeliveredTextMessage(
@@ -2805,276 +2359,23 @@ export class CodexPluginController {
     message: DeliveredMessageRef,
     text: string,
   ): Promise<boolean> {
-    const trimmed = text.trim();
-    if (!trimmed) {
-      return false;
-    }
-    try {
-      if (message.provider === "telegram") {
-        await this.editTelegramMessage(message.chatId, message.messageId, trimmed, {
-          accountId: conversation.accountId,
-        });
-        return true;
-      }
-      const spec: DiscordComponentMessageSpec = {
-        text: trimmed,
-      };
-      await this.editDiscordComponentMessage(message.channelId, message.messageId, spec, {
-        accountId: conversation.accountId,
-      });
-      await this.registerBuiltDiscordComponentMessage({
-        buildResult: await this.loadDiscordSdk().then((discordSdk) =>
-          discordSdk.buildDiscordComponentMessage({
-            spec,
-            accountId: conversation.accountId,
-          }),
-        ),
-        messageId: message.messageId,
-      });
-      return true;
-    } catch (error) {
-      this.api.logger.warn(
-        `codex live assistant message update failed ${this.formatConversationForLog(conversation)} provider=${message.provider}: ${String(error)}`,
-      );
-      return false;
-    }
+    return await this.channelRendering.updateDeliveredTextMessage(conversation, message, text);
   }
 
   private createLiveAssistantReplyWriter(conversation: ConversationTarget): LiveAssistantReplyWriter {
-    if (isDiscordChannel(conversation.channel)) {
-      return this.createDiscordLiveAssistantReplyWriter(conversation);
-    }
-    return this.createChunkedLiveAssistantReplyWriter(conversation);
+    return this.channelRendering.createLiveAssistantReplyWriter(conversation);
   }
 
   private createChunkedLiveAssistantReplyWriter(
     conversation: ConversationTarget,
   ): LiveAssistantReplyWriter {
-    const fallbackLimit = isTelegramChannel(conversation.channel) ? 4000 : 2000;
-    const chunkLimit = this.api.runtime.channel.text.resolveTextChunkLimit(
-      undefined,
-      conversation.channel,
-      conversation.accountId,
-      { fallbackLimit },
-    );
-    const chunkText = (text: string): string[] => {
-      const trimmed = text.trim();
-      if (!trimmed) {
-        return [];
-      }
-      const chunks = this.api.runtime.channel.text.chunkText(trimmed, chunkLimit).filter(Boolean);
-      return chunks.length > 0 ? chunks : [trimmed];
-    };
-
-    let deliveredChunks: DeliveredMessageRef[] = [];
-    let renderedChunks: string[] = [];
-    let renderedText = "";
-    let pendingText = "";
-    let renderQueue = Promise.resolve();
-
-    const renderLatest = async () => {
-      const nextText = pendingText.trim();
-      if (!nextText || nextText === renderedText) {
-        return;
-      }
-      if (renderedText && nextText.length < renderedText.length) {
-        return;
-      }
-      const nextChunks = chunkText(nextText);
-      for (let index = 0; index < nextChunks.length; index += 1) {
-        const chunk = nextChunks[index];
-        if (!chunk) {
-          continue;
-        }
-        const delivered = deliveredChunks[index];
-        if (delivered) {
-          if (renderedChunks[index] !== chunk) {
-            const updated = await this.updateDeliveredTextMessage(conversation, delivered, chunk);
-            if (!updated) {
-              return;
-            }
-          }
-          continue;
-        }
-        const nextDelivered = await this.sendTextWithDeliveryRef(conversation, chunk);
-        if (!nextDelivered) {
-          return;
-        }
-        deliveredChunks.push(nextDelivered);
-      }
-      renderedChunks = nextChunks;
-      renderedText = nextText;
-    };
-
-    const enqueueRender = () => {
-      renderQueue = renderQueue
-        .then(renderLatest)
-        .catch((error: unknown) => {
-          this.api.logger.warn(
-            `codex live assistant render failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
-          );
-        });
-      return renderQueue;
-    };
-
-    return {
-      update: async (text: string) => {
-        const trimmed = text.trim();
-        if (!trimmed) {
-          return;
-        }
-        pendingText = trimmed;
-        await enqueueRender();
-      },
-      finalize: async (text?: string) => {
-        const trimmed = text?.trim();
-        if (trimmed) {
-          pendingText = trimmed;
-          await enqueueRender();
-        } else {
-          await renderQueue;
-        }
-        return trimmed ? renderedText === trimmed : renderedChunks.length > 0;
-      },
-    };
+    return this.channelRendering.createLiveAssistantReplyWriter(conversation);
   }
 
   private createDiscordLiveAssistantReplyWriter(
     conversation: ConversationTarget,
   ): LiveAssistantReplyWriter {
-    const chunkLimit = this.api.runtime.channel.text.resolveTextChunkLimit(
-      undefined,
-      "discord",
-      conversation.accountId,
-      { fallbackLimit: DISCORD_LIVE_ASSISTANT_PREVIEW_MAX_CHARS },
-    );
-    const chunkText = (text: string): string[] => {
-      const trimmed = text.trim();
-      if (!trimmed) {
-        return [];
-      }
-      const chunks = this.api.runtime.channel.text.chunkText(trimmed, chunkLimit).filter(Boolean);
-      return chunks.length > 0 ? chunks : [trimmed];
-    };
-
-    let previewMessage: DeliveredMessageRef | null = null;
-    let previewText = "";
-    let observedText = "";
-    let pendingPreviewText = "";
-    let previewQueue = Promise.resolve();
-    let previewTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const clearPreviewTimer = () => {
-      if (!previewTimer) {
-        return;
-      }
-      clearTimeout(previewTimer);
-      previewTimer = null;
-    };
-
-    const renderPreview = async () => {
-      previewTimer = null;
-      const nextText = pendingPreviewText.trim();
-      if (!nextText || nextText === previewText) {
-        return;
-      }
-      if (!previewMessage && nextText.length < DISCORD_LIVE_ASSISTANT_PREVIEW_MIN_CHARS) {
-        return;
-      }
-      if (nextText.length > DISCORD_LIVE_ASSISTANT_PREVIEW_MAX_CHARS) {
-        return;
-      }
-      if (previewText && previewText.startsWith(nextText) && nextText.length < previewText.length) {
-        return;
-      }
-      if (!previewMessage) {
-        previewMessage = await this.sendSingleTextWithDeliveryRef(conversation, nextText);
-        if (!previewMessage) {
-          return;
-        }
-        previewText = nextText;
-        return;
-      }
-      const updated = await this.updateDeliveredTextMessage(conversation, previewMessage, nextText);
-      if (!updated) {
-        return;
-      }
-      previewText = nextText;
-    };
-
-    const enqueuePreviewRender = () => {
-      previewQueue = previewQueue
-        .then(renderPreview)
-        .catch((error: unknown) => {
-          this.api.logger.warn(
-            `codex live assistant preview render failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
-          );
-        });
-      return previewQueue;
-    };
-
-    const schedulePreviewRender = () => {
-      if (previewTimer) {
-        return;
-      }
-      previewTimer = setTimeout(() => {
-        void enqueuePreviewRender();
-      }, DISCORD_LIVE_ASSISTANT_PREVIEW_THROTTLE_MS);
-    };
-
-    return {
-      update: async (text: string) => {
-        const trimmed = text.trim();
-        if (!trimmed) {
-          return;
-        }
-        if (observedText && observedText.startsWith(trimmed) && trimmed.length < observedText.length) {
-          return;
-        }
-        observedText = trimmed;
-        pendingPreviewText = trimmed;
-        if (trimmed.length >= DISCORD_LIVE_ASSISTANT_PREVIEW_MIN_CHARS || previewMessage) {
-          schedulePreviewRender();
-        }
-      },
-      finalize: async (text?: string) => {
-        clearPreviewTimer();
-        await previewQueue;
-
-        const explicitFinalText = text?.trim();
-        const finalSource = explicitFinalText || observedText.trim();
-        if (!previewMessage) {
-          if (!explicitFinalText && finalSource) {
-            const delivered = await this.sendTextWithDeliveryRef(conversation, finalSource);
-            return delivered !== null;
-          }
-          return false;
-        }
-        if (!finalSource) {
-          return previewText.length > 0;
-        }
-
-        const finalChunks = chunkText(finalSource);
-        if (finalChunks.length === 0) {
-          return previewText.length > 0;
-        }
-        const [firstChunk, ...spilloverChunks] = finalChunks;
-        if (firstChunk && firstChunk !== previewText) {
-          const updated = await this.updateDeliveredTextMessage(conversation, previewMessage, firstChunk);
-          if (!updated) {
-            return false;
-          }
-          previewText = firstChunk;
-        }
-        for (const chunk of spilloverChunks) {
-          const delivered = await this.sendSingleTextWithDeliveryRef(conversation, chunk);
-          if (!delivered) {
-            return false;
-          }
-        }
-        return true;
-      },
-    };
+    return this.channelRendering.createLiveAssistantReplyWriter(conversation);
   }
 
   private async buildModelPicker(
@@ -3394,7 +2695,6 @@ export class CodexPluginController {
         `codex plan off requested ${this.formatConversationForLog(conversation)} active=${active?.mode ?? "none"} boundThread=${binding?.threadId ?? "<none>"}`,
       );
       if (active?.mode === "plan") {
-        this.activeRuns.delete(key);
         await active.handle.interrupt().catch(() => undefined);
       }
       return { text: "Exited Codex plan mode. Future turns will use default coding mode." };
@@ -3594,14 +2894,6 @@ export class CodexPluginController {
     return buildReplyWithButtons(picker.text, picker.buttons);
   }
 
-  private async handleExperimentalCommand(binding: StoredBinding | null): Promise<ReplyPayload> {
-    const features = await this.client.listExperimentalFeatures({
-      profile: this.getPermissionsMode(binding),
-      sessionKey: binding?.sessionKey,
-    });
-    return { text: formatExperimentalFeatures(features) };
-  }
-
   private async handleMcpCommand(binding: StoredBinding | null, args: string): Promise<ReplyPayload> {
     const servers = await this.client.listMcpServers({
       profile: this.getPermissionsMode(binding),
@@ -3733,38 +3025,6 @@ export class CodexPluginController {
     };
     await this.store.upsertBinding(updatedBinding);
     return { text: `Codex model set to ${nextState.model || trimmedArgs}.` };
-  }
-
-  private async handlePermissionsCommand(
-    conversation: ConversationTarget | null,
-    binding: StoredBinding | null,
-    bindingActive: boolean,
-  ): Promise<ReplyPayload> {
-    return await this.handleStatusCommand(conversation, binding, "", bindingActive);
-  }
-
-  private async handlePromptAlias(
-    conversation: ConversationTarget | null,
-    binding: StoredBinding | null,
-    args: string,
-    alias: string,
-  ): Promise<ReplyPayload> {
-    if (!conversation) {
-      return { text: "This command needs a Telegram or Discord conversation." };
-    }
-    const workspaceDir = resolveWorkspaceDir({
-      bindingWorkspaceDir: binding?.workspaceDir,
-      configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
-      serviceWorkspaceDir: this.serviceWorkspaceDir,
-    });
-    await this.startTurn({
-      conversation,
-      binding,
-      workspaceDir,
-      prompt: `${alias}${args.trim() ? ` ${args.trim()}` : ""}`,
-      reason: "command",
-    });
-    return { text: `Sent ${alias} to Codex.` };
   }
 
   private async handleRenameCommand(
@@ -3933,7 +3193,6 @@ export class CodexPluginController {
             : `codex turn request restarting active run for fresh prompt ${this.formatConversationForLog(params.conversation)} mode=${existing.mode}`,
         );
       }
-      this.activeRuns.delete(key);
       await existing.handle.interrupt().catch(() => undefined);
     }
     const typing = await this.startTypingLease(params.conversation);
@@ -3947,7 +3206,16 @@ export class CodexPluginController {
       this.settings.defaultModel,
       this.settings.defaultServiceTier,
     );
-    const run = this.client.startTurn({
+    let run!: ActiveCodexRun;
+    const activeRun: ActiveRunRecord = {
+      conversation: params.conversation,
+      workspaceDir: params.workspaceDir,
+      mode: params.collaborationMode?.mode === "plan" ? "plan" : "default",
+      profile,
+      handle: undefined as unknown as ActiveCodexRun,
+      tracker: this.createActiveRunTracker(),
+    };
+    run = this.client.startTurn({
       profile,
       sessionKey: params.binding?.sessionKey,
       workspaceDir: params.workspaceDir,
@@ -3969,29 +3237,33 @@ export class CodexPluginController {
         this.api.logger.debug?.(
           `codex turn pending input ${state ? "received" : "cleared"} ${this.formatConversationForLog(params.conversation)} questionnaire=${state?.questionnaire ? "yes" : "no"}`,
         );
-        await this.handlePendingInputState(params.conversation, params.workspaceDir, state, run);
+        await this.handlePendingInputState(
+          params.conversation,
+          params.workspaceDir,
+          state,
+          run,
+          activeRun,
+        );
       },
       onFileEdits: async (text) => {
         await this.sendText(params.conversation, text);
         await typing?.refresh().catch(() => undefined);
       },
       onInterrupted: async () => {
+        if (!this.markInterruptedNoticeSent(activeRun)) {
+          return;
+        }
         this.api.logger.debug?.(
           `codex turn interrupted ${this.formatConversationForLog(params.conversation)}`,
         );
         await this.sendText(params.conversation, "Codex stopped.");
       },
     });
+    activeRun.handle = run;
     this.api.logger.debug?.(
       `codex turn run handle created ${this.formatConversationForLog(params.conversation)}`,
     );
-    this.activeRuns.set(key, {
-      conversation: params.conversation,
-      workspaceDir: params.workspaceDir,
-      mode: params.collaborationMode?.mode === "plan" ? "plan" : "default",
-      profile,
-      handle: run,
-    });
+    this.activeRuns.set(key, activeRun);
     void (run.result as Promise<import("./types.js").TurnResult>)
       .then(async (result) => {
         const threadId = result.threadId || run.getThreadId();
@@ -4037,6 +3309,9 @@ export class CodexPluginController {
         ) {
           return;
         }
+        if (result.aborted && activeRun.tracker?.interruptedNoticeSent) {
+          return;
+        }
         const completionText =
           result.terminalStatus === "failed"
             ? await this.describeTurnFailure({
@@ -4068,16 +3343,7 @@ export class CodexPluginController {
         );
       })
       .finally(async () => {
-        typing?.stop();
-        this.activeRuns.delete(key);
-        const pending = this.store.getPendingRequestByConversation(params.conversation);
-        if (pending) {
-          await this.store.removePendingRequest(pending.requestId);
-        }
-        await this.applyPendingBindingPermissionsModeMigration(params.conversation);
-        this.api.logger.debug?.(
-          `codex turn cleaned up ${this.formatConversationForLog(params.conversation)}`,
-        );
+        await this.cleanupActiveRun(key, activeRun, params.conversation, typing);
       });
   }
 
@@ -4215,7 +3481,16 @@ export class CodexPluginController {
       this.settings.defaultServiceTier,
     );
     const effectiveThreadState = desired.effectiveState;
-    const run = this.client.startTurn({
+    let run!: ActiveCodexRun;
+    const activeRun: ActiveRunRecord = {
+      conversation: params.conversation,
+      workspaceDir: params.workspaceDir,
+      mode: "plan",
+      profile,
+      handle: undefined as unknown as ActiveCodexRun,
+      tracker: this.createActiveRunTracker(),
+    };
+    run = this.client.startTurn({
       profile,
       sessionKey: params.binding?.sessionKey,
       workspaceDir: params.workspaceDir,
@@ -4242,19 +3517,23 @@ export class CodexPluginController {
         this.api.logger.debug(
           `codex plan pending input ${state ? `received (questionnaire=${state.questionnaire ? "yes" : "no"})` : "cleared"}`,
         );
-        await this.handlePendingInputState(params.conversation, params.workspaceDir, state, run);
+        await this.handlePendingInputState(
+          params.conversation,
+          params.workspaceDir,
+          state,
+          run,
+          activeRun,
+        );
       },
       onInterrupted: async () => {
+        if (!this.markInterruptedNoticeSent(activeRun)) {
+          return;
+        }
         await this.sendText(params.conversation, formatInterruptedText("plan"));
       },
     });
-    this.activeRuns.set(key, {
-      conversation: params.conversation,
-      workspaceDir: params.workspaceDir,
-      mode: "plan",
-      profile,
-      handle: run,
-    });
+    activeRun.handle = run;
+    this.activeRuns.set(key, activeRun);
     void (run.result as Promise<import("./types.js").TurnResult>)
       .then(async (result) => {
         const threadId = result.threadId || run.getThreadId();
@@ -4279,6 +3558,9 @@ export class CodexPluginController {
           });
         }
         if (result.aborted) {
+          if (activeRun.tracker?.interruptedNoticeSent) {
+            return;
+          }
           await this.sendText(params.conversation, formatInterruptedText("plan"));
           return;
         }
@@ -4342,13 +3624,7 @@ export class CodexPluginController {
       })
       .finally(async () => {
         stopProgressTimer();
-        typing?.stop();
-        this.activeRuns.delete(key);
-        const pending = this.store.getPendingRequestByConversation(params.conversation);
-        if (pending) {
-          await this.store.removePendingRequest(pending.requestId);
-        }
-        await this.applyPendingBindingPermissionsModeMigration(params.conversation);
+        await this.cleanupActiveRun(key, activeRun, params.conversation, typing);
       });
   }
 
@@ -4404,7 +3680,16 @@ export class CodexPluginController {
       this.settings.defaultModel,
       this.settings.defaultServiceTier,
     );
-    const run = this.client.startReview({
+    let run!: ActiveCodexRun;
+    const activeRun: ActiveRunRecord = {
+      conversation: params.conversation,
+      workspaceDir: params.workspaceDir,
+      mode: "review",
+      profile,
+      handle: undefined as unknown as ActiveCodexRun,
+      tracker: this.createActiveRunTracker(),
+    };
+    run = this.client.startReview({
       profile,
       sessionKey: params.binding.sessionKey,
       workspaceDir: params.workspaceDir,
@@ -4420,22 +3705,29 @@ export class CodexPluginController {
         if (state) {
           stopProgressTimer();
         }
-        await this.handlePendingInputState(params.conversation, params.workspaceDir, state, run);
+        await this.handlePendingInputState(
+          params.conversation,
+          params.workspaceDir,
+          state,
+          run,
+          activeRun,
+        );
       },
       onInterrupted: async () => {
+        if (!this.markInterruptedNoticeSent(activeRun)) {
+          return;
+        }
         await this.sendText(params.conversation, "Codex review stopped.");
       },
     });
-    this.activeRuns.set(key, {
-      conversation: params.conversation,
-      workspaceDir: params.workspaceDir,
-      mode: "review",
-      profile,
-      handle: run,
-    });
+    activeRun.handle = run;
+    this.activeRuns.set(key, activeRun);
     void (run.result as Promise<import("./types.js").ReviewResult>)
       .then(async (result) => {
         if (result.aborted) {
+          if (activeRun.tracker?.interruptedNoticeSent) {
+            return;
+          }
           await this.sendText(params.conversation, formatInterruptedText("review"));
           return;
         }
@@ -4506,13 +3798,7 @@ export class CodexPluginController {
       })
       .finally(async () => {
         stopProgressTimer();
-        typing?.stop();
-        this.activeRuns.delete(key);
-        const pending = this.store.getPendingRequestByConversation(params.conversation);
-        if (pending) {
-          await this.store.removePendingRequest(pending.requestId);
-        }
-        await this.applyPendingBindingPermissionsModeMigration(params.conversation);
+        await this.cleanupActiveRun(key, activeRun, params.conversation, typing);
       });
   }
 
@@ -4521,14 +3807,13 @@ export class CodexPluginController {
     workspaceDir: string,
     state: PendingInputState | null,
     run: ActiveCodexRun,
+    activeRun?: ActiveRunRecord,
   ): Promise<void> {
     if (!state) {
-      const existing = this.store.getPendingRequestByConversation(conversation);
-      if (existing) {
-        await this.store.removePendingRequest(existing.requestId);
-      }
+      await this.clearTrackedPendingRequests(conversation, activeRun);
       return;
     }
+    await this.replaceTrackedPendingRequest(conversation, activeRun, state.requestId);
     if (state.questionnaire) {
       const existing = this.store.getPendingRequestById(state.requestId);
       await this.store.upsertPendingRequest({
@@ -5529,72 +4814,23 @@ export class CodexPluginController {
   }
 
   private async loadDiscordSdk(): Promise<DiscordSdkModule> {
-    return await loadOpenClawCompatModule<DiscordSdkModule>({
-      specifier: "openclaw/plugin-sdk/discord",
-      fallbackRelativePath: "dist/extensions/discord/api.js",
-      label: "discord",
-      logger: this.api.logger,
-    });
+    return await this.channelRuntime.loadDiscordSdk();
   }
 
   private async loadTelegramAccountSdk(): Promise<TelegramAccountSdkModule> {
-    return await loadOpenClawCompatModule<TelegramAccountSdkModule>({
-      specifier: "openclaw/plugin-sdk/telegram-account",
-      fallbackRelativePath: "dist/extensions/telegram/api.js",
-      label: "telegram account",
-      logger: this.api.logger,
-    });
+    return await this.channelRuntime.loadTelegramAccountSdk();
   }
 
   private async loadDiscordRuntimeApi(): Promise<DiscordRuntimeApiModule | undefined> {
-    try {
-      const openClawEntrypointPath = resolveOpenClawEntrypointPath();
-      const runtimeApiPath = resolveCompatFallbackPath(
-        openClawEntrypointPath,
-        "dist/extensions/discord/runtime-api.js",
-      );
-      if (!existsSync(runtimeApiPath)) {
-        return undefined;
-      }
-      return (await import(pathToFileURL(runtimeApiPath).href)) as DiscordRuntimeApiModule;
-    } catch (error) {
-      this.api.logger.debug?.(`codex discord runtime api unavailable: ${String(error)}`);
-      return undefined;
-    }
+    return await this.channelRuntime.loadDiscordRuntimeApi();
   }
 
   private async loadTelegramRuntimeApi(): Promise<TelegramRuntimeApiModule | undefined> {
-    try {
-      const openClawEntrypointPath = resolveOpenClawEntrypointPath();
-      const runtimeApiPath = resolveCompatFallbackPath(
-        openClawEntrypointPath,
-        "dist/extensions/telegram/runtime-api.js",
-      );
-      if (!existsSync(runtimeApiPath)) {
-        return undefined;
-      }
-      return (await import(pathToFileURL(runtimeApiPath).href)) as TelegramRuntimeApiModule;
-    } catch (error) {
-      this.api.logger.debug?.(`codex telegram runtime api unavailable: ${String(error)}`);
-      return undefined;
-    }
+    return await this.channelRuntime.loadTelegramRuntimeApi();
   }
 
   private async loadDiscordExtensionApi(): Promise<DiscordExtensionApiModule | undefined> {
-    try {
-      const openClawEntrypointPath = resolveOpenClawEntrypointPath();
-      const apiPath = resolveCompatFallbackPath(
-        openClawEntrypointPath,
-        "dist/extensions/discord/api.js",
-      );
-      if (!existsSync(apiPath)) {
-        return undefined;
-      }
-      return (await import(pathToFileURL(apiPath).href)) as DiscordExtensionApiModule;
-    } catch (error) {
-      this.api.logger.debug?.(`codex discord extension api unavailable: ${String(error)}`);
-      return undefined;
-    }
+    return await this.channelRuntime.loadDiscordExtensionApi();
   }
 
   private async editDiscordComponentMessage(
@@ -5878,7 +5114,6 @@ export class CodexPluginController {
       const ackText = this.buildRunPromptAckText(callback.prompt);
       if (active) {
         if (active.mode === "plan" && (callback.collaborationMode?.mode ?? "default") !== "plan") {
-          this.activeRuns.delete(buildConversationKey(conversation));
           await active.handle.interrupt().catch(() => undefined);
         } else {
           const handled = await active.handle.queueMessage(callback.prompt);
@@ -6246,7 +5481,6 @@ export class CodexPluginController {
       const ackText = this.buildRunPromptAckText(prompt);
       if (active) {
         if (active.mode === "plan") {
-          this.activeRuns.delete(buildConversationKey(conversation));
           await active.handle.interrupt().catch(() => undefined);
         } else {
           const handled = await active.handle.queueMessage(prompt);
@@ -6853,7 +6087,7 @@ export class CodexPluginController {
     await this.store.removeBinding(conversation);
   }
 
-  private async validateStoredBindingForInboundClaim(
+  private async validateStoredBindingAgainstRuntime(
     conversation: ConversationTarget,
     binding: StoredBinding,
   ): Promise<HydratedBindingOutcome | null> {
@@ -7332,275 +6566,7 @@ export class CodexPluginController {
       mediaUrl?: string;
     },
   ): Promise<DeliveredMessageRef | null> {
-    const text = payload.text?.trim() ?? "";
-    const hasMedia = typeof payload.mediaUrl === "string" && payload.mediaUrl.trim().length > 0;
-    if (!text && !hasMedia) {
-      return null;
-    }
-    this.api.logger.debug?.(
-      `codex outbound send start ${this.formatConversationForLog(conversation)} textChars=${text.length} media=${hasMedia ? "yes" : "no"} buttons=${payload.buttons?.length ?? 0} preview="${summarizeTextForLog(text, 80)}"`,
-    );
-    if (isTelegramChannel(conversation.channel)) {
-      const outbound = await this.loadTelegramOutboundAdapter();
-      const outboundCfg = this.getOpenClawConfig();
-      const mediaLocalRoots = this.resolveReplyMediaLocalRoots(payload.mediaUrl);
-      const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
-        undefined,
-        "telegram",
-        conversation.accountId,
-        { fallbackLimit: 4000 },
-      );
-      const chunks = text
-        ? this.api.runtime.channel.text.chunkText(text, limit).filter(Boolean)
-        : [];
-      let delivered: DeliveredMessageRef | null = null;
-      if (hasMedia) {
-        const result =
-          chunks.length <= 1 && payload.buttons && outboundCfg && outbound?.sendPayload
-            ? await outbound.sendPayload({
-                cfg: outboundCfg,
-                to: conversation.parentConversationId ?? conversation.conversationId,
-                accountId: conversation.accountId,
-                threadId: conversation.threadId,
-                mediaLocalRoots,
-                text: chunks[0] ?? text,
-                payload: {
-                  text: chunks[0] ?? text,
-                  mediaUrl: payload.mediaUrl,
-                  channelData: {
-                    telegram: {
-                      buttons: payload.buttons,
-                    },
-                  },
-                },
-              })
-            : await this.sendTelegramMediaChunk(outbound, conversation, chunks[0] ?? text, {
-                mediaUrl: payload.mediaUrl,
-                mediaLocalRoots,
-                buttons: chunks.length <= 1 ? payload.buttons : undefined,
-              });
-        delivered = {
-          provider: "telegram",
-          messageId: result.messageId,
-          chatId:
-            typeof result.chatId === "string"
-              ? result.chatId
-              : conversation.parentConversationId ?? conversation.conversationId,
-        };
-        for (let index = 1; index < chunks.length; index += 1) {
-          const chunk = chunks[index];
-          if (!chunk) {
-            continue;
-          }
-          const result =
-            index === chunks.length - 1 && payload.buttons && outboundCfg && outbound?.sendPayload
-              ? await outbound.sendPayload({
-                  cfg: outboundCfg,
-                  to: conversation.parentConversationId ?? conversation.conversationId,
-                  accountId: conversation.accountId,
-                  threadId: conversation.threadId,
-                  text: chunk,
-                  payload: {
-                    text: chunk,
-                    channelData: {
-                      telegram: {
-                        buttons: payload.buttons,
-                      },
-                    },
-                  },
-                })
-              : await this.sendTelegramTextChunk(outbound, conversation, chunk, {
-                  buttons: index === chunks.length - 1 ? payload.buttons : undefined,
-                });
-          if (index === chunks.length - 1 || !delivered) {
-            delivered = {
-              provider: "telegram",
-              messageId: result.messageId,
-              chatId:
-                typeof result.chatId === "string"
-                  ? result.chatId
-                  : conversation.parentConversationId ?? conversation.conversationId,
-            };
-          }
-        }
-        this.api.logger.debug?.(
-          `codex outbound send complete ${this.formatConversationForLog(conversation)} channel=telegram chunks=${Math.max(chunks.length, 1)} media=${hasMedia ? "yes" : "no"}`,
-        );
-        return delivered;
-      }
-      const textChunks = chunks.length > 0 ? chunks : [text];
-      for (let index = 0; index < textChunks.length; index += 1) {
-        const chunk = textChunks[index];
-        if (!chunk) {
-          continue;
-        }
-        const result =
-          index === textChunks.length - 1 && payload.buttons && outboundCfg && outbound?.sendPayload
-            ? await outbound.sendPayload({
-                cfg: outboundCfg,
-                to: conversation.parentConversationId ?? conversation.conversationId,
-                accountId: conversation.accountId,
-                threadId: conversation.threadId,
-                text: chunk,
-                payload: {
-                  text: chunk,
-                  channelData: {
-                    telegram: {
-                      buttons: payload.buttons,
-                    },
-                  },
-                },
-              })
-            : await this.sendTelegramTextChunk(outbound, conversation, chunk, {
-                buttons: index === textChunks.length - 1 ? payload.buttons : undefined,
-              });
-        if (!delivered || index === textChunks.length - 1) {
-          delivered = {
-            provider: "telegram",
-            messageId: result.messageId,
-            chatId:
-              typeof result.chatId === "string"
-                ? result.chatId
-                : conversation.parentConversationId ?? conversation.conversationId,
-          };
-        }
-      }
-      this.api.logger.debug?.(
-        `codex outbound send complete ${this.formatConversationForLog(conversation)} channel=telegram chunks=${textChunks.length} media=no`,
-      );
-      return delivered;
-    }
-    if (isDiscordChannel(conversation.channel)) {
-      const outbound = await this.loadDiscordOutboundAdapter();
-      const outboundCfg = this.getOpenClawConfig();
-      const mediaLocalRoots = this.resolveReplyMediaLocalRoots(payload.mediaUrl);
-      const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
-        undefined,
-        "discord",
-        conversation.accountId,
-        { fallbackLimit: 2000 },
-      );
-      const chunks = text
-        ? this.api.runtime.channel.text.chunkText(text, limit).filter(Boolean)
-        : [];
-      let delivered: DeliveredMessageRef | null = null;
-      if (payload.buttons && payload.buttons.length > 0) {
-        this.api.logger.debug(
-          `codex discord reply send conversation=${conversation.conversationId} rows=${payload.buttons.length}`,
-        );
-        const attachmentChunk = hasMedia ? (chunks.shift() ?? text) : undefined;
-        if (hasMedia) {
-          const result = await this.sendDiscordTextChunk(outbound, conversation, attachmentChunk ?? "", {
-            mediaUrl: payload.mediaUrl,
-            mediaLocalRoots,
-          });
-          delivered = {
-            provider: "discord",
-            messageId: result.messageId,
-            channelId:
-              typeof result.channelId === "string"
-                ? result.channelId
-                : conversation.conversationId,
-          };
-        }
-        const finalChunk = chunks.pop() ?? (hasMedia ? "" : text);
-        for (const chunk of chunks) {
-          const result = await this.sendDiscordTextChunk(outbound, conversation, chunk);
-          if (!delivered) {
-            delivered = {
-              provider: "discord",
-              messageId: result.messageId,
-              channelId:
-                typeof result.channelId === "string"
-                  ? result.channelId
-                  : conversation.conversationId,
-            };
-          }
-        }
-        const picker = {
-          text: finalChunk,
-          buttons: payload.buttons,
-        };
-        if (outboundCfg && outbound?.sendPayload) {
-          const result = await outbound.sendPayload({
-            cfg: outboundCfg,
-            to: conversation.conversationId,
-            text: finalChunk,
-            payload: {
-              text: finalChunk,
-              channelData: {
-                discord: {
-                  components: this.buildDiscordPickerSpec(picker),
-                },
-              },
-            },
-            accountId: conversation.accountId,
-            mediaLocalRoots,
-          });
-          delivered = {
-            provider: "discord",
-            messageId: result.messageId,
-            channelId:
-              typeof result.channelId === "string"
-                ? result.channelId
-                : conversation.conversationId,
-          };
-        } else {
-          const result = await this.sendDiscordPickerMessageLegacy(conversation, picker);
-          if (result) {
-            delivered = {
-              provider: "discord",
-              messageId: result.messageId,
-              channelId:
-                typeof result.channelId === "string"
-                  ? result.channelId
-                  : conversation.conversationId,
-            };
-          }
-        }
-        this.api.logger.debug?.(
-          `codex outbound send complete ${this.formatConversationForLog(conversation)} channel=discord chunks=${chunks.length + 1 + (hasMedia ? 1 : 0)} media=${hasMedia ? "yes" : "no"} buttons=${payload.buttons.length}`,
-        );
-        return delivered;
-      }
-      const textChunks = chunks.length > 0 ? chunks : [text];
-      if (hasMedia) {
-        const firstChunk = textChunks.shift() ?? "";
-        const result = await this.sendDiscordTextChunk(outbound, conversation, firstChunk, {
-          mediaUrl: payload.mediaUrl,
-          mediaLocalRoots,
-        });
-        delivered = {
-          provider: "discord",
-          messageId: result.messageId,
-          channelId:
-            typeof result.channelId === "string"
-              ? result.channelId
-              : conversation.conversationId,
-        };
-      }
-      for (const chunk of textChunks) {
-        if (!chunk) {
-          continue;
-        }
-        const result = await this.sendDiscordTextChunk(outbound, conversation, chunk);
-        if (!delivered) {
-          delivered = {
-            provider: "discord",
-            messageId: result.messageId,
-            channelId:
-              typeof result.channelId === "string"
-                ? result.channelId
-                : conversation.conversationId,
-          };
-        }
-      }
-      this.api.logger.debug?.(
-        `codex outbound send complete ${this.formatConversationForLog(conversation)} channel=discord chunks=${textChunks.length + (hasMedia ? 1 : 0)} media=${hasMedia ? "yes" : "no"}`,
-      );
-      return delivered;
-    }
-    return null;
+    return await this.channelDelivery.sendReplyWithDeliveryRef(conversation, payload);
   }
 
   private getOpenClawConfig(): HostOpenClawConfig | undefined {
@@ -7632,60 +6598,7 @@ export class CodexPluginController {
     text: string,
     opts?: { buttons?: PluginInteractiveButtons },
   ): Promise<{ messageId: string; chatId?: string }> {
-    const target = conversation.parentConversationId ?? conversation.conversationId;
-    const buttons = opts?.buttons;
-    const cfg = this.getOpenClawConfig();
-    if (buttons && cfg && outbound?.sendPayload) {
-      return await outbound.sendPayload({
-        cfg,
-        to: target,
-        text,
-        payload: {
-          text,
-          channelData: {
-            telegram: {
-              buttons,
-            },
-          },
-        },
-        accountId: conversation.accountId,
-        threadId: conversation.threadId,
-      });
-    }
-    const legacySend = getLegacyTelegramRuntime(this.api)?.sendMessageTelegram;
-    if (buttons && typeof legacySend === "function") {
-      return await legacySend(target, text, {
-        accountId: conversation.accountId,
-        messageThreadId: typeof conversation.threadId === "number" ? conversation.threadId : undefined,
-        buttons,
-      });
-    }
-    if (!buttons && cfg && outbound?.sendText) {
-      return await outbound.sendText({
-        cfg,
-        to: target,
-        text,
-        accountId: conversation.accountId,
-        threadId: conversation.threadId,
-      });
-    }
-    if (typeof legacySend === "function") {
-      return await legacySend(target, text, {
-        accountId: conversation.accountId,
-        messageThreadId: typeof conversation.threadId === "number" ? conversation.threadId : undefined,
-        buttons,
-      });
-    }
-    const runtimeApi = await this.loadTelegramRuntimeApi();
-    if (typeof runtimeApi?.sendMessageTelegram === "function") {
-      return await runtimeApi.sendMessageTelegram(target, text, {
-        cfg: this.getOpenClawConfig(),
-        accountId: conversation.accountId,
-        messageThreadId: typeof conversation.threadId === "number" ? conversation.threadId : undefined,
-        ...(buttons ? { buttons } : {}),
-      });
-    }
-    throw new Error("Telegram send runtime unavailable");
+    return await this.channelDelivery.sendTelegramTextChunk(outbound, conversation, text, opts);
   }
 
   private async sendTelegramMediaChunk(
@@ -7698,72 +6611,7 @@ export class CodexPluginController {
       buttons?: PluginInteractiveButtons;
     },
   ): Promise<{ messageId: string; chatId?: string }> {
-    if (!opts.mediaUrl) {
-      throw new Error("Telegram media send requires mediaUrl");
-    }
-    const target = conversation.parentConversationId ?? conversation.conversationId;
-    const cfg = this.getOpenClawConfig();
-    if (opts.buttons && cfg && outbound?.sendPayload) {
-      return await outbound.sendPayload({
-        cfg,
-        to: target,
-        text,
-        payload: {
-          text,
-          mediaUrl: opts.mediaUrl,
-          channelData: {
-            telegram: {
-              buttons: opts.buttons,
-            },
-          },
-        },
-        mediaLocalRoots: opts.mediaLocalRoots,
-        accountId: conversation.accountId,
-        threadId: conversation.threadId,
-      });
-    }
-    const legacySend = getLegacyTelegramRuntime(this.api)?.sendMessageTelegram;
-    if (opts.buttons && typeof legacySend === "function") {
-      return await legacySend(target, text, {
-        accountId: conversation.accountId,
-        messageThreadId: typeof conversation.threadId === "number" ? conversation.threadId : undefined,
-        mediaUrl: opts.mediaUrl,
-        mediaLocalRoots: opts.mediaLocalRoots,
-        buttons: opts.buttons,
-      });
-    }
-    if (!opts.buttons && cfg && outbound?.sendMedia) {
-      return await outbound.sendMedia({
-        cfg,
-        to: target,
-        text,
-        mediaUrl: opts.mediaUrl,
-        mediaLocalRoots: opts.mediaLocalRoots,
-        accountId: conversation.accountId,
-        threadId: conversation.threadId,
-      });
-    }
-    if (typeof legacySend === "function") {
-      return await legacySend(target, text, {
-        accountId: conversation.accountId,
-        messageThreadId: typeof conversation.threadId === "number" ? conversation.threadId : undefined,
-        mediaUrl: opts.mediaUrl,
-        mediaLocalRoots: opts.mediaLocalRoots,
-        buttons: opts.buttons,
-      });
-    }
-    const runtimeApi = await this.loadTelegramRuntimeApi();
-    if (typeof runtimeApi?.sendMessageTelegram === "function") {
-      return await runtimeApi.sendMessageTelegram(target, text, {
-        cfg: this.getOpenClawConfig(),
-        accountId: conversation.accountId,
-        messageThreadId: typeof conversation.threadId === "number" ? conversation.threadId : undefined,
-        mediaUrl: opts.mediaUrl,
-        mediaLocalRoots: opts.mediaLocalRoots,
-        ...(opts.buttons ? { buttons: opts.buttons } : {}),
-      });
-    }
-    throw new Error("Telegram media send runtime unavailable");
+    return await this.channelDelivery.sendTelegramMediaChunk(outbound, conversation, text, opts);
   }
 
   private async sendDiscordTextChunk(
@@ -7772,45 +6620,7 @@ export class CodexPluginController {
     text: string,
     opts?: { mediaUrl?: string; mediaLocalRoots?: readonly string[] },
   ): Promise<{ messageId: string; channelId?: string }> {
-    const mediaUrl = opts?.mediaUrl;
-    const mediaLocalRoots = opts?.mediaLocalRoots;
-    const cfg = this.getOpenClawConfig();
-    if (mediaUrl && cfg && outbound?.sendMedia) {
-      return await outbound.sendMedia({
-        cfg,
-        to: conversation.conversationId,
-        text,
-        mediaUrl,
-        accountId: conversation.accountId,
-        mediaLocalRoots,
-      });
-    }
-    if (!mediaUrl && cfg && outbound?.sendText) {
-      return await outbound.sendText({
-        cfg,
-        to: conversation.conversationId,
-        text,
-        accountId: conversation.accountId,
-      });
-    }
-    const legacySend = getLegacyDiscordRuntime(this.api)?.sendMessageDiscord;
-    if (typeof legacySend === "function") {
-      return await legacySend(conversation.conversationId, text, {
-        accountId: conversation.accountId,
-        mediaUrl,
-        mediaLocalRoots,
-      });
-    }
-    const runtimeApi = await this.loadDiscordRuntimeApi();
-    if (typeof runtimeApi?.sendMessageDiscord === "function") {
-      return await runtimeApi.sendMessageDiscord(conversation.conversationId, text, {
-        cfg: this.getOpenClawConfig(),
-        accountId: conversation.accountId,
-        mediaUrl,
-        mediaLocalRoots,
-      });
-    }
-    throw new Error("Discord outbound messaging is unavailable.");
+    return await this.channelDelivery.sendDiscordTextChunk(outbound, conversation, text, opts);
   }
 
   private resolveReplyMediaLocalRoots(mediaUrl?: string): readonly string[] | undefined {
@@ -7948,100 +6758,14 @@ export class CodexPluginController {
     conversation: ConversationTarget,
     text: string,
   ): Promise<DeliveredMessageRef | null> {
-    const trimmed = text.trim();
-    if (!trimmed) {
-      return null;
-    }
-    if (isTelegramChannel(conversation.channel)) {
-      const outbound = await this.loadTelegramOutboundAdapter();
-      const result = await this.sendTelegramTextChunk(outbound, conversation, trimmed);
-      return {
-        provider: "telegram",
-        messageId: result.messageId,
-        chatId:
-          typeof result.chatId === "string"
-            ? result.chatId
-            : conversation.parentConversationId ?? conversation.conversationId,
-      };
-    }
-    if (isDiscordChannel(conversation.channel)) {
-      const outbound = await this.loadDiscordOutboundAdapter();
-      const result = await this.sendDiscordTextChunk(outbound, conversation, trimmed);
-      return {
-        provider: "discord",
-        messageId: result.messageId,
-        channelId:
-          typeof result.channelId === "string"
-            ? result.channelId
-            : conversation.conversationId,
-      };
-    }
-    await this.sendText(conversation, trimmed);
-    return null;
+    return await this.channelDelivery.sendSingleTextWithDeliveryRef(conversation, text);
   }
 
   private async sendTextWithDeliveryRef(
     conversation: ConversationTarget,
     text: string,
   ): Promise<DeliveredMessageRef | null> {
-    const trimmed = text.trim();
-    if (!trimmed) {
-      return null;
-    }
-    if (isTelegramChannel(conversation.channel)) {
-      const outbound = await this.loadTelegramOutboundAdapter();
-      const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
-        undefined,
-        "telegram",
-        conversation.accountId,
-        { fallbackLimit: 4000 },
-      );
-      const chunks = this.api.runtime.channel.text.chunkText(trimmed, limit).filter(Boolean);
-      const textChunks = chunks.length > 0 ? chunks : [trimmed];
-      let firstDelivered: DeliveredMessageRef | null = null;
-      for (const chunk of textChunks) {
-        const result = await this.sendTelegramTextChunk(outbound, conversation, chunk);
-        if (!firstDelivered) {
-          firstDelivered = {
-            provider: "telegram",
-            messageId: result.messageId,
-            chatId:
-              typeof result.chatId === "string"
-                ? result.chatId
-                : conversation.parentConversationId ?? conversation.conversationId,
-          };
-        }
-      }
-      return firstDelivered;
-    }
-    if (isDiscordChannel(conversation.channel)) {
-      const outbound = await this.loadDiscordOutboundAdapter();
-      const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
-        undefined,
-        "discord",
-        conversation.accountId,
-        { fallbackLimit: 2000 },
-      );
-      const chunks = this.api.runtime.channel.text.chunkText(trimmed, limit).filter(Boolean);
-      const textChunks = chunks.length > 0 ? chunks : [trimmed];
-      let firstDelivered: DeliveredMessageRef | null = null;
-      for (const chunk of textChunks) {
-        const result = await this.sendDiscordTextChunk(outbound, conversation, chunk);
-        if (!firstDelivered) {
-          firstDelivered = {
-            provider: "discord",
-            messageId: result.messageId,
-            channelId:
-              typeof result.channelId === "string"
-                ? result.channelId
-                : conversation.conversationId,
-          };
-        }
-      }
-      return firstDelivered;
-    }
-    await this.sendText(conversation, trimmed);
-    return null;
+    return await this.channelDelivery.sendTextWithDeliveryRef(conversation, text);
   }
 
   private async pinBindingMessage(
@@ -8100,57 +6824,11 @@ export class CodexPluginController {
   }
 
   private async resolveTelegramBotToken(accountId?: string): Promise<string | undefined> {
-    const legacyResolution = getLegacyTelegramRuntime(this.api)?.resolveTelegramToken?.(
-      this.getOpenClawConfig(),
-      { accountId },
-    );
-    const legacyToken = legacyResolution?.token?.trim();
-    if (legacyToken) {
-      return legacyToken;
-    }
-    const cfg = this.getOpenClawConfig();
-    if (!cfg) {
-      return undefined;
-    }
-    try {
-      const telegramAccount = await this.loadTelegramAccountSdk();
-      const account = telegramAccount.resolveTelegramAccount({
-        cfg,
-        accountId,
-      });
-      const token = account?.token?.trim();
-      return token || undefined;
-    } catch (error) {
-      this.api.logger.debug?.(`codex telegram account facade unavailable: ${String(error)}`);
-      return undefined;
-    }
+    return await this.channelRuntime.resolveTelegramBotToken(accountId);
   }
 
   private async resolveDiscordBotToken(accountId?: string): Promise<string | undefined> {
-    const cfg = this.lastRuntimeConfig;
-    if (!cfg) {
-      return undefined;
-    }
-    try {
-      const discordSdk = await this.loadDiscordSdk();
-      const account = discordSdk.resolveDiscordAccount({
-        cfg: cfg as Parameters<DiscordSdkModule["resolveDiscordAccount"]>[0]["cfg"],
-        accountId,
-      });
-      const token = account.token?.trim();
-      if (token) {
-        return token;
-      }
-    } catch (error) {
-      this.api.logger.debug?.(`codex discord account facade unavailable: ${String(error)}`);
-    }
-    const discordApi = await this.loadDiscordExtensionApi();
-    const account = discordApi?.resolveDiscordAccount?.({
-      cfg,
-      accountId,
-    });
-    const token = account?.token?.trim();
-    return token || undefined;
+    return await this.channelRuntime.resolveDiscordBotToken(accountId);
   }
 
   private async startManagedTypingLease(params: {
@@ -8263,24 +6941,7 @@ export class CodexPluginController {
     messageId: string,
     opts?: { accountId?: string; disableNotification?: boolean },
   ): Promise<void> {
-    const runtimeApi = await this.loadTelegramRuntimeApi();
-    if (typeof runtimeApi?.pinMessageTelegram === "function") {
-      await runtimeApi.pinMessageTelegram(chatId, messageId, {
-        cfg: this.getOpenClawConfig(),
-        accountId: opts?.accountId,
-      });
-      return;
-    }
-    const token = await this.resolveTelegramBotToken(opts?.accountId);
-    if (!token) {
-      this.api.logger.debug?.(`codex telegram pin skipped chat=${chatId} reason=no-token`);
-      return;
-    }
-    await this.callTelegramPinApi("pinChatMessage", token, {
-      chat_id: chatId,
-      message_id: Number(messageId),
-      disable_notification: opts?.disableNotification ?? false,
-    });
+    await this.channelDelivery.pinTelegramMessage(chatId, messageId, opts);
   }
 
   private async unpinTelegramMessage(
@@ -8288,23 +6949,7 @@ export class CodexPluginController {
     messageId: string,
     opts?: { accountId?: string },
   ): Promise<void> {
-    const runtimeApi = await this.loadTelegramRuntimeApi();
-    if (typeof runtimeApi?.unpinMessageTelegram === "function") {
-      await runtimeApi.unpinMessageTelegram(chatId, messageId, {
-        cfg: this.getOpenClawConfig(),
-        accountId: opts?.accountId,
-      });
-      return;
-    }
-    const token = await this.resolveTelegramBotToken(opts?.accountId);
-    if (!token) {
-      this.api.logger.debug?.(`codex telegram unpin skipped chat=${chatId} reason=no-token`);
-      return;
-    }
-    await this.callTelegramPinApi("unpinChatMessage", token, {
-      chat_id: chatId,
-      message_id: Number(messageId),
-    });
+    await this.channelDelivery.unpinTelegramMessage(chatId, messageId, opts);
   }
 
   private async editTelegramMessage(
@@ -8313,27 +6958,7 @@ export class CodexPluginController {
     text: string,
     opts?: { accountId?: string; buttons?: PluginInteractiveButtons },
   ): Promise<void> {
-    const runtimeApi = await this.loadTelegramRuntimeApi();
-    if (typeof runtimeApi?.editMessageTelegram === "function") {
-      await runtimeApi.editMessageTelegram(chatId, messageId, text, {
-        cfg: this.getOpenClawConfig(),
-        accountId: opts?.accountId,
-        ...(opts?.buttons ? { buttons: opts.buttons } : {}),
-      });
-      return;
-    }
-    const token = await this.resolveTelegramBotToken(opts?.accountId);
-    if (!token) {
-      throw new Error("Telegram edit skipped because no bot token was available");
-    }
-    await this.callTelegramEditMessageApi(token, {
-      chat_id: chatId,
-      message_id: Number(messageId),
-      text,
-      ...(opts?.buttons
-        ? { reply_markup: buildTelegramReplyMarkup(opts.buttons) ?? { inline_keyboard: [] } }
-        : {}),
-    });
+    await this.channelDelivery.editTelegramMessage(chatId, messageId, text, opts);
   }
 
   private async renameTelegramTopic(
@@ -8342,23 +6967,7 @@ export class CodexPluginController {
     name: string,
     opts?: { accountId?: string },
   ): Promise<void> {
-    const runtimeApi = await this.loadTelegramRuntimeApi();
-    if (typeof runtimeApi?.renameForumTopicTelegram === "function") {
-      await runtimeApi.renameForumTopicTelegram(chatId, messageThreadId, name, {
-        cfg: this.getOpenClawConfig(),
-        accountId: opts?.accountId,
-      });
-      return;
-    }
-    const token = await this.resolveTelegramBotToken(opts?.accountId);
-    if (!token) {
-      return;
-    }
-    await this.callTelegramTopicEditApi(token, {
-      chat_id: chatId,
-      message_thread_id: messageThreadId,
-      name,
-    });
+    await this.channelDelivery.renameTelegramTopic(chatId, messageThreadId, name, opts);
   }
 
   private async pinDiscordMessage(
@@ -8366,20 +6975,7 @@ export class CodexPluginController {
     messageId: string,
     opts?: { accountId?: string },
   ): Promise<void> {
-    const runtimeApi = await this.loadDiscordRuntimeApi();
-    if (typeof runtimeApi?.pinMessageDiscord === "function") {
-      await runtimeApi.pinMessageDiscord(channelId, messageId, {
-        cfg: this.getOpenClawConfig(),
-        accountId: opts?.accountId,
-      });
-      return;
-    }
-    const token = await this.resolveDiscordBotToken(opts?.accountId);
-    if (!token) {
-      this.api.logger.debug?.(`codex discord pin skipped channel=${channelId} reason=no-token`);
-      return;
-    }
-    await this.callDiscordPinApi("pin", token, channelId, messageId);
+    await this.channelDelivery.pinDiscordMessage(channelId, messageId, opts);
   }
 
   private async unpinDiscordMessage(
@@ -8387,170 +6983,13 @@ export class CodexPluginController {
     messageId: string,
     opts?: { accountId?: string },
   ): Promise<void> {
-    const runtimeApi = await this.loadDiscordRuntimeApi();
-    if (typeof runtimeApi?.unpinMessageDiscord === "function") {
-      await runtimeApi.unpinMessageDiscord(channelId, messageId, {
-        cfg: this.getOpenClawConfig(),
-        accountId: opts?.accountId,
-      });
-      return;
-    }
-    const token = await this.resolveDiscordBotToken(opts?.accountId);
-    if (!token) {
-      this.api.logger.debug?.(`codex discord unpin skipped channel=${channelId} reason=no-token`);
-      return;
-    }
-    await this.callDiscordPinApi("unpin", token, channelId, messageId);
-  }
-
-  private async callDiscordPinApi(
-    action: "pin" | "unpin",
-    token: string,
-    channelId: string,
-    messageId: string,
-  ): Promise<void> {
-    const response = await fetch(
-      `https://discord.com/api/v10/channels/${encodeURIComponent(channelId)}/pins/${encodeURIComponent(messageId)}`,
-      {
-        method: action === "pin" ? "PUT" : "DELETE",
-        headers: {
-          Authorization: `Bot ${token}`,
-        },
-      },
-    );
-    if (!response.ok) {
-      throw new Error(
-        `Discord ${action} failed status=${response.status} body=${await response.text()}`,
-      );
-    }
-  }
-
-  private async callTelegramBotApi(
-    method: string,
-    token: string,
-    body: Record<string, unknown>,
-  ): Promise<void> {
-    const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-    const responseText = await response.text();
-    if (!response.ok) {
-      throw new Error(
-        `Telegram ${method} failed status=${response.status} body=${responseText}`,
-      );
-    }
-    const trimmedBody = responseText.trim();
-    if (!trimmedBody) {
-      return;
-    }
-    try {
-      const parsed = JSON.parse(trimmedBody) as { ok?: unknown; description?: unknown };
-      if (parsed.ok === false) {
-        const description =
-          typeof parsed.description === "string" && parsed.description.trim()
-            ? parsed.description.trim()
-            : trimmedBody;
-        throw new Error(`Telegram ${method} failed body=${description}`);
-      }
-    } catch (error) {
-      if (error instanceof SyntaxError) {
-        return;
-      }
-      throw error;
-    }
-  }
-
-  private async callTelegramPinApi(
-    method: "pinChatMessage" | "unpinChatMessage",
-    token: string,
-    body: Record<string, unknown>,
-  ): Promise<void> {
-    await this.callTelegramBotApi(method, token, body);
-  }
-
-  private async callTelegramEditMessageApi(
-    token: string,
-    body: Record<string, unknown>,
-  ): Promise<void> {
-    await this.callTelegramBotApi("editMessageText", token, body);
-  }
-
-  private async callTelegramTopicEditApi(
-    token: string,
-    body: Record<string, unknown>,
-  ): Promise<void> {
-    await this.callTelegramBotApi("editForumTopic", token, body);
+    await this.channelDelivery.unpinDiscordMessage(channelId, messageId, opts);
   }
 
   private async renameConversationIfSupported(
     conversation: ConversationTarget,
     name: string,
   ): Promise<void> {
-    if (isTelegramChannel(conversation.channel) && conversation.threadId != null) {
-      const legacyRename = getLegacyTelegramRuntime(this.api)?.conversationActions?.renameTopic;
-      if (typeof legacyRename === "function") {
-        await legacyRename(
-          conversation.parentConversationId ?? conversation.conversationId,
-          conversation.threadId,
-          name,
-          {
-            accountId: conversation.accountId,
-          },
-        ).catch((error) => {
-          this.api.logger.warn(`codex telegram topic rename failed: ${String(error)}`);
-        });
-        return;
-      }
-      await this.renameTelegramTopic(
-        conversation.parentConversationId ?? conversation.conversationId,
-        conversation.threadId,
-        name,
-        {
-          accountId: conversation.accountId,
-        },
-      ).catch((error) => {
-        this.api.logger.warn(`codex telegram topic rename failed: ${String(error)}`);
-      });
-      return;
-    }
-    if (isDiscordChannel(conversation.channel)) {
-      const legacyEditChannel = getLegacyDiscordRuntime(this.api)?.conversationActions?.editChannel;
-      if (typeof legacyEditChannel !== "function") {
-        const runtimeApi = await this.loadDiscordRuntimeApi();
-        if (typeof runtimeApi?.editChannelDiscord !== "function") {
-          return;
-        }
-        await runtimeApi.editChannelDiscord(
-          {
-            channelId:
-              denormalizeDiscordConversationId(conversation.conversationId) ??
-              conversation.conversationId,
-            name,
-          },
-          {
-            cfg: this.getOpenClawConfig(),
-            accountId: conversation.accountId,
-          },
-        ).catch((error) => {
-          this.api.logger.warn(`codex discord channel rename failed: ${String(error)}`);
-        });
-        return;
-      }
-      await legacyEditChannel(
-        conversation.conversationId,
-        {
-          name,
-        },
-        {
-          accountId: conversation.accountId,
-        },
-      ).catch((error) => {
-        this.api.logger.warn(`codex discord channel rename failed: ${String(error)}`);
-      });
-    }
+    await this.channelDelivery.renameConversationIfSupported(conversation, name);
   }
 }

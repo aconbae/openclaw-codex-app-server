@@ -1,5 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import path from "node:path";
 
 function resolveHostPackageRoot() {
@@ -37,11 +46,30 @@ function resolveHostPackageRoot() {
 
 function replaceWithSymlink(targetPath, sourcePath) {
   mkdirSync(path.dirname(targetPath), { recursive: true });
+  const relativeSource = path.relative(path.dirname(targetPath), sourcePath) || ".";
+  const existing = lstatSafe(targetPath);
+  if (existing?.isSymbolicLink()) {
+    try {
+      if (readlinkSync(targetPath) === relativeSource && realpathSync(targetPath) === sourcePath) {
+        return;
+      }
+    } catch {
+      // Fall through and replace the stale symlink.
+    }
+  }
   if (existsSync(targetPath) || lstatSafe(targetPath)) {
     rmSync(targetPath, { force: true, recursive: true });
   }
-  const relativeSource = path.relative(path.dirname(targetPath), sourcePath) || ".";
-  symlinkSync(relativeSource, targetPath, "dir");
+  try {
+    symlinkSync(relativeSource, targetPath, "dir");
+  } catch (error) {
+    if (error?.code !== "EEXIST") {
+      throw error;
+    }
+    if (readlinkSync(targetPath) !== relativeSource || realpathSync(targetPath) !== sourcePath) {
+      throw error;
+    }
+  }
 }
 
 function lstatSafe(targetPath) {

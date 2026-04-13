@@ -108,11 +108,6 @@ export const COMMAND_HELP: Record<CommandName, CommandHelpEntry> = {
     ],
     notes: "When a conversation is bound, the reply can include picker buttons and you can also run a skill directly by typing $skill-name.",
   },
-  cas_experimental: {
-    summary: COMMAND_SUMMARY.cas_experimental,
-    usage: "/cas_experimental",
-    examples: ["/cas_experimental"],
-  },
   cas_mcp: {
     summary: COMMAND_SUMMARY.cas_mcp,
     usage: "/cas_mcp [filter]",
@@ -146,30 +141,6 @@ export const COMMAND_HELP: Record<CommandName, CommandHelpEntry> = {
       "/cas_model openai/gpt-5.4",
     ],
     notes: "The status card is the main interactive model-control surface, but this command remains available.",
-  },
-  cas_permissions: {
-    summary: COMMAND_SUMMARY.cas_permissions,
-    usage: "/cas_permissions",
-    examples: ["/cas_permissions"],
-    notes: "This shows account and permission status. To change permissions, use /cas_status --yolo or the status card toggle.",
-  },
-  cas_init: {
-    summary: COMMAND_SUMMARY.cas_init,
-    usage: "/cas_init [args]",
-    flags: [{ flag: "[args]", description: "Arguments forwarded directly to Codex /init." }],
-    examples: [
-      "/cas_init",
-      "/cas_init --help",
-    ],
-  },
-  cas_diff: {
-    summary: COMMAND_SUMMARY.cas_diff,
-    usage: "/cas_diff [args]",
-    flags: [{ flag: "[args]", description: "Arguments forwarded directly to Codex /diff." }],
-    examples: [
-      "/cas_diff",
-      "/cas_diff HEAD~1..HEAD",
-    ],
   },
   cas_rename: {
     summary: COMMAND_SUMMARY.cas_rename,
